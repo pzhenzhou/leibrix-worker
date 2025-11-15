@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package control_plane;
+option optimize_for = SPEED;
+
+import "common.proto";
+import "google/protobuf/struct.proto";
+option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
+
+// EventStreamMessage is the union type for all messages exchanged
+// between the Master and a Worker in both directions (symmetric).
+message EventStreamMessage {
+  // A unique identifier for the event, used for logging and correlation.
+  string event_id = 1;
+  // Tenant and Worker IDs provide context for the event.
+  string tenant_id = 2;
+  string worker_id = 3;
+
+  oneof payload {
+    // ---- Events initiated by the Worker ----
+    RegisterEvent register_event = 4;
+    HeartbeatEvent heartbeat_event = 5;
+    DataPullStatusUpdateEvent data_pull_status_update = 6;
+
+    // ---- Events initiated by the Master ----
+    DataAssignmentEvent data_assignment = 7;
+
+    // ---- Common Events (bidirectional) ----
+    // Used for acknowledgments, control commands, and other flexible message types
+    CommonAckEvent common_ack = 8;
+  }
+}
+
+// CommonAckEvent is a unified event type for acknowledgments and control messages.
+// It replaces specific event types like RegistrationAckEvent, HeartbeatAckEvent, etc.
+// with a flexible structure that can represent any acknowledgment or control command.
+message CommonAckEvent {
+  // The server ID of the node sending this acknowledgment
+  string server_id = 1;
+
+  // The type of event being acknowledged or the command being sent
+  // Examples: "registration_ack", "heartbeat_ack", "evict_epoch", "drain_command"
+  string event_type = 2;
+
+  // Flexible payload containing event-specific data
+  // For registration_ack: may contain heartbeat_interval_seconds, accepted status
+  // For heartbeat_ack: may contain drain command
+  // For evict_epoch: may contain dataset_id, epoch_id, reason
+  google.protobuf.Struct payload = 3;
+}
+
+message Worker {
+  string node_id = 1;
+  string addr = 2;
+  map<string, string> labels = 3;
+}
+
+message RegisterEvent {
+  Worker worker = 1;
+}
+
+message HeartbeatEvent {
+}
+
+message DataPullStatusUpdateEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  enum Status {
+    UNKNOWN = 0;
+    IN_PROGRESS = 1;
+    COMPLETED = 2;
+    FAILED = 3;
+  }
+  Status status = 3;
+  string error_message = 4; // Populated if status is FAILED.
+}
+
+message DataAssignmentEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  LoadPlan load_plan = 3;
+}
+
+
+message LoadPlan {
+  string plan_id = 1;
+  common.DataSource source = 2;
+
+  // The table name in DuckDB following the pattern: {dataset_id}__{epoch_id}
+  // Example: "sales_data__1730419200000_a7b3c2"
+  // This establishes the 1:1 relationship: one epoch_id = one DuckDB table
+  string destination_table_name = 3;
+
+  bytes arrow_schema = 4;
+
+  // REQUIRED: Resolved partition information for this specific epoch
+  // This tells the Worker exactly what time range and partition values
+  // this epoch represents, enabling it to generate the optimized table macro
+  ResolvedPartition resolved_partition = 5;
+}
+
+// The concrete partition values for a single epoch
+// This is what the Worker needs to generate the table macro constants
+message ResolvedPartition {
+  // The time range this epoch represents (REQUIRED)
+  // Used in macro: WHERE (DATE 'start' >= start_dt AND DATE 'start' < end_excl)
+  common.TimeRange time_range = 1;
+  // The name of the time partition column in the loaded data
+  // Used in macro: AND dt = DATE '2025-10-25'
+  string time_column_name = 2;
+  // The specific time partition value(s) this epoch contains
+  // For single partition: "2025-10-25"
+  // For coalesced epochs: start date of the range
+  string time_partition_value = 3;
+
+  // Additional dimension partition values (if multi-dimensional)
+  map<string, string> dimension_values = 4;
+}
+
+// DEPRECATED: EventResponse is being phased out in favor of CommonAckEvent within EventStreamMessage
+// for symmetric bidirectional communication. Kept temporarily for backward compatibility.
+message EventResponse {
+  string server_id = 1;
+  common.ResponseStatus status = 2;
+  google.protobuf.Struct payload = 3;
+}
+
+// ControlPlaneService defines the bidirectional stream for all real-time
+// communication between a Worker and the Master.
+// The stream is now symmetric - both sides send and receive EventStreamMessage.
+service ControlPlaneService {
+  rpc CoordinateWorker(stream EventStreamMessage) returns (stream EventStreamMessage);
+}

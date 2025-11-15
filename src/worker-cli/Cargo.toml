@@ -1,0 +1,12 @@
+[package]
+name = "worker-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "liebrix-worker"
+path = "src/main.rs"
+
+[dependencies]
+

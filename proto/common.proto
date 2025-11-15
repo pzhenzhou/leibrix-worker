@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package common;
+option optimize_for = SPEED;
+
+import "google/protobuf/timestamp.proto";
+
+message Catalog {
+  oneof catalog_type {
+    IcebergCatalog iceberg = 1;
+    StarRocksCatalog starrocks = 2;
+    JdbcCatalog jdbc = 3;
+  }
+}
+
+message IcebergCatalog {
+  string uri = 1;
+}
+
+message StarRocksCatalog {
+  string dsn = 1;
+  string internal_catalog_name = 2;
+}
+
+message JdbcCatalog {
+  string uri = 1;
+  string driver = 2;
+}
+
+message Partition {
+  // REQUIRED: Time partition definition (first-class citizen)
+  TimePartition time_partition = 1;
+  // OPTIONAL: Additional dimension partitions (e.g., country, region, product_id)
+  repeated DimensionPartition dimension_partitions = 2;
+}
+
+// Time partition is mandatory and treated specially
+message TimePartition {
+  // The partition column definition
+  PartitionColumn column = 1;
+  // The time range to query
+  TimeRangeFilter filter = 2;
+}
+
+// Additional dimension partitions (optional)
+message DimensionPartition {
+  // The partition column definition
+  PartitionColumn column = 1;
+  // The partition values to filter
+  PartitionValues values = 2;
+}
+
+message PartitionColumn {
+  // Column name (e.g., "dt", "event_date", "country")
+  string name = 1;
+  enum Type {
+    UNKNOWN = 0;
+    TIMESTAMP = 1;
+    DATE = 2;
+    STRING = 3;
+    INT64 = 4;
+  }
+  Type type = 2;
+
+  // For time-based partitions: the granularity of the source data
+  // This describes how the source table is partitioned, not how we group it
+  enum Granularity {
+    GRANULARITY_UNSPECIFIED = 0;
+    GRANULARITY_HOUR = 1;
+    GRANULARITY_DAY = 2;
+    GRANULARITY_WEEK = 3;
+    GRANULARITY_MONTH = 4;
+  }
+  optional Granularity source_granularity = 3;
+}
+
+message TimeRangeFilter {
+  google.protobuf.Timestamp start_inclusive = 1;
+  google.protobuf.Timestamp end_exclusive = 2;
+}
+
+// A list of partition values
+// If values contain duplicates, they map to the same partition (idempotent)
+message PartitionValues {
+  repeated string values = 1;
+}
+
+message DataSource {
+  Catalog catalog = 1;
+  string database = 2;
+  string table = 3;
+  // REQUIRED: Partition specification with time as first-class citizen
+  Partition partition = 4;
+  // For snapshot-capable sources (e.g., Iceberg snapshot_id)
+  optional string version = 5;
+}
+
+message TimeRange {
+  google.protobuf.Timestamp start_inclusive = 1;
+  google.protobuf.Timestamp end_exclusive = 2;
+}
+
+// Metadata about an epoch created by the admission request
+// This is synchronous - just the epoch metadata, not actual data stats
+message EpochInfo {
+  // Time-sortable epoch identifier
+  // Format: {start_timestamp_ms}_{hash_suffix}
+  // Example: "1730419200000_a7b3c2" for 2025-10-25
+  // This epoch_id will become the table name suffix in DuckDB:
+  // {dataset_id}_{epoch_id}
+  string epoch_id = 1;
+  // The time range this epoch covers
+  TimeRange time_range = 2;
+  // Additional partition dimensions (if any)
+  map<string, string> dimension_values = 3;
+}
+
+message EpochInfoList {
+  repeated EpochInfo epochs = 1;
+}
+
+message EpochGranularity {
+  // Number of time units (must be > 0)
+  // Examples: 1, 3, 7, 10, 24, 72
+  int32 value = 1;
+
+  // Time unit
+  enum TimeUnit {
+    HOUR = 0;
+    DAY = 1;
+    WEEK = 2;
+    MONTH = 3;
+  }
+  TimeUnit unit = 2;
+}
+
+enum ResponseStatus {
+  UNKNOWN = 0;
+  SUCCESS = 1;
+  ERROR = 2;
+}
+
+message CommonResponse {
+  ResponseStatus status = 1;
+  string message = 2;
+}

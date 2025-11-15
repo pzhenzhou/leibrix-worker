@@ -1,0 +1,38 @@
+cargo-features = ["profile-rustflags"]
+
+[workspace]
+resolver = "2"
+members = [
+    "src/worker-cli",
+    "src/worker-cp"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+keywords = ["distributed-memory", "high-performance"]
+license = "Apache-2.0"
+authors = ["pangzhenzhou"]
+
+[workspace.dependencies]
+prost = { version = "0.13", default-features = false, features = ["prost-derive"] }
+prost-types = { version = "0.13" }
+tonic = { version = "0.13", default-features = false, features = ["transport", "prost", "codegen"] }
+serde = { version = "1", features = ["derive"] }
+tracing = { version = "0.1" }
+
+tonic-health = { version = "0.13" }
+tonic-reflection = { version = "0.13" }
+
+
+[profile.dev]
+lto = "off"
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+incremental = false
+rustflags = ["-Ctarget-cpu=native"]
