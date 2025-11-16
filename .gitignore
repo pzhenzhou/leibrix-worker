@@ -41,5 +41,4 @@ src/log/
 *.log
 log/
 logs/
-.monograph_proxy
 .bin/
