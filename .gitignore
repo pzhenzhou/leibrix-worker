@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+Cargo.lock
 # profile
 *.heap
 # Visual Studio Code

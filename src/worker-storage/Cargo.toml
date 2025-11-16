@@ -1,0 +1,15 @@
+[package]
+name = "worker-storage"
+version.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json"] }
+arrow = { version = "=56.2.0", features = ["ipc", "arrow-json"] }
+futures-core = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
