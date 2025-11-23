@@ -24,6 +24,9 @@ pub enum StorageError {
         backend: &'static str,
         message: String,
     },
+
+    #[error("Engine shutting down")]
+    ShuttingDown,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +65,15 @@ pub struct EpochView {
     pub dimension_values: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EngineMetrics {
+    pub total_batches_written: u64,
+    pub total_rows_written: u64,
+    pub total_flushes: u64,
+    pub active_epochs: usize,
+    pub committed_epochs: usize,
+}
+
 /// StorageEngine is responsible for:
 /// - Creating immutable epoch tables
 /// - Dropping epoch tables when they're no longer needed (e.g., TTL expired, memory pressure)
@@ -71,7 +83,7 @@ pub struct EpochView {
 ///
 /// Note: Table names are deterministically derived as `{dataset_id}__{epoch_id}` to ensure
 /// consistency and prevent naming collisions.
-pub trait StorageEngine {
+pub trait StorageEngine: Send + Sync {
     /// create_epoch_table. Executes DDL to create epoch table and load Arrow data
     ///
     /// This method ingests data into the acceleration layer. It:
@@ -88,7 +100,7 @@ pub trait StorageEngine {
         dataset_id: String,
         epoch: EpochView,
         arrow_stream: RecordBatchStream,
-    ) -> impl Future<Output = anyhow::Result<TableMetadata, StorageError>> + Send + '_;
+    ) -> impl Future<Output = anyhow::Result<TableMetadata>> + Send;
 
     /// Drops an epoch table and frees its memory.
     ///
@@ -110,7 +122,7 @@ pub trait StorageEngine {
         &self,
         dataset_id: String,
         epoch_id: String,
-    ) -> impl Future<Output = anyhow::Result<(), StorageError>> + Send + '_;
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     /// Lists all epochs currently stored for a dataset.
     ///
@@ -124,7 +136,7 @@ pub trait StorageEngine {
     fn list_epochs(
         &self,
         dataset_id: String,
-    ) -> impl Future<Output = anyhow::Result<Vec<EpochView>, StorageError>> + Send + '_;
+    ) -> impl Future<Output = anyhow::Result<Vec<EpochView>>> + Send;
 
     /// memory_stats is called periodically to:
     /// - Monitor per-worker memory consumption against quota
@@ -132,5 +144,9 @@ pub trait StorageEngine {
     /// - Make admission control and eviction decisions
     ///
     ///  Returns `None` if memory statistics are not available (e.g., not yet initialized).
-    fn memory_stats(&self) -> Option<MemoryStats>;
+    fn memory_stats(&self) -> impl Future<Output = anyhow::Result<MemoryStats>> + Send;
+
+    fn get_metrics(&self) -> impl Future<Output = anyhow::Result<EngineMetrics>> + Send;
+
+    fn shutdown(self) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

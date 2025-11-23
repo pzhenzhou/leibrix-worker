@@ -25,6 +25,7 @@ thiserror = { version = "2" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 anyhow = { version = "1.0" }
+tokio = { version = "1", features = ["full"] }
 
 tonic-health = { version = "0.13" }
 tonic-reflection = { version = "0.13" }

@@ -13,3 +13,5 @@ futures-core = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
