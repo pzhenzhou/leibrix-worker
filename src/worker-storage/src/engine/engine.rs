@@ -1,9 +1,9 @@
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
 use futures_core::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use arrow::datatypes::Schema;
 use thiserror::Error;
 
 pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, StorageError>> + Send>>;
