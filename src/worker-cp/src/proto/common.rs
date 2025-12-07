@@ -36,9 +36,19 @@ pub struct IcebergCatalog {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StarRocksCatalog {
     #[prost(string, tag = "1")]
-    pub dsn: ::prost::alloc::string::String,
+    pub catalog_name: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub internal_catalog_name: ::prost::alloc::string::String,
+    pub host: ::prost::alloc::string::String,
+    #[prost(int32, tag = "3")]
+    pub port: i32,
+    #[prost(string, tag = "4")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub username: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub password: ::prost::alloc::string::String,
+    #[prost(int32, tag = "7")]
+    pub max_concurrency: i32,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]

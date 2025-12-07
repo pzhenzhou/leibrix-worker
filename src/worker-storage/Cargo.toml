@@ -7,12 +7,21 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json"] }
 arrow = { version = "=56.2.0", features = ["ipc", "arrow-json"] }
+arrow-array = "=56.2.0"
+arrow-schema = "=56.2.0"
+arrow-ipc = "=56.2.0"
+
+# Flight client to talk to StarRocks
+arrow-flight = { version = "=56.2.0", features = ["flight-sql"] }
+base64 = "0.22"
+duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json"] }
 futures-core = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 tracing = { workspace = true }
-tracing-subscriber  = { workspace = true }
+tracing-subscriber = { workspace = true }
+tonic = "0.13.1"
