@@ -9,4 +9,8 @@ name = "liebrix-worker"
 path = "src/main.rs"
 
 [dependencies]
-
+clap = { version = "4.5.53", features = ["derive", "env"] }
+anyhow = { workspace = true }
+tonic = { workspace = true }
+worker-cp = { path = "../worker-cp" }
+worker-storage = { path = "../worker-storage" }
