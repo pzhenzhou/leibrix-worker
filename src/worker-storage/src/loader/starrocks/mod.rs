@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 mod adbc_client;
 pub mod backend;
+mod jdbc_client;
+
+pub use backend::StarRocksBackend;
 
 pub fn select_text(source: Arc<DataSource>, schema: Arc<Schema>) -> String {
     let column_list = schema
@@ -17,12 +20,15 @@ pub fn select_text(source: Arc<DataSource>, schema: Arc<Schema>) -> String {
         Catalog::StarRocks { catalog, .. } => {
             format!("{}.`{}`.`{}`", catalog, source.database, source.table)
         }
+        Catalog::Jdbc { .. } => {
+            format!("`{}`.`{}`", source.database, source.table)
+        }
         _ => format!("`{}`.`{}`", source.database, source.table),
     };
 
     let mut sql = format!(
-        "SELECT {} FROM `{}`.`{}`",
-        column_list, source.database, full_table_name
+        "SELECT {} FROM {}",
+        column_list, full_table_name
     );
 
     if let Some(filter) = &source.filter {

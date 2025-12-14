@@ -1,5 +1,6 @@
 use crate::engine::engine::{RecordBatchStream, StorageError};
-use crate::loader::types::{Catalog, SourceError};
+use crate::loader::types::{Catalog, DataSource, SourceError};
+use crate::loader::starrocks::select_text;
 use arrow_array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -15,6 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_MAX_CONCURRENCY: usize = 16;
 
+#[derive(Clone)]
 pub struct StarRocksAdbcClient {
     catalog_name: String,
     host: String,
@@ -49,6 +51,7 @@ impl StarRocksAdbcClient {
             user,
             password,
             max_concurrency,
+            ..
         } = catalog
         {
             let concurrency = if let Some(concurrency) = max_concurrency {
@@ -242,5 +245,24 @@ impl StarRocksAdbcClient {
         })?;
 
         Ok(())
+    }
+}
+
+// Implement SourceAdapter trait
+impl crate::loader::adapter::SourceAdapter for StarRocksAdbcClient {
+    fn stream_data(
+        &self,
+        source: Arc<DataSource>,
+        schema: Arc<arrow::datatypes::Schema>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecordBatchStream, StorageError>> + Send>> {
+        let sql = select_text(source.clone(), schema.clone());
+        let client = self.clone();
+        
+        Box::pin(async move {
+            client.query(&sql).await.map_err(|e| StorageError::Backend {
+                backend: "starrocks-adbc",
+                message: e.to_string(),
+            })
+        })
     }
 }

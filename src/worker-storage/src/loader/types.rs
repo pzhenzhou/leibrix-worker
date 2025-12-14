@@ -15,11 +15,25 @@ pub enum Catalog {
         user: String,
         password: String,
         max_concurrency: Option<usize>,
+        pool_options: Option<ConnectionPoolOptions>,
     },
     Jdbc {
         uri: String,
         driver: String,
+        pool_options: Option<ConnectionPoolOptions>,
     },
+}
+
+/// Reusable connection pool configuration for SQL-based catalogs
+#[derive(Debug, Clone)]
+pub struct ConnectionPoolOptions {
+    pub max_connections: Option<u32>,
+    pub min_connections: Option<u32>,
+    pub acquire_timeout_ms: Option<u64>,
+    pub connect_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+    pub max_lifetime_ms: Option<u64>,
+    pub batch_size: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
