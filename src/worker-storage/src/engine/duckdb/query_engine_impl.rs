@@ -244,7 +244,6 @@ impl QueryEngine for DuckDBQueryEngine {
                     }
                 };
 
-                // Execute query and get Arrow reader
                 let arrow_reader = match stmt.query_arrow([]) {
                     Ok(r) => r,
                     Err(e) => {
@@ -255,9 +254,7 @@ impl QueryEngine for DuckDBQueryEngine {
                     }
                 };
 
-                // Stream results - arrow_reader is an iterator over RecordBatch directly
                 for batch in arrow_reader {
-                    // Cooperative cancellation
                     if cancelled_blocking.load(std::sync::atomic::Ordering::Relaxed) {
                         info!(sql = %sql_log_blocking, "execute_query: query cancelled due to timeout");
                         break;
@@ -274,7 +271,7 @@ impl QueryEngine for DuckDBQueryEngine {
                 Ok::<(), QueryError>(())
             });
 
-            // 5. Timeout supervision (ASYNC)
+            // Timeout supervision
             tokio::spawn({
                 let tx = tx.clone();
                 let cancelled = cancelled.clone();
@@ -305,7 +302,6 @@ impl QueryEngine for DuckDBQueryEngine {
                 }
             });
 
-            // 6. Return streaming receiver
             let stream = ReceiverStream::new(rx);
             Ok(Box::pin(stream) as QueryResultStream)
         }
