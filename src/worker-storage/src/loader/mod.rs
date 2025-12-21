@@ -4,7 +4,7 @@ mod starrocks;
 
 use self::adapter::SourceAdapter;
 use self::types::{Catalog, LoadRequest};
-use crate::engine::engine::{StorageEngine, TableMetadata};
+use crate::engine::storage_engine::{StorageEngine, TableMetadata};
 use std::sync::Arc;
 
 pub struct DataLoader<E: StorageEngine> {

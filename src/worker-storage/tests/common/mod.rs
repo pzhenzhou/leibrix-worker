@@ -3,8 +3,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use futures_util::stream;
 use std::collections::HashMap;
 use std::sync::Arc;
-use worker_storage::engine::duckdb::{DuckDBConfig, memory_duckdb::MemoryDuckDBEngine};
-use worker_storage::engine::engine::{EpochView, RecordBatchStream, StorageError};
+use worker_storage::engine::duckdb::{DuckDBConfig, storage_engine_impl::MemoryDuckDBEngine};
+use worker_storage::engine::storage_engine::{EpochView, RecordBatchStream, StorageError};
 
 use std::sync::Once;
 

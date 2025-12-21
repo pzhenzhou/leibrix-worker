@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use worker_storage::engine::engine::StorageEngine;
+use worker_storage::engine::storage_engine::StorageEngine;
 
 #[tokio::test]
 async fn test_concurrent_epoch_creation_different_datasets() {

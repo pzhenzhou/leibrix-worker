@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 pub fn epoch_key(dataset_id: &str, epoch_id: &str) -> String {
-    format!("{}::{}", dataset_id, epoch_id)
+    format!("{}__{}", dataset_id, epoch_id)
 }
 
 pub fn escape_ident(name: &str) -> String {
@@ -38,6 +38,20 @@ pub fn estimate_table_bytes(row_count: u64, schema: &Schema) -> u64 {
         })
         .sum();
     row_count.saturating_mul(row_size)
+}
+
+pub fn query_table_row_count(conn: &Connection, table_name: &str) -> anyhow::Result<u64> {
+    let query = format!("SELECT COUNT(*) FROM {}", escape_ident(table_name));
+
+    let mut stmt = conn
+        .prepare(&query)
+        .with_context(|| format!("Failed to prepare COUNT query for {}", table_name))?;
+
+    let count: i64 = stmt
+        .query_row([], |row| row.get(0))
+        .with_context(|| format!("Failed to execute COUNT query for {}", table_name))?;
+
+    Ok(count as u64)
 }
 
 pub fn query_table_size(conn: &Connection, table_name: &str) -> anyhow::Result<u64> {

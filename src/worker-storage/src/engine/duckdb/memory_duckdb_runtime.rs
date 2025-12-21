@@ -1,6 +1,6 @@
 use super::DuckDBConfig;
 use super::helper::*;
-use crate::engine::engine::*;
+use crate::engine::storage_engine::*;
 use anyhow::{Context, bail};
 use arrow::datatypes::Schema;
 use arrow::record_batch;
@@ -59,7 +59,7 @@ pub enum EngineCom {
         resp: oneshot::Sender<anyhow::Result<Vec<EpochView>>>,
     },
     MemoryStats {
-        resp: oneshot::Sender<anyhow::Result<crate::engine::engine::MemoryStats>>,
+        resp: oneshot::Sender<anyhow::Result<crate::engine::storage_engine::MemoryStats>>,
     },
     GetMetrics {
         resp: oneshot::Sender<anyhow::Result<EngineMetrics>>,
@@ -69,13 +69,16 @@ pub enum EngineCom {
     },
 }
 
+pub fn database_path() -> String {
+    ":memory:leibrix_db".to_string()
+}
 
 pub fn engine_main(
     config: DuckDBConfig,
     mut rx: sync::mpsc::Receiver<EngineCom>,
 ) -> anyhow::Result<()> {
     // The connection is not thread-safe, so owned by single thread
-    let db_conn = duckdb::Connection::open_in_memory().context("Failed to open db")?;
+    let db_conn = Connection::open(&database_path()).context("Failed to open db")?;
     if let Some(mem_limit) = config.memory_limit_mb {
         db_conn
             .execute(&format!("SET memory_limit='{} MB'", mem_limit), params![])
@@ -144,9 +147,7 @@ pub fn engine_main(
                 epoch_id,
                 resp,
             }) => {
-                let res = on_drop_epoch(
-                    &mut state, dataset_id, epoch_id,
-                );
+                let res = on_drop_epoch(&mut state, dataset_id, epoch_id);
                 if let Err(e) = &res {
                     warn!(error = ?e, "Failed to drop epoch");
                 }
@@ -213,11 +214,7 @@ fn on_start_epoch(
         return;
     }
     // if create table fails, send error back
-    if let Err(e) = create_table_from_arrow_schema(
-        &state.conn,
-        &epoch_view.table_name,
-        &schema,
-    ) {
+    if let Err(e) = create_table_from_arrow_schema(&state.conn, &epoch_view.table_name, &schema) {
         let _ = done.send(Err(e));
         return;
     }
@@ -255,20 +252,13 @@ fn on_ingest_batch(
 
     // Flush if threshold reached
     if ep.pending_rows >= state.config.flush_rows_threshold {
-        flush_pending_batches(
-            &state.conn,
-            &mut state.metrics,
-            ep,
-        )
-        .with_context(|| format!("Failed to flush pending batches for epoch {}", key))?;
+        flush_pending_batches(&state.conn, &mut state.metrics, ep)
+            .with_context(|| format!("Failed to flush pending batches for epoch {}", key))?;
     }
     Ok(())
 }
 
-fn on_finish_epoch(
-    state: &mut EngineState,
-    key: String,
-) -> anyhow::Result<()> {
+fn on_finish_epoch(state: &mut EngineState, key: String) -> anyhow::Result<()> {
     let mut ep = state.in_progress.remove(&key).ok_or_else(|| {
         StorageError::InvalidArgument(format!("FinishEpoch for non-existent epoch: {}", key))
     })?;
@@ -281,12 +271,8 @@ fn on_finish_epoch(
     }
 
     // Flush any remaining buffered batches
-    flush_pending_batches(
-        &state.conn,
-        &mut state.metrics,
-        &mut ep,
-    )
-    .with_context(|| format!("Failed to flush final batches for epoch {}", key))?;
+    flush_pending_batches(&state.conn, &mut state.metrics, &mut ep)
+        .with_context(|| format!("Failed to flush final batches for epoch {}", key))?;
 
     if ep.total_rows_committed == 0 {
         let _ = ep.done.send(Err(StorageError::InvalidArgument(
@@ -369,11 +355,12 @@ fn on_drop_epoch(
 }
 
 fn on_list_epochs(state: &mut EngineState, dataset_id: String) -> anyhow::Result<Vec<EpochView>> {
+    let prefix = format!("{}__{}", dataset_id, "");
     let epochs = state
         .committed
         .iter()
         .filter_map(|(key, (epoch_view, _metadata))| {
-            if key.starts_with(&format!("{}_", dataset_id)) {
+            if key.starts_with(&prefix) {
                 Some(epoch_view.clone())
             } else {
                 None

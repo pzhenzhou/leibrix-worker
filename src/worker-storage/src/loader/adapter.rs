@@ -1,5 +1,5 @@
 use super::types::DataSource;
-use crate::engine::engine::{RecordBatchStream, StorageError};
+use crate::engine::storage_engine::{RecordBatchStream, StorageError};
 use arrow::datatypes::Schema;
 use std::future::Future;
 use std::pin::Pin;

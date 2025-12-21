@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 mod helper;
-pub mod memory_duckdb;
+pub mod storage_engine_impl;
 mod memory_duckdb_runtime;
+mod query_engine_impl;
 
 /// Configuration for the DuckDB storage engine.
 #[derive(Debug, Clone)]

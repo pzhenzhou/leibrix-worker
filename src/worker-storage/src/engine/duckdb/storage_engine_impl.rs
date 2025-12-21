@@ -1,7 +1,7 @@
+use super::DuckDBConfig;
 use super::helper::*;
 use super::memory_duckdb_runtime::*;
-use super::DuckDBConfig;
-use crate::engine::engine::{EngineMetrics, EpochView, TableMetadata};
+use crate::engine::storage_engine::{EngineMetrics, EpochView, TableMetadata};
 use std::future::Future;
 use tokio::sync;
 use tokio::sync::oneshot;
@@ -28,15 +28,18 @@ impl MemoryDuckDBEngine {
     pub fn with_defaults() -> anyhow::Result<Self> {
         Self::new(DuckDBConfig::default())
     }
+
+    pub fn database_path(&self) -> String {
+        ":memory:leibrix_db".to_string()
+    }
 }
 
-
-impl crate::engine::engine::StorageEngine for MemoryDuckDBEngine {
+impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
     fn create_epoch_table(
         &self,
         dataset_id: String,
         epoch: EpochView,
-        mut arrow_stream: crate::engine::engine::RecordBatchStream,
+        mut arrow_stream: crate::engine::storage_engine::RecordBatchStream,
     ) -> impl Future<Output = anyhow::Result<TableMetadata>> + Send {
         let tx = self.com_tx.clone();
         async move {
@@ -136,7 +139,7 @@ impl crate::engine::engine::StorageEngine for MemoryDuckDBEngine {
 
     fn memory_stats(
         &self,
-    ) -> impl Future<Output = anyhow::Result<crate::engine::engine::MemoryStats>> + Send {
+    ) -> impl Future<Output = anyhow::Result<crate::engine::storage_engine::MemoryStats>> + Send {
         let tx = self.com_tx.clone();
         async move {
             let (resp_tx, resp_rx) = oneshot::channel();

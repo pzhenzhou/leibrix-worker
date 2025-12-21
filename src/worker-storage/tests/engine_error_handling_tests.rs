@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use worker_storage::engine::engine::StorageEngine;
+use worker_storage::engine::storage_engine::StorageEngine;
 
 #[tokio::test]
 async fn test_error_empty_arrow_stream() {
