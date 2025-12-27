@@ -4,7 +4,8 @@ use crate::engine::storage_engine::*;
 use anyhow::{Context, bail};
 use arrow::datatypes::Schema;
 use arrow::record_batch;
-use duckdb::{Connection, params};
+use duckdb::{Connection, params, DuckdbConnectionManager};
+use r2d2::PooledConnection;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync;
@@ -25,7 +26,7 @@ struct EpochInProgress {
 }
 
 struct EngineState {
-    conn: Connection,
+    conn: PooledConnection<DuckdbConnectionManager>,
     config: DuckDBConfig,
     committed: HashMap<String, (EpochView, TableMetadata)>,
     in_progress: HashMap<String, EpochInProgress>,
@@ -69,16 +70,12 @@ pub enum EngineCom {
     },
 }
 
-pub fn database_path() -> String {
-    ":memory:leibrix_db".to_string()
-}
-
 pub fn engine_main(
     config: DuckDBConfig,
     mut rx: sync::mpsc::Receiver<EngineCom>,
+    db_conn: PooledConnection<DuckdbConnectionManager>,
 ) -> anyhow::Result<()> {
-    // The connection is not thread-safe, so owned by single thread
-    let db_conn = Connection::open(&database_path()).context("Failed to open db")?;
+    // Configure the connection
     if let Some(mem_limit) = config.memory_limit_mb {
         db_conn
             .execute(&format!("SET memory_limit='{} MB'", mem_limit), params![])

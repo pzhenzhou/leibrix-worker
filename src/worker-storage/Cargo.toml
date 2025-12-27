@@ -15,7 +15,8 @@ arrow-ipc = "=56.2.0"
 # Flight client to talk to StarRocks
 arrow-flight = { version = "=56.2.0", features = ["flight-sql"] }
 base64 = "0.22"
-duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json"] }
+duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json", "r2d2"] }
+r2d2 = "0.8"
 futures-core = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

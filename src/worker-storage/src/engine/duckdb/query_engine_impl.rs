@@ -1,7 +1,7 @@
 use crate::engine::query_engine::{QueryEngine, QueryError, QueryResultStream};
 use crate::engine::storage_engine::TableMetadata;
+use super::SharedDatabase;
 use arrow_schema::Schema;
-use duckdb::Connection;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,32 +15,41 @@ const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_QUERY_MEMORY_MB: usize = 1024;
 
 pub struct DuckDBQueryEngine {
-    /// Database path to connect to (e.g., ":memory:leibrix_db")
-    database_path: String,
+    /// Shared database handle for creating read connections
+    shared_db: Arc<SharedDatabase>,
     /// Semaphore to limit concurrent queries
     query_limiter: Arc<Semaphore>,
     /// Maximum concurrent queries allowed
+    #[allow(dead_code)]
     max_concurrent_queries: usize,
 }
 
 impl DuckDBQueryEngine {
-    pub fn new(database_path: String, max_concurrent_queries: usize) -> Self {
+    /// Creates a new query engine using the shared database.
+    /// This allows read-write separation with StorageEngine.
+    pub fn new(shared_db: Arc<SharedDatabase>, max_concurrent_queries: usize) -> Self {
         let query_limiter = Arc::new(Semaphore::new(max_concurrent_queries));
         Self {
-            database_path,
+            shared_db,
             query_limiter,
             max_concurrent_queries,
         }
     }
 
     fn classify_anyhow_error(err: anyhow::Error, table_name: &str) -> QueryError {
-        let msg = err.to_string();
-        if msg.contains("does not exist") || msg.contains("not found") {
+        // Use {:#} to get the full error chain including all nested causes
+        let full_msg = format!("{:#}", err);
+        
+        if full_msg.contains("does not exist") 
+            || full_msg.contains("not found")
+            || full_msg.contains("Table with name")
+            || full_msg.contains("Catalog Error")
+        {
             QueryError::TableNotFound(table_name.to_string())
-        } else if msg.contains("Out of Memory") || msg.contains("failed to allocate") {
-            QueryError::DuckDB(format!("Out of memory: {}", msg))
+        } else if full_msg.contains("Out of Memory") || full_msg.contains("failed to allocate") {
+            QueryError::DuckDB(format!("Out of memory: {}", full_msg))
         } else {
-            QueryError::DuckDB(msg)
+            QueryError::DuckDB(err.to_string())
         }
     }
 
@@ -64,15 +73,15 @@ impl QueryEngine for DuckDBQueryEngine {
         &self,
         table_name: &str,
     ) -> impl Future<Output = Result<Arc<Schema>, QueryError>> + Send {
-        let database_path = self.database_path.clone();
+        let shared_db = self.shared_db.clone();
         let table_name = table_name.to_string();
         let table_name_log = table_name.clone();
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = Connection::open(&database_path).map_err(|e| {
-                    QueryError::Internal(format!("failed to open connection: {}", e))
-                })?;
+                let conn = shared_db
+                    .get()
+                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
 
                 // Use DuckDB's DESCRIBE to get schema
                 super::helper::query_table_schema(&conn, &table_name)
@@ -92,15 +101,15 @@ impl QueryEngine for DuckDBQueryEngine {
         &self,
         table_name: &str,
     ) -> impl Future<Output = Result<TableMetadata, QueryError>> + Send {
-        let database_path = self.database_path.clone();
+        let shared_db = self.shared_db.clone();
         let table_name = table_name.to_string();
         let table_name_log = table_name.clone();
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = Connection::open(&database_path).map_err(|e| {
-                    QueryError::Internal(format!("failed to open connection: {}", e))
-                })?;
+                let conn = shared_db
+                    .get()
+                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
 
                 let schema = super::helper::query_table_schema(&conn, &table_name)
                     .map_err(|e| Self::classify_anyhow_error(e, &table_name))?;
@@ -134,16 +143,16 @@ impl QueryEngine for DuckDBQueryEngine {
         &self,
         dataset_id: &str,
     ) -> impl Future<Output = Result<Vec<String>, QueryError>> + Send {
-        let database_path = self.database_path.clone();
+        let shared_db = self.shared_db.clone();
         let prefix = format!("{}__%", dataset_id);
         let dataset_id_log = dataset_id.to_string();
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = Connection::open(&database_path).map_err(|e| {
-                    QueryError::Internal(format!("failed to open connection: {}", e))
-                })?;
-                // dataset is logical , a high-level concept, is a grouping of data (e.g., a project, a user, a topic).
+                let conn = shared_db
+                    .get()
+                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
+                // dataset is logical, a high-level concept, is a grouping of data (e.g., a project, a user, a topic).
                 // Tables are physical entities in the database.
                 let mut stmt = conn
                     .prepare(
@@ -179,7 +188,7 @@ impl QueryEngine for DuckDBQueryEngine {
         timeout_secs: Option<Duration>,
     ) -> impl Future<Output = Result<QueryResultStream, QueryError>> + Send {
         let query_limiter = self.query_limiter.clone();
-        let database_path = self.database_path.clone();
+        let shared_db = self.shared_db.clone();
         let sql = sql.to_string();
         let memory_mb = memory_limit.unwrap_or(DEFAULT_QUERY_MEMORY_MB);
         let timeout = timeout_secs.unwrap_or(Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS));
@@ -208,12 +217,12 @@ impl QueryEngine for DuckDBQueryEngine {
                 // Hold permit for full execution
                 let _permit = permit;
 
-                // Open connection and configure
-                let conn = match Connection::open(&database_path) {
+                // Get pooled connection from shared database
+                let conn = match shared_db.get() {
                     Ok(c) => c,
                     Err(e) => {
-                        let err = QueryError::Internal(format!("open failed: {}", e));
-                        error!(error = %err, "execute_query: connection open failed");
+                        let err = QueryError::Internal(format!("failed to get pooled connection: {}", e));
+                        error!(error = %err, "execute_query: connection failed");
                         let _ = tx_blocking.blocking_send(Err(err.clone()));
                         return Err(err);
                     }

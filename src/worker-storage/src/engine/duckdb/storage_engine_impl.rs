@@ -1,8 +1,10 @@
 use super::DuckDBConfig;
 use super::helper::*;
 use super::memory_duckdb_runtime::*;
+use super::SharedDatabase;
 use crate::engine::storage_engine::{EngineMetrics, EpochView, TableMetadata};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync;
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -10,27 +12,44 @@ use tracing::{error, info};
 /// An in-memory DuckDB storage engine for the acceleration layer.
 pub struct MemoryDuckDBEngine {
     com_tx: sync::mpsc::Sender<EngineCom>,
+    shared_db: Arc<SharedDatabase>,
 }
 
 impl MemoryDuckDBEngine {
-    pub fn new(config: DuckDBConfig) -> anyhow::Result<Self> {
+    /// Creates a new engine with a shared database.
+    /// The shared database can be used by QueryEngine for read operations.
+    pub fn new(config: DuckDBConfig, shared_db: Arc<SharedDatabase>) -> anyhow::Result<Self> {
         info!("MemoryDuckDBEngine starting with config: {:?}", config);
+        
+        // Get a pooled connection for the storage engine (writer)
+        // This connection will be held for the lifetime of the engine
+        let writer_conn = shared_db.get()?;
+        
         let (tx, rx) = sync::mpsc::channel(config.channel_capacity);
         let thread_config = config.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = engine_main(thread_config, rx) {
+            if let Err(e) = engine_main(thread_config, rx, writer_conn) {
                 error!("Engine loop exited with error: {}", e);
             }
         });
-        Ok(Self { com_tx: tx })
+        Ok(Self { com_tx: tx, shared_db })
+    }
+
+    /// Creates a new engine with a fresh in-memory database.
+    /// Convenience method that creates its own SharedDatabase.
+    pub fn new_with_fresh_db(config: DuckDBConfig) -> anyhow::Result<Self> {
+        let shared_db = Arc::new(SharedDatabase::new(&config)?);
+        Self::new(config, shared_db)
     }
 
     pub fn with_defaults() -> anyhow::Result<Self> {
-        Self::new(DuckDBConfig::default())
+        Self::new_with_fresh_db(DuckDBConfig::default())
     }
 
-    pub fn database_path(&self) -> String {
-        ":memory:leibrix_db".to_string()
+    /// Returns the shared database handle.
+    /// Use this to create a QueryEngine that reads from the same database.
+    pub fn shared_database(&self) -> Arc<SharedDatabase> {
+        self.shared_db.clone()
     }
 }
 
