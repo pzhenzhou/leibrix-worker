@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 arrow = { version = "=56.2.0", features = ["ipc", "arrow-json"] }
+sqlparser = { version = "0.60", features = ["visitor"] }
 arrow-array = "=56.2.0"
 arrow-schema = "=56.2.0"
 arrow-ipc = "=56.2.0"

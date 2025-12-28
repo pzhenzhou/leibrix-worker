@@ -84,18 +84,18 @@ pub fn engine_main(
         info!("DuckDB memory limit set to {} MB", mem_limit);
     }
 
-    if let Some(parent) = config.tmp_dir.as_ref().and_then(|d| d.parent()) {
-        std::fs::create_dir_all(parent).context("Failed to create tmp dir parent")?;
+    if let Some(tmp_dir) = &config.tmp_dir {
+        std::fs::create_dir_all(tmp_dir).context("Failed to create tmp dir")?;
         db_conn
             .execute(
-                &format!("SET temp_directory='{}'", parent.display()),
+                &format!("SET temp_directory='{}'", tmp_dir.display()),
                 params![],
             )
             .context("Failed to set temp directory")?;
 
         info!(
-            "DuckDB set temp director for potential disk spilling {}",
-            parent.display()
+            "DuckDB set temp directory for potential disk spilling {}",
+            tmp_dir.display()
         );
     }
     info!("DuckDB Memory Engine started");
