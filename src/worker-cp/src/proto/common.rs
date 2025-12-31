@@ -36,9 +36,23 @@ pub struct IcebergCatalog {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StarRocksCatalog {
     #[prost(string, tag = "1")]
-    pub dsn: ::prost::alloc::string::String,
+    pub catalog_name: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub internal_catalog_name: ::prost::alloc::string::String,
+    pub host: ::prost::alloc::string::String,
+    #[prost(int32, tag = "3")]
+    pub port: i32,
+    #[prost(string, tag = "4")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub username: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub password: ::prost::alloc::string::String,
+    #[prost(int32, tag = "7")]
+    pub max_concurrency: i32,
+    /// Optional pool configuration for fine-grained control
+    /// If not specified, worker will use sensible defaults
+    #[prost(message, optional, tag = "8")]
+    pub pool_options: ::core::option::Option<ConnectionPoolOptions>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
@@ -49,6 +63,38 @@ pub struct JdbcCatalog {
     pub uri: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub driver: ::prost::alloc::string::String,
+    /// Optional pool configuration for fine-grained control
+    #[prost(message, optional, tag = "3")]
+    pub pool_options: ::core::option::Option<ConnectionPoolOptions>,
+}
+/// Reusable connection pool configuration
+/// Applies to any SQL-based catalog (StarRocks, JDBC, etc.)
+#[allow(non_camel_case_types)]
+#[allow(clippy::large_enum_variant)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ConnectionPoolOptions {
+    /// Maximum number of connections in the pool (concurrency limit for MySQL)
+    #[prost(uint32, optional, tag = "1")]
+    pub max_connections: ::core::option::Option<u32>,
+    /// Minimum number of idle connections to maintain
+    #[prost(uint32, optional, tag = "2")]
+    pub min_connections: ::core::option::Option<u32>,
+    /// Maximum time to wait for a connection from the pool (milliseconds)
+    #[prost(uint64, optional, tag = "3")]
+    pub acquire_timeout_ms: ::core::option::Option<u64>,
+    /// Connection timeout when establishing new connections (milliseconds)
+    #[prost(uint64, optional, tag = "4")]
+    pub connect_timeout_ms: ::core::option::Option<u64>,
+    /// Maximum idle time before a connection is closed (milliseconds)
+    #[prost(uint64, optional, tag = "5")]
+    pub idle_timeout_ms: ::core::option::Option<u64>,
+    /// Maximum lifetime of a connection before it's recycled (milliseconds)
+    #[prost(uint64, optional, tag = "6")]
+    pub max_lifetime_ms: ::core::option::Option<u64>,
+    /// Batch size for query result fetching
+    #[prost(uint32, optional, tag = "7")]
+    pub batch_size: ::core::option::Option<u32>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]

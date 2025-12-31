@@ -18,13 +18,42 @@ message IcebergCatalog {
 }
 
 message StarRocksCatalog {
-  string dsn = 1;
-  string internal_catalog_name = 2;
+  string catalog_name = 1;
+  string host = 2;
+  int32 port = 3;
+  string database = 4;
+  string username = 5;
+  string password = 6;
+  int32 max_concurrency = 7;
+  // Optional pool configuration for fine-grained control
+  // If not specified, worker will use sensible defaults
+  optional ConnectionPoolOptions pool_options = 8;
 }
 
 message JdbcCatalog {
   string uri = 1;
   string driver = 2;
+  // Optional pool configuration for fine-grained control
+  optional ConnectionPoolOptions pool_options = 3;
+}
+
+// Reusable connection pool configuration
+// Applies to any SQL-based catalog (StarRocks, JDBC, etc.)
+message ConnectionPoolOptions {
+  // Maximum number of connections in the pool (concurrency limit for MySQL)
+  optional uint32 max_connections = 1;
+  // Minimum number of idle connections to maintain
+  optional uint32 min_connections = 2;
+  // Maximum time to wait for a connection from the pool (milliseconds)
+  optional uint64 acquire_timeout_ms = 3;
+  // Connection timeout when establishing new connections (milliseconds)
+  optional uint64 connect_timeout_ms = 4;
+  // Maximum idle time before a connection is closed (milliseconds)
+  optional uint64 idle_timeout_ms = 5;
+  // Maximum lifetime of a connection before it's recycled (milliseconds)
+  optional uint64 max_lifetime_ms = 6;
+  // Batch size for query result fetching
+  optional uint32 batch_size = 7;
 }
 
 message Partition {

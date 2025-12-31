@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+Cargo.lock
 # profile
 *.heap
 # Visual Studio Code
@@ -40,5 +41,4 @@ src/log/
 *.log
 log/
 logs/
-.monograph_proxy
 .bin/

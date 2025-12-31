@@ -1,0 +1,33 @@
+[package]
+name = "worker-storage"
+version.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+arrow = { version = "=56.2.0", features = ["ipc", "arrow-json"] }
+sqlparser = { version = "0.60", features = ["visitor"] }
+arrow-array = "=56.2.0"
+arrow-schema = "=56.2.0"
+arrow-ipc = "=56.2.0"
+
+# Flight client to talk to StarRocks
+arrow-flight = { version = "=56.2.0", features = ["flight-sql"] }
+base64 = "0.22"
+duckdb = { version = "1.4.2", features = ["bundled", "appender-arrow", "vscalar-arrow", "json", "r2d2"] }
+r2d2 = "0.8"
+futures-core = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tonic = "0.13.1"
+
+# SQL dependencies
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono"] }
+chrono = "0.4"

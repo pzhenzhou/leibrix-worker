@@ -4,8 +4,8 @@ cargo-features = ["profile-rustflags"]
 resolver = "2"
 members = [
     "src/worker-cli",
-    "src/worker-cp"
-]
+    "src/worker-cp",
+    "src/worker-storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,7 +19,13 @@ prost = { version = "0.13", default-features = false, features = ["prost-derive"
 prost-types = { version = "0.13" }
 tonic = { version = "0.13", default-features = false, features = ["transport", "prost", "codegen"] }
 serde = { version = "1", features = ["derive"] }
+futures-core = { version = "0.3" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+thiserror = { version = "2" }
 tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "tracing"] }
+anyhow = { version = "1.0" }
+tokio = { version = "1", features = ["full"] }
 
 tonic-health = { version = "0.13" }
 tonic-reflection = { version = "0.13" }

@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:4.0-latest
+    container_name: sr-fe
+    hostname: sr-fe
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+    environment:
+      - FE_SERVERS=sr-fe:9010
+      - STARROCKS_FE_JAVA_OPTS=-Xms512m -Xmx512m
+    command: [ "/opt/starrocks/fe/bin/start_fe.sh" ]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    volumes:
+      - fe-meta:/opt/starrocks/fe/meta
+      - fe-log:/opt/starrocks/fe/log
+    restart: unless-stopped
+
+  starrocks-be:
+    image: starrocks/be-ubuntu:4.0-latest
+    container_name: sr-be
+    hostname: sr-be
+    depends_on:
+      - starrocks-fe
+    ports:
+      - "8040:8040"
+      - "9050:9050"
+    environment:
+      - STARROCKS_BE_JAVA_OPTS=-Xms512m -Xmx1g
+    command: [ "/opt/starrocks/be/bin/start_be.sh" ]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    volumes:
+      - be-storage:/opt/starrocks/be/storage
+      - be-log:/opt/starrocks/be/log
+    restart: unless-stopped
+
+volumes:
+  fe-meta:
+  fe-log:
+  be-storage:
+  be-log:
