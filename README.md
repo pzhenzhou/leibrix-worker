@@ -1,5 +1,5 @@
 # Leibrix Worker
-
+⚠️ **Active development:** not production-ready yet.
 **High-performance, memory-centric data plane for the Leibrix distributed acceleration layer.**
 
 ## What is Leibrix Worker?
