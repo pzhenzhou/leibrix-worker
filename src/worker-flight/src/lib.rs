@@ -16,6 +16,8 @@
 //! - [`FlightServerConfig`]: Configuration for the Arrow Flight server
 //! - [`FlightServerBuilder`]: Builder for creating and running the server
 //! - [`QueryTicket`]: Serializable query parameters for DoGet requests
+//! - [`StageResultTicket`]: Ticket for LDP stage output retrieval
+//! - [`FlightTicket`]: Unified ticket type for dispatching in DoGet
 //!
 //! # Example
 //!
@@ -50,5 +52,5 @@ pub mod ticket;
 pub use config::FlightServerConfig;
 pub use error::{map_query_error_to_status, map_transform_error_to_status};
 pub use server::{load_identity, FlightServerBuilder, FlightServerError};
-pub use service::WorkerFlightService;
-pub use ticket::{QueryTicket, TicketError};
+pub use service::{CachedStageResult, CachedStageStats, StageResultKey, StageResultStore, WorkerFlightService};
+pub use ticket::{FlightTicket, QueryTicket, StageResultTicket, TicketError};

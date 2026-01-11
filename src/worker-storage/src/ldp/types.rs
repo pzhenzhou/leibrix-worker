@@ -27,6 +27,43 @@ pub type WorkerId = String;
 pub type EpochId = String;
 
 // ============================================================================
+// Statistics Confidence
+// ============================================================================
+
+/// Indicates the confidence level of statistics.
+///
+/// This is crucial for the baseline-first exchange selection strategy:
+/// - Exact stats: Can optimize (e.g., use broadcast for small joins)
+/// - Estimated/Unknown stats: Use conservative baseline (shuffle)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StatsSource {
+    /// Exact count from epoch ingestion metadata.
+    /// Trustworthy - can be used for optimization decisions.
+    Exact,
+
+    /// Estimated via sampling (e.g., reservoir sampling) or heuristics.
+    /// Apply safety factor before making decisions.
+    Estimated,
+
+    /// No statistics available.
+    /// Use conservative baseline strategies.
+    #[default]
+    Unknown,
+}
+
+impl StatsSource {
+    /// Check if stats are trustworthy enough for optimization.
+    pub fn is_exact(&self) -> bool {
+        matches!(self, StatsSource::Exact)
+    }
+
+    /// Check if stats should trigger conservative behavior.
+    pub fn is_uncertain(&self) -> bool {
+        !self.is_exact()
+    }
+}
+
+// ============================================================================
 // Distribution Properties
 // ============================================================================
 
@@ -84,15 +121,56 @@ pub struct DistributionAnnotation {
 
     /// Estimated bytes at this node's output.
     pub est_bytes: u64,
+
+    /// Confidence level of the statistics.
+    /// Determines whether optimizations (like broadcast) can be applied.
+    pub stats_source: StatsSource,
 }
 
 impl DistributionAnnotation {
-    /// Create a new annotation.
+    /// Create a new annotation with exact stats.
     pub fn new(distribution: Distribution, est_rows: u64, est_bytes: u64) -> Self {
         Self {
             distribution,
             est_rows,
             est_bytes,
+            stats_source: StatsSource::Exact,
+        }
+    }
+
+    /// Create a new annotation with specified stats source.
+    pub fn with_source(
+        distribution: Distribution,
+        est_rows: u64,
+        est_bytes: u64,
+        stats_source: StatsSource,
+    ) -> Self {
+        Self {
+            distribution,
+            est_rows,
+            est_bytes,
+            stats_source,
+        }
+    }
+
+    /// Create an annotation with unknown stats (conservative baseline).
+    pub fn unknown(distribution: Distribution) -> Self {
+        Self {
+            distribution,
+            est_rows: 0,
+            est_bytes: 0,
+            stats_source: StatsSource::Unknown,
+        }
+    }
+
+    /// Apply safety factor to estimates if stats are uncertain.
+    pub fn with_safety_factor(&self, factor: f64) -> (u64, u64) {
+        if self.stats_source.is_uncertain() {
+            let safe_rows = (self.est_rows as f64 * factor) as u64;
+            let safe_bytes = (self.est_bytes as f64 * factor) as u64;
+            (safe_rows, safe_bytes)
+        } else {
+            (self.est_rows, self.est_bytes)
         }
     }
 }
@@ -200,7 +278,7 @@ pub enum StageOutput {
     Stream,
 
     /// Multiple partitioned streams (for HashPartition exchange).
-    Partitioned { partitions: u32 },
+    Partitioned { partitions: u32, field_refs: Vec<u32> },
 }
 
 impl Default for StageOutput {
@@ -321,6 +399,9 @@ pub struct LdpPlan {
 
     /// Exchange edges connecting stages.
     pub edges: Vec<ExchangeEdge>,
+
+    /// The root stage ID (final stage that produces the query result).
+    pub root_stage: StageId,
 }
 
 impl LdpPlan {
@@ -331,6 +412,18 @@ impl LdpPlan {
             coordinator,
             stages: Vec::new(),
             edges: Vec::new(),
+            root_stage: 0,
+        }
+    }
+
+    /// Create a new LDP plan with a root stage.
+    pub fn with_root(query_id: QueryId, coordinator: WorkerId, root_stage: StageId) -> Self {
+        Self {
+            query_id,
+            coordinator,
+            stages: Vec::new(),
+            edges: Vec::new(),
+            root_stage,
         }
     }
 
@@ -362,6 +455,50 @@ impl LdpPlan {
             .map(|e| e.from_stage)
             .collect()
     }
+
+    /// Get stages in topological execution order (dependencies first).
+    ///
+    /// Returns stages ordered so that a stage's dependencies always appear
+    /// before the stage itself.
+    pub fn topological_order(&self) -> Vec<StageId> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut in_degree: std::collections::HashMap<StageId, usize> = self
+            .stages
+            .iter()
+            .map(|s| (s.stage_id, self.upstream_stages(s.stage_id).len()))
+            .collect();
+
+        // Start with stages that have no dependencies
+        let mut queue: VecDeque<StageId> = self
+            .stages
+            .iter()
+            .filter(|s| in_degree.get(&s.stage_id) == Some(&0))
+            .map(|s| s.stage_id)
+            .collect();
+
+        while let Some(stage_id) = queue.pop_front() {
+            if visited.contains(&stage_id) {
+                continue;
+            }
+            visited.insert(stage_id);
+            result.push(stage_id);
+
+            // Decrement in-degree for downstream stages
+            for downstream in self.downstream_stages(stage_id) {
+                if let Some(deg) = in_degree.get_mut(&downstream) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 && !visited.contains(&downstream) {
+                        queue.push_back(downstream);
+                    }
+                }
+            }
+        }
+
+        result
+    }
 }
 
 /// Statistics for an epoch, used for cost estimation.
@@ -376,6 +513,38 @@ pub struct EpochStats {
     /// Optional: Number of distinct values for common columns.
     /// Key is column name, value is estimated NDV.
     pub ndv: HashMap<String, u64>,
+
+    /// Confidence level of these statistics.
+    /// Exact if computed during epoch ingestion.
+    pub stats_source: StatsSource,
+}
+
+impl EpochStats {
+    /// Create epoch stats with exact confidence (from ingestion metadata).
+    pub fn exact(rows: u64, bytes: u64) -> Self {
+        Self {
+            rows,
+            bytes,
+            ndv: HashMap::new(),
+            stats_source: StatsSource::Exact,
+        }
+    }
+
+    /// Create epoch stats with estimated confidence.
+    pub fn estimated(rows: u64, bytes: u64) -> Self {
+        Self {
+            rows,
+            bytes,
+            ndv: HashMap::new(),
+            stats_source: StatsSource::Estimated,
+        }
+    }
+
+    /// Add NDV (number of distinct values) for a column.
+    pub fn with_ndv(mut self, column: impl Into<String>, ndv: u64) -> Self {
+        self.ndv.insert(column.into(), ndv);
+        self
+    }
 }
 
 // ============================================================================

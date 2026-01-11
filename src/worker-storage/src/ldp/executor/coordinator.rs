@@ -1,0 +1,1041 @@
+//! LDP Coordinator for end-to-end query execution.
+//!
+//! The coordinator is responsible for the complete query lifecycle:
+//! 1. SQL parsing and admission control
+//! 2. LDP planning (SQL → Substrait → LDP)
+//! 3. Stage scheduling to workers
+//! 4. Exchange execution between stages
+//! 5. Result streaming back to client
+//!
+//! # Architecture
+//! ```text
+//! Client SQL Query
+//!        │
+//!        ▼
+//! ┌──────────────────────────────────────────────┐
+//! │              LdpCoordinator                   │
+//! │  ┌─────────────────────────────────────────┐ │
+//! │  │ 1. Admission Control                    │ │
+//! │  │    - Reject recursive CTEs              │ │
+//! │  │    - Require time-range predicates      │ │
+//! │  └─────────────────────────────────────────┘ │
+//! │                    │                         │
+//! │                    ▼                         │
+//! │  ┌─────────────────────────────────────────┐ │
+//! │  │ 2. SQL Transformation                   │ │
+//! │  │    - Rewrite to table macros            │ │
+//! │  │    - Extract date ranges                │ │
+//! │  └─────────────────────────────────────────┘ │
+//! │                    │                         │
+//! │                    ▼                         │
+//! │  ┌─────────────────────────────────────────┐ │
+//! │  │ 3. LDP Planning                         │ │
+//! │  │    - SQL → Substrait (DuckDB)           │ │
+//! │  │    - Annotate distributions             │ │
+//! │  │    - Cut into stages                    │ │
+//! │  └─────────────────────────────────────────┘ │
+//! │                    │                         │
+//! │                    ▼                         │
+//! │  ┌─────────────────────────────────────────┐ │
+//! │  │ 4. Stage Execution                      │ │
+//! │  │    - Topological ordering               │ │
+//! │  │    - Submit to workers via Flight       │ │
+//! │  │    - Execute exchanges                  │ │
+//! │  └─────────────────────────────────────────┘ │
+//! │                    │                         │
+//! │                    ▼                         │
+//! │  ┌─────────────────────────────────────────┐ │
+//! │  │ 5. Result Streaming                     │ │
+//! │  │    - Fetch final stage output           │ │
+//! │  │    - Stream Arrow batches to client     │ │
+//! │  └─────────────────────────────────────────┘ │
+//! └──────────────────────────────────────────────┘
+//!        │
+//!        ▼
+//! Arrow RecordBatch Stream
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::record_batch::RecordBatch;
+use duckdb::Connection;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
+
+use crate::ldp::executor::stage::{StageExecutor, StageTickets};
+use crate::ldp::executor::{
+    DistributedExchangeRuntime, ExchangeRuntime, ExecutionError, FlightStageExecutor,
+    LocalStageExecutor, WorkerConnectionPool,
+};
+use crate::ldp::planner::metadata::{InMemoryMetadata, Metadata};
+use crate::ldp::planner::pipeline::{plan_ldp, PipelineError};
+use crate::ldp::planner::policy::PlannerPolicy;
+use crate::ldp::planner::storage_metadata::ClusterMetadata;
+use crate::ldp::{Exchange, LdpPlan, Stage, StageId, WorkerId};
+use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
+
+// ============================================================================
+// Coordinator Error
+// ============================================================================
+
+/// Errors that can occur during query coordination.
+#[derive(Debug)]
+pub enum CoordinatorError {
+    /// Query was rejected by admission control.
+    AdmissionRejected(AdmissionError),
+    /// SQL transformation failed.
+    TransformFailed(String),
+    /// LDP planning failed.
+    PlanningFailed(PipelineError),
+    /// Stage execution failed.
+    ExecutionFailed(ExecutionError),
+    /// DuckDB connection error.
+    ConnectionFailed(String),
+    /// Worker communication failed.
+    WorkerFailed(WorkerId, String),
+    /// Query timeout.
+    Timeout(Duration),
+    /// Invalid configuration.
+    InvalidConfig(String),
+}
+
+impl std::fmt::Display for CoordinatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordinatorError::AdmissionRejected(e) => {
+                write!(f, "Query rejected: {}", e)
+            }
+            CoordinatorError::TransformFailed(msg) => {
+                write!(f, "SQL transformation failed: {}", msg)
+            }
+            CoordinatorError::PlanningFailed(e) => {
+                write!(f, "LDP planning failed: {}", e)
+            }
+            CoordinatorError::ExecutionFailed(e) => {
+                write!(f, "Execution failed: {}", e)
+            }
+            CoordinatorError::ConnectionFailed(msg) => {
+                write!(f, "Connection failed: {}", msg)
+            }
+            CoordinatorError::WorkerFailed(worker, msg) => {
+                write!(f, "Worker {} failed: {}", worker, msg)
+            }
+            CoordinatorError::Timeout(duration) => {
+                write!(f, "Query timeout after {:?}", duration)
+            }
+            CoordinatorError::InvalidConfig(msg) => {
+                write!(f, "Invalid configuration: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CoordinatorError {}
+
+impl From<AdmissionError> for CoordinatorError {
+    fn from(err: AdmissionError) -> Self {
+        CoordinatorError::AdmissionRejected(err)
+    }
+}
+
+impl From<PipelineError> for CoordinatorError {
+    fn from(err: PipelineError) -> Self {
+        CoordinatorError::PlanningFailed(err)
+    }
+}
+
+impl From<ExecutionError> for CoordinatorError {
+    fn from(err: ExecutionError) -> Self {
+        CoordinatorError::ExecutionFailed(err)
+    }
+}
+
+// ============================================================================
+// Query Result
+// ============================================================================
+
+/// Result of a coordinated query execution.
+#[derive(Debug)]
+pub struct QueryResult {
+    /// Query identifier.
+    pub query_id: String,
+    /// Result batches.
+    pub batches: Vec<RecordBatch>,
+    /// Execution statistics.
+    pub stats: QueryStats,
+}
+
+/// Statistics about query execution.
+#[derive(Clone, Debug, Default)]
+pub struct QueryStats {
+    /// Total execution time.
+    pub total_time: Duration,
+    /// Planning time.
+    pub planning_time: Duration,
+    /// Execution time.
+    pub execution_time: Duration,
+    /// Number of stages executed.
+    pub stages_executed: usize,
+    /// Total rows produced.
+    pub rows_produced: u64,
+    /// Total bytes produced.
+    pub bytes_produced: u64,
+    /// Workers involved.
+    pub workers_used: Vec<WorkerId>,
+}
+
+// ============================================================================
+// Coordinator Configuration
+// ============================================================================
+
+/// Configuration for the LDP coordinator.
+#[derive(Clone, Debug)]
+pub struct CoordinatorConfig {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Query timeout.
+    pub query_timeout: Duration,
+    /// Maximum concurrent stages.
+    pub max_concurrent_stages: usize,
+    /// Maximum retries per stage.
+    pub max_stage_retries: u32,
+    /// Planner policy.
+    pub planner_policy: PlannerPolicy,
+    /// Enable distributed execution (vs local-only).
+    pub distributed: bool,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            tenant_id: "default".to_string(),
+            query_timeout: Duration::from_secs(300), // 5 minutes
+            max_concurrent_stages: 16,
+            max_stage_retries: 3,
+            planner_policy: PlannerPolicy::default(),
+            distributed: false,
+        }
+    }
+}
+
+impl CoordinatorConfig {
+    /// Create a new coordinator config with the given tenant ID.
+    pub fn new(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Enable distributed execution.
+    pub fn with_distributed(mut self, enabled: bool) -> Self {
+        self.distributed = enabled;
+        self
+    }
+
+    /// Set query timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
+    }
+
+    /// Set planner policy.
+    pub fn with_policy(mut self, policy: PlannerPolicy) -> Self {
+        self.planner_policy = policy;
+        self
+    }
+}
+
+// ============================================================================
+// Stage Execution Status
+// ============================================================================
+
+/// Status of a stage during execution.
+#[derive(Clone, Debug)]
+pub enum StageStatus {
+    /// Stage is pending execution.
+    Pending,
+    /// Stage is currently running.
+    Running { started_at: Instant },
+    /// Stage completed successfully.
+    Completed { tickets: StageTickets, duration: Duration },
+    /// Stage failed.
+    Failed { error: String, retries: u32 },
+}
+
+// ============================================================================
+// LDP Coordinator
+// ============================================================================
+
+/// Main coordinator for distributed query execution.
+///
+/// The coordinator manages the complete lifecycle of a query from SQL
+/// to result streaming.
+pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
+    /// Configuration.
+    config: CoordinatorConfig,
+    /// SQL transformer for query rewriting.
+    transformer: RwLock<SqlTransformer>,
+    /// Metadata provider.
+    metadata: Arc<M>,
+    /// DuckDB connection for planning.
+    conn: Arc<RwLock<Connection>>,
+    /// Worker connection pool (for distributed mode).
+    connection_pool: Arc<WorkerConnectionPool>,
+    /// Stage execution status tracking.
+    stage_status: RwLock<HashMap<(String, StageId), StageStatus>>,
+}
+
+impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
+    /// Create a new coordinator with in-memory DuckDB.
+    pub fn new(config: CoordinatorConfig, metadata: Arc<M>) -> Result<Self, CoordinatorError> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| CoordinatorError::ConnectionFailed(e.to_string()))?;
+
+        Ok(Self {
+            config,
+            transformer: RwLock::new(SqlTransformer::new()),
+            metadata,
+            conn: Arc::new(RwLock::new(conn)),
+            connection_pool: Arc::new(WorkerConnectionPool::new()),
+            stage_status: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Create a coordinator with an existing DuckDB connection.
+    pub fn with_connection(
+        config: CoordinatorConfig,
+        metadata: Arc<M>,
+        conn: Connection,
+    ) -> Self {
+        Self {
+            config,
+            transformer: RwLock::new(SqlTransformer::new()),
+            metadata,
+            conn: Arc::new(RwLock::new(conn)),
+            connection_pool: Arc::new(WorkerConnectionPool::new()),
+            stage_status: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a dataset for SQL transformation.
+    pub async fn register_dataset(&self, dataset: RegisteredDataset) {
+        self.transformer.write().await.register_dataset(dataset);
+    }
+
+    /// Register a remote worker for distributed execution.
+    pub async fn register_worker(&self, worker_id: &str, endpoint: &str) {
+        self.connection_pool
+            .register_worker(worker_id.to_string(), endpoint.to_string())
+            .await;
+    }
+
+    /// Get the worker connection pool.
+    pub fn connection_pool(&self) -> &Arc<WorkerConnectionPool> {
+        &self.connection_pool
+    }
+
+    // ========================================================================
+    // Main Query Execution
+    // ========================================================================
+
+    /// Execute a SQL query and return results.
+    ///
+    /// This is the main entry point for query execution. It performs:
+    /// 1. Admission control
+    /// 2. SQL transformation
+    /// 3. LDP planning
+    /// 4. Stage execution
+    /// 5. Result collection
+    ///
+    /// # Arguments
+    /// * `sql` - The SQL query to execute.
+    ///
+    /// # Returns
+    /// * `Ok(QueryResult)` - Query completed successfully.
+    /// * `Err(CoordinatorError)` - Query failed.
+    pub async fn execute_query(&self, sql: &str) -> Result<QueryResult, CoordinatorError> {
+        let total_start = Instant::now();
+        let query_id = generate_query_id();
+
+        info!(query_id = %query_id, "Starting query execution");
+
+        // Step 1: Admission control
+        let transformer = self.transformer.read().await;
+        transformer
+            .admit(sql)
+            .map_err(CoordinatorError::AdmissionRejected)?;
+        debug!(query_id = %query_id, "Query admitted");
+
+        // Step 2: SQL transformation
+        let transform_result = transformer
+            .transform(sql)
+            .map_err(|e| CoordinatorError::TransformFailed(e.to_string()))?;
+
+        let transformed_sql = &transform_result.transformed_sql;
+        debug!(
+            query_id = %query_id,
+            tables_replaced = ?transform_result.tables_replaced,
+            "SQL transformed"
+        );
+
+        // Drop the transformer lock before planning
+        drop(transformer);
+
+        // Step 3: LDP planning
+        let planning_start = Instant::now();
+        let plan = self.plan_query(transformed_sql, &query_id).await?;
+        let planning_time = planning_start.elapsed();
+
+        info!(
+            query_id = %query_id,
+            stages = plan.stages.len(),
+            planning_time_ms = planning_time.as_millis(),
+            "LDP plan generated"
+        );
+
+        // Step 4: Execute plan
+        let execution_start = Instant::now();
+        let (batches, workers_used) = self.execute_plan(&plan, &query_id).await?;
+        let execution_time = execution_start.elapsed();
+
+        // Calculate stats
+        let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let bytes_produced: u64 = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        let stats = QueryStats {
+            total_time: total_start.elapsed(),
+            planning_time,
+            execution_time,
+            stages_executed: plan.stages.len(),
+            rows_produced,
+            bytes_produced,
+            workers_used,
+        };
+
+        info!(
+            query_id = %query_id,
+            total_time_ms = stats.total_time.as_millis(),
+            rows = rows_produced,
+            stages = stats.stages_executed,
+            "Query completed"
+        );
+
+        Ok(QueryResult {
+            query_id,
+            batches,
+            stats,
+        })
+    }
+
+    /// Execute a SQL query with a pre-generated query ID.
+    pub async fn execute_query_with_id(
+        &self,
+        sql: &str,
+        query_id: &str,
+    ) -> Result<QueryResult, CoordinatorError> {
+        let total_start = Instant::now();
+
+        info!(query_id = %query_id, "Starting query execution");
+
+        // Step 1: Admission control
+        let transformer = self.transformer.read().await;
+        transformer
+            .admit(sql)
+            .map_err(CoordinatorError::AdmissionRejected)?;
+
+        // Step 2: SQL transformation
+        let transform_result = transformer
+            .transform(sql)
+            .map_err(|e| CoordinatorError::TransformFailed(e.to_string()))?;
+        let transformed_sql = &transform_result.transformed_sql;
+        drop(transformer);
+
+        // Step 3: LDP planning
+        let planning_start = Instant::now();
+        let plan = self.plan_query(transformed_sql, query_id).await?;
+        let planning_time = planning_start.elapsed();
+
+        // Step 4: Execute plan
+        let execution_start = Instant::now();
+        let (batches, workers_used) = self.execute_plan(&plan, query_id).await?;
+        let execution_time = execution_start.elapsed();
+
+        // Calculate stats
+        let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let bytes_produced: u64 = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        let stats = QueryStats {
+            total_time: total_start.elapsed(),
+            planning_time,
+            execution_time,
+            stages_executed: plan.stages.len(),
+            rows_produced,
+            bytes_produced,
+            workers_used,
+        };
+
+        Ok(QueryResult {
+            query_id: query_id.to_string(),
+            batches,
+            stats,
+        })
+    }
+
+    // ========================================================================
+    // Planning
+    // ========================================================================
+
+    /// Plan a SQL query into an LDP plan.
+    async fn plan_query(&self, sql: &str, query_id: &str) -> Result<LdpPlan, CoordinatorError> {
+        let conn = self.conn.read().await;
+        let plan = plan_ldp(
+            sql,
+            &*conn,
+            self.metadata.as_ref(),
+            &self.config.planner_policy,
+            query_id,
+        )?;
+        Ok(plan)
+    }
+
+    /// Plan without transformation (for already-transformed SQL or testing).
+    pub async fn plan_raw(&self, sql: &str, query_id: &str) -> Result<LdpPlan, CoordinatorError> {
+        self.plan_query(sql, query_id).await
+    }
+
+    // ========================================================================
+    // Execution
+    // ========================================================================
+
+    /// Execute an LDP plan.
+    async fn execute_plan(
+        &self,
+        plan: &LdpPlan,
+        query_id: &str,
+    ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
+        if self.config.distributed {
+            self.execute_distributed(plan, query_id).await
+        } else {
+            self.execute_local(plan, query_id).await
+        }
+    }
+
+    /// Execute plan locally (single-node).
+    async fn execute_local(
+        &self,
+        plan: &LdpPlan,
+        query_id: &str,
+    ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
+        let executor = Arc::new(LocalStageExecutor::new());
+        let exchange_runtime = ExchangeRuntime::new(executor.clone());
+
+        let mut stage_outputs: HashMap<StageId, StageTickets> = HashMap::new();
+        let mut workers_used: Vec<WorkerId> = Vec::new();
+
+        // Execute stages in topological order
+        let execution_order = plan.topological_order();
+
+        for stage_id in execution_order {
+            let stage = plan
+                .get_stage(stage_id)
+                .ok_or(ExecutionError::StageNotFound(stage_id))?;
+
+            // Track stage status
+            self.set_stage_status(query_id, stage_id, StageStatus::Running {
+                started_at: Instant::now(),
+            })
+            .await;
+
+            // Resolve inputs
+            let inputs = exchange_runtime
+                .resolve_inputs(plan, stage_id, &stage_outputs)
+                .await
+                .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?;
+
+            // Execute stage with retry
+            let result = self
+                .execute_stage_with_retry(&*executor, stage, inputs, query_id)
+                .await;
+
+            match result {
+                Ok(tickets) => {
+                    // Track workers
+                    for ticket in tickets.all() {
+                        if !workers_used.contains(&ticket.worker_id) {
+                            workers_used.push(ticket.worker_id.clone());
+                        }
+                    }
+
+                    self.set_stage_status(
+                        query_id,
+                        stage_id,
+                        StageStatus::Completed {
+                            tickets: tickets.clone(),
+                            duration: Duration::from_secs(0), // TODO: track actual duration
+                        },
+                    )
+                    .await;
+
+                    stage_outputs.insert(stage_id, tickets);
+                }
+                Err(e) => {
+                    self.set_stage_status(
+                        query_id,
+                        stage_id,
+                        StageStatus::Failed {
+                            error: e.to_string(),
+                            retries: self.config.max_stage_retries,
+                        },
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Fetch final output
+        let root_tickets = stage_outputs
+            .get(&plan.root_stage)
+            .ok_or(ExecutionError::StageNotFound(plan.root_stage))?;
+
+        let mut final_batches = Vec::new();
+        for ticket in root_tickets.all() {
+            let batches = executor
+                .fetch_output(ticket)
+                .await
+                .map_err(|e| ExecutionError::StageFailed(plan.root_stage, e.to_string()))?;
+            final_batches.extend(batches);
+        }
+
+        Ok((final_batches, workers_used))
+    }
+
+    /// Execute plan in distributed mode.
+    async fn execute_distributed(
+        &self,
+        plan: &LdpPlan,
+        query_id: &str,
+    ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
+        let executor = Arc::new(FlightStageExecutor::new(
+            self.config.tenant_id.clone(),
+            self.connection_pool.clone(),
+        ));
+        let exchange_runtime = DistributedExchangeRuntime::new(
+            self.config.tenant_id.clone(),
+            self.connection_pool.clone(),
+        );
+
+        let mut stage_outputs: HashMap<StageId, StageTickets> = HashMap::new();
+        let mut workers_used: Vec<WorkerId> = Vec::new();
+
+        // Execute stages in topological order
+        let execution_order = plan.topological_order();
+
+        for stage_id in execution_order {
+            let stage = plan
+                .get_stage(stage_id)
+                .ok_or(ExecutionError::StageNotFound(stage_id))?;
+
+            self.set_stage_status(query_id, stage_id, StageStatus::Running {
+                started_at: Instant::now(),
+            })
+            .await;
+
+            info!(
+                query_id = %query_id,
+                stage_id = stage_id,
+                target_workers = ?stage.target_workers,
+                "Executing stage on workers"
+            );
+
+            // Submit to each target worker with worker-specific inputs
+            let mut all_tickets = StageTickets::new();
+
+            for target_worker in &stage.target_workers {
+                // Resolve inputs specifically for this worker
+                let inputs = self
+                    .resolve_distributed_inputs_for_worker(
+                        plan,
+                        stage_id,
+                        target_worker,
+                        &stage_outputs,
+                        &exchange_runtime,
+                    )
+                    .await?;
+
+                debug!(
+                    query_id = %query_id,
+                    stage_id = stage_id,
+                    worker = %target_worker,
+                    input_tables = inputs.len(),
+                    "Resolved inputs for worker"
+                );
+
+                // Create a modified stage with single worker
+                let worker_stage = Stage {
+                    stage_id: stage.stage_id,
+                    target_workers: vec![target_worker.clone()],
+                    inputs: stage.inputs.clone(),
+                    output: stage.output.clone(),
+                    substrait_plan: stage.substrait_plan.clone(),
+                    limits: stage.limits.clone(),
+                };
+
+                // Submit to this specific worker with its inputs
+                let tickets = self
+                    .execute_stage_with_retry(&*executor, &worker_stage, inputs, query_id)
+                    .await?;
+
+                // Collect tickets
+                for ticket in tickets.all() {
+                    all_tickets.add(ticket.clone());
+                    if !workers_used.contains(&ticket.worker_id) {
+                        workers_used.push(ticket.worker_id.clone());
+                    }
+                }
+            }
+
+            self.set_stage_status(
+                query_id,
+                stage_id,
+                StageStatus::Completed {
+                    tickets: all_tickets.clone(),
+                    duration: Duration::from_secs(0),
+                },
+            )
+            .await;
+
+            stage_outputs.insert(stage_id, all_tickets);
+        }
+
+        // Fetch final output via Flight
+        let root_tickets = stage_outputs
+            .get(&plan.root_stage)
+            .ok_or(ExecutionError::StageNotFound(plan.root_stage))?;
+
+        let mut final_batches = Vec::new();
+        for ticket in root_tickets.all() {
+            let batches = executor
+                .fetch_output(ticket)
+                .await
+                .map_err(|e| ExecutionError::StageFailed(plan.root_stage, e.to_string()))?;
+            final_batches.extend(batches);
+        }
+
+        Ok((final_batches, workers_used))
+    }
+
+    /// Execute a stage with retry logic.
+    async fn execute_stage_with_retry<E: StageExecutor>(
+        &self,
+        executor: &E,
+        stage: &Stage,
+        inputs: HashMap<String, Vec<RecordBatch>>,
+        query_id: &str,
+    ) -> Result<StageTickets, ExecutionError> {
+        let mut last_error = None;
+        let mut retries = 0;
+
+        while retries <= self.config.max_stage_retries {
+            match executor.submit_stage(query_id, stage, inputs.clone()).await {
+                Ok(tickets) => return Ok(tickets),
+                Err(e) => {
+                    retries += 1;
+                    warn!(
+                        query_id = %query_id,
+                        stage_id = stage.stage_id,
+                        retry = retries,
+                        error = %e,
+                        "Stage execution failed, retrying"
+                    );
+                    last_error = Some(e);
+
+                    // Exponential backoff
+                    if retries <= self.config.max_stage_retries {
+                        tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(retries - 1))).await;
+                    }
+                }
+            }
+        }
+
+        Err(ExecutionError::StageFailed(
+            stage.stage_id,
+            format!(
+                "Failed after {} retries: {}",
+                retries,
+                last_error.map(|e| e.to_string()).unwrap_or_default()
+            ),
+        ))
+    }
+
+    /// Resolve inputs for a specific target worker in distributed execution.
+    ///
+    /// This method fetches the correct subset of data for each worker based on
+    /// the exchange type:
+    /// - Gather: Only the target worker receives data
+    /// - Broadcast: All target workers receive the same data
+    /// - HashPartition: Each worker receives its assigned partitions
+    async fn resolve_distributed_inputs_for_worker(
+        &self,
+        plan: &LdpPlan,
+        stage_id: StageId,
+        target_worker: &WorkerId,
+        stage_outputs: &HashMap<StageId, StageTickets>,
+        exchange_runtime: &DistributedExchangeRuntime,
+    ) -> Result<HashMap<String, Vec<RecordBatch>>, CoordinatorError> {
+        let stage = plan
+            .get_stage(stage_id)
+            .ok_or(ExecutionError::StageNotFound(stage_id))?;
+
+        let mut inputs = HashMap::new();
+
+        for input in &stage.inputs {
+            if let crate::ldp::StageInput::ExchangeInput { exchange_id, table_name } = input {
+                // Find the edge for this exchange
+                if let Some(edge) = plan.edges.iter().find(|e| e.exchange_id == *exchange_id) {
+                    let upstream_stage = edge.from_stage;
+
+                    if let Some(upstream_tickets) = stage_outputs.get(&upstream_stage) {
+                        // Get source workers from upstream tickets
+                        let source_workers: Vec<WorkerId> = upstream_tickets
+                            .all()
+                            .iter()
+                            .map(|t| t.worker_id.clone())
+                            .collect();
+
+                        // Call the correct exchange method based on exchange type
+                        let batches = match &edge.kind {
+                            Exchange::Gather { target } => {
+                                // Only the target worker receives gathered data
+                                if target_worker != target {
+                                    warn!(
+                                        query_id = %plan.query_id,
+                                        stage_id = stage_id,
+                                        worker = %target_worker,
+                                        target = %target,
+                                        "Worker is not the gather target, skipping"
+                                    );
+                                    vec![]
+                                } else {
+                                    debug!(
+                                        query_id = %plan.query_id,
+                                        stage_id = stage_id,
+                                        worker = %target_worker,
+                                        sources = ?source_workers,
+                                        "Executing gather exchange"
+                                    );
+                                    exchange_runtime
+                                        .execute_gather(
+                                            &plan.query_id,
+                                            upstream_stage,
+                                            &source_workers,
+                                            target,
+                                        )
+                                        .await
+                                        .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?
+                                }
+                            }
+                            Exchange::Broadcast { targets } => {
+                                // All target workers receive the same broadcasted data
+                                if !targets.contains(target_worker) {
+                                    warn!(
+                                        query_id = %plan.query_id,
+                                        stage_id = stage_id,
+                                        worker = %target_worker,
+                                        targets = ?targets,
+                                        "Worker not in broadcast targets, skipping"
+                                    );
+                                    vec![]
+                                } else {
+                                    debug!(
+                                        query_id = %plan.query_id,
+                                        stage_id = stage_id,
+                                        worker = %target_worker,
+                                        sources = ?source_workers,
+                                        "Executing broadcast exchange"
+                                    );
+                                    // Fetch from source (typically single worker for broadcast)
+                                    let source = source_workers.first().ok_or_else(|| {
+                                        ExecutionError::ExchangeFailed(
+                                            "No source worker for broadcast".into(),
+                                        )
+                                    })?;
+
+                                    exchange_runtime
+                                        .execute_broadcast(
+                                            &plan.query_id,
+                                            upstream_stage,
+                                            source,
+                                            targets,
+                                        )
+                                        .await
+                                        .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?
+                                }
+                            }
+                            Exchange::HashPartition {
+                                field_refs,
+                                partitions,
+                            } => {
+                                // Each worker receives only its assigned partitions
+                                debug!(
+                                    query_id = %plan.query_id,
+                                    stage_id = stage_id,
+                                    worker = %target_worker,
+                                    sources = ?source_workers,
+                                    partitions = partitions,
+                                    "Executing hash partition exchange"
+                                );
+                                exchange_runtime
+                                    .execute_hash_partition(
+                                        &plan.query_id,
+                                        upstream_stage,
+                                        &source_workers,
+                                        field_refs,
+                                        *partitions,
+                                        &edge.partition_to_worker,
+                                        target_worker,
+                                    )
+                                    .await
+                                    .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?
+                            }
+                        };
+
+                        inputs.insert(table_name.clone(), batches);
+                    }
+                }
+            }
+        }
+
+        Ok(inputs)
+    }
+
+    // ========================================================================
+    // Status Tracking
+    // ========================================================================
+
+    /// Set stage execution status.
+    async fn set_stage_status(&self, query_id: &str, stage_id: StageId, status: StageStatus) {
+        let mut statuses = self.stage_status.write().await;
+        statuses.insert((query_id.to_string(), stage_id), status);
+    }
+
+    /// Get stage execution status.
+    pub async fn get_stage_status(&self, query_id: &str, stage_id: StageId) -> Option<StageStatus> {
+        let statuses = self.stage_status.read().await;
+        statuses.get(&(query_id.to_string(), stage_id)).cloned()
+    }
+
+    /// Clear status for a completed query.
+    pub async fn clear_query_status(&self, query_id: &str) {
+        let mut statuses = self.stage_status.write().await;
+        statuses.retain(|(qid, _), _| qid != query_id);
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Generate a unique query ID.
+fn generate_query_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("q_{:x}", timestamp % 0xFFFFFFFFFFFF)
+}
+
+// ============================================================================
+// Convenience Constructors
+// ============================================================================
+
+impl LdpCoordinator<InMemoryMetadata> {
+    /// Create a simple coordinator with in-memory metadata.
+    pub fn simple(tenant_id: impl Into<String>) -> Result<Self, CoordinatorError> {
+        let config = CoordinatorConfig::new(tenant_id);
+        let metadata = Arc::new(InMemoryMetadata::new());
+        Self::new(config, metadata)
+    }
+}
+
+impl LdpCoordinator<ClusterMetadata> {
+    /// Create a coordinator for distributed execution.
+    pub fn distributed(tenant_id: impl Into<String>) -> Result<Self, CoordinatorError> {
+        let config = CoordinatorConfig::new(tenant_id).with_distributed(true);
+        let metadata = Arc::new(ClusterMetadata::new());
+        Self::new(config, metadata)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_coordinator_creation() {
+        let coordinator = LdpCoordinator::simple("test_tenant").unwrap();
+        assert!(!coordinator.config.distributed);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_coordinator_creation() {
+        let coordinator = LdpCoordinator::distributed("test_tenant").unwrap();
+        assert!(coordinator.config.distributed);
+    }
+
+    #[tokio::test]
+    async fn test_register_dataset() {
+        let coordinator = LdpCoordinator::simple("test_tenant").unwrap();
+        let dataset = RegisteredDataset::new("sales".to_string(), "dt".to_string());
+        coordinator.register_dataset(dataset).await;
+
+        let transformer = coordinator.transformer.read().await;
+        assert!(transformer.is_registered("sales"));
+    }
+
+    #[tokio::test]
+    async fn test_register_worker() {
+        let coordinator = LdpCoordinator::distributed("test_tenant").unwrap();
+        coordinator
+            .register_worker("worker1", "http://localhost:50051")
+            .await;
+
+        // Worker should be registered in connection pool
+        // (actual connection happens on first use)
+    }
+
+    #[tokio::test]
+    async fn test_query_id_generation() {
+        let id1 = generate_query_id();
+        let id2 = generate_query_id();
+
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("q_"));
+        assert_eq!(id1.len(), 14); // "q_" + 12 chars
+    }
+
+    #[tokio::test]
+    async fn test_config_builder() {
+        let config = CoordinatorConfig::new("tenant1")
+            .with_distributed(true)
+            .with_timeout(Duration::from_secs(60));
+
+        assert_eq!(config.tenant_id, "tenant1");
+        assert!(config.distributed);
+        assert_eq!(config.query_timeout, Duration::from_secs(60));
+    }
+}

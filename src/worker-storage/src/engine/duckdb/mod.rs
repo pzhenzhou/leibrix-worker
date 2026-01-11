@@ -8,6 +8,7 @@ mod helper;
 pub mod storage_engine_impl;
 mod memory_duckdb_runtime;
 pub mod query_engine_impl;
+pub mod substrait;
 
 // Re-export commonly used types
 pub use query_engine_impl::DuckDBQueryEngine;

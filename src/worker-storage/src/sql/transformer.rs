@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use sqlparser::ast::*;
 
+use super::admission::{AdmissionController, AdmissionError};
 use super::analyzer::PredicateAnalyzer;
 use super::discovery::TableDiscovery;
-use super::error::SqlTransformError;
+use super::error::{SqlTransformError, TransformError};
 use super::parser::{parse_sql, to_sql};
 use super::types::*;
 
@@ -62,6 +63,59 @@ impl SqlTransformer {
     /// Get registered dataset names.
     pub fn registered_dataset_ids(&self) -> HashSet<String> {
         self.registered_datasets.keys().cloned().collect()
+    }
+
+    /// Create an admission controller with the same registered datasets.
+    ///
+    /// This is useful if you want to perform admission checks separately
+    /// from transformation.
+    pub fn create_admission_controller(&self) -> AdmissionController {
+        let mut controller = AdmissionController::new();
+        for dataset in self.registered_datasets.values() {
+            controller.register_dataset(dataset.clone());
+        }
+        controller
+    }
+
+    /// Check if a query passes admission control.
+    ///
+    /// This performs structural checks to ensure the query is suitable
+    /// for distributed execution:
+    /// - Rejects recursive CTEs
+    /// - Requires time-range predicates on distributed tables
+    ///
+    /// # Arguments
+    /// * `sql` - The SQL query to check.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Query is admitted for execution.
+    /// * `Err(AdmissionError)` - Query is rejected with reason.
+    pub fn admit(&self, sql: &str) -> Result<(), AdmissionError> {
+        let controller = self.create_admission_controller();
+        controller.check(sql)
+    }
+
+    /// Perform admission control and transformation in one step.
+    ///
+    /// This is the recommended method for production use as it ensures
+    /// queries are validated before transformation.
+    ///
+    /// # Process
+    /// 1. Run admission checks (recursive CTE, time-range requirements)
+    /// 2. If admitted, transform the query to use table macros
+    ///
+    /// # Arguments
+    /// * `sql` - The SQL query to process.
+    ///
+    /// # Returns
+    /// * `Ok(TransformResult)` - Query admitted and transformed.
+    /// * `Err(TransformError)` - Admission failed or transformation failed.
+    pub fn admit_and_transform(&self, sql: &str) -> Result<TransformResult, TransformError> {
+        // Step 1: Admission control
+        self.admit(sql).map_err(TransformError::Admission)?;
+
+        // Step 2: Transform
+        self.transform(sql).map_err(TransformError::Transform)
     }
 
     /// Transform a SQL query to use table macros.

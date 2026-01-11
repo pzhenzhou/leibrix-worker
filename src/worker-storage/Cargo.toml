@@ -31,6 +31,10 @@ tonic = "0.13.1"
 # LDP proto types
 worker-proto = { path = "../worker-proto" }
 
+# Substrait for distributed query planning
+substrait = "0.57"
+prost = "0.13"  # Must match substrait's prost version
+
 # SQL dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono"] }
 chrono = "0.4"

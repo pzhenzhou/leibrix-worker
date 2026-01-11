@@ -5,6 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use arrow::datatypes::Schema;
 use thiserror::Error;
+use std::future::Future;
+
+use crate::ldp::EpochStats;
 
 pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, StorageError>> + Send>>;
 
@@ -147,6 +150,25 @@ pub trait StorageEngine: Send + Sync {
     fn memory_stats(&self) -> impl Future<Output = anyhow::Result<MemoryStats>> + Send;
 
     fn get_metrics(&self) -> impl Future<Output = anyhow::Result<EngineMetrics>> + Send;
+
+    /// Get statistics for a specific epoch.
+    ///
+    /// This method is used by the LDP planner for cost estimation.
+    /// It returns row counts, byte sizes, and optionally NDV (number of distinct values)
+    /// for columns in the epoch.
+    ///
+    /// # Arguments
+    /// * `dataset_id` - The logical dataset identifier
+    /// * `epoch_id` - The epoch identifier
+    ///
+    /// # Returns
+    /// Returns `EpochStats` containing row count, byte size, and optional NDV map.
+    /// Returns `None` if the epoch doesn't exist.
+    fn get_epoch_stats(
+        &self,
+        dataset_id: &str,
+        epoch_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<EpochStats>>> + Send;
 
     fn shutdown(self) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

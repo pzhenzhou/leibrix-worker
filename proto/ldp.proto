@@ -91,6 +91,7 @@ message StreamOutput {
 
 message PartitionedOutput {
   uint32 partitions = 1;
+  repeated uint32 field_refs = 2;  // Hash keys for partitioning
 }
 
 // Resource limits for stage execution.
@@ -158,8 +159,8 @@ message SubmitStageRequest {
 message ExchangeInputRegistration {
   // Table name to register as (e.g., "__exchange_0")
   string table_name = 1;
-  // Schema of the Arrow data (IPC format)
-  bytes arrow_schema = 2;
+  // Arrow IPC stream containing the batches
+  bytes arrow_ipc_stream = 2;
 }
 
 // Response from stage execution.

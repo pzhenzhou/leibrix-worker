@@ -3,6 +3,7 @@ use super::helper::*;
 use super::memory_duckdb_runtime::*;
 use super::SharedDatabase;
 use crate::engine::storage_engine::{EngineMetrics, EpochView, TableMetadata};
+use crate::ldp::{EpochStats, StatsSource};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync;
@@ -183,6 +184,39 @@ impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
             resp_rx
                 .await
                 .map_err(|_| anyhow::anyhow!("Response channel closed"))?
+        }
+    }
+
+    fn get_epoch_stats(
+        &self,
+        dataset_id: &str,
+        epoch_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<EpochStats>>> + Send {
+        let tx = self.com_tx.clone();
+        let dataset_id = dataset_id.to_string();
+        let epoch_id = epoch_id.to_string();
+        async move {
+            // First get memory stats to find the epoch
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(EngineCom::MemoryStats { resp: resp_tx })
+                .await
+                .map_err(|_| anyhow::anyhow!("Engine channel closed"))?;
+
+            let stats = resp_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("Response channel closed"))??;
+
+            // Find the epoch in the stats
+            let epoch_stat = stats.epochs.iter().find(|e| {
+                e.dataset_id == dataset_id && e.epoch_id == epoch_id
+            });
+
+            Ok(epoch_stat.map(|e| EpochStats {
+                rows: e.rows_count,
+                bytes: e.approx_bytes,
+                ndv: std::collections::HashMap::new(), // NDV not yet tracked
+                stats_source: StatsSource::Exact,      // From ingestion metadata
+            }))
         }
     }
 

@@ -153,7 +153,7 @@ pub struct ExchangeInput {
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StageOutput {
     #[prost(oneof = "stage_output::OutputType", tags = "1, 2")]
     pub output_type: ::core::option::Option<stage_output::OutputType>,
@@ -163,7 +163,7 @@ pub mod stage_output {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum OutputType {
         #[prost(message, tag = "1")]
         Stream(super::StreamOutput),
@@ -180,10 +180,13 @@ pub struct StreamOutput {}
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionedOutput {
     #[prost(uint32, tag = "1")]
     pub partitions: u32,
+    /// Hash keys for partitioning
+    #[prost(uint32, repeated, tag = "2")]
+    pub field_refs: ::prost::alloc::vec::Vec<u32>,
 }
 /// Resource limits for stage execution.
 #[allow(non_camel_case_types)]
@@ -283,9 +286,9 @@ pub struct ExchangeInputRegistration {
     /// Table name to register as (e.g., "__exchange_0")
     #[prost(string, tag = "1")]
     pub table_name: ::prost::alloc::string::String,
-    /// Schema of the Arrow data (IPC format)
+    /// Arrow IPC stream containing the batches
     #[prost(bytes = "vec", tag = "2")]
-    pub arrow_schema: ::prost::alloc::vec::Vec<u8>,
+    pub arrow_ipc_stream: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response from stage execution.
 #[allow(non_camel_case_types)]

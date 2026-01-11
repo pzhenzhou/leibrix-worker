@@ -60,6 +60,7 @@
 //!   are not extracted; wide scan is used instead
 //! - Dynamic SQL (table names in variables) is not supported
 
+mod admission;
 mod analyzer;
 mod boolean_analyzer;
 mod discovery;
@@ -120,7 +121,8 @@ pub(crate) fn extract_join_on_expr_mut(op: &mut JoinOperator) -> Option<&mut Exp
 }
 
 // Re-export public types
-pub use error::SqlTransformError;
+pub use admission::{AdmissionController, AdmissionError, AdmissionResult};
+pub use error::{SqlTransformError, TransformError};
 pub use interval::Interval;
 pub use transformer::SqlTransformer;
 pub use types::{

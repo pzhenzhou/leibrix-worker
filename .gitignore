@@ -5,6 +5,7 @@ Cargo.lock
 *.heap
 # Visual Studio Code
 .vscode/
+.qoder/
 .devcontainer/
 #*.json
 *.log
