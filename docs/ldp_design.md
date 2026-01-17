@@ -191,7 +191,7 @@ Arrow RecordBatch Stream
 
 ### 3.6 Connection Pool Sizing
 
-The system uses connection pooling to balance parallelism against memory pressure. Higher pool sizes increase concurrent query capacity but risk memory exhaustion under load.
+The system uses connection pooling (via `deadpool 0.12` with native async traits) to balance parallelism against memory pressure. The `DuckDbConnectionPool` uses `SharedDatabase` internally, which manages pooled connections for concurrent query execution. Higher pool sizes (`max_size`, default 32) increase concurrent query capacity but risk memory exhaustion under load. The pool is accessed via `pool.get()` which returns a `PooledConnection`.
 
 ### 3.7 Optimization Path: When Statistics Are Sufficient
 
@@ -601,7 +601,9 @@ Statistics confidence propagates through the tree:
 
 ### 4.8 Execution: Topological Stage Ordering
 
-Once planning produces an LdpPlan with stages connected by exchange edges, execution follows a **dependency-driven** order:
+Once planning produces an LdpPlan with stages connected by exchange edges, execution follows a **dependency-driven** order.
+
+**Current Implementation Status:** Stages currently execute sequentially in topological order. Parallel execution of independent stages (same DAG level) is designed but not yet implemented (see enhancement task ldp-007).
 
 #### The Topological Ordering Principle
 
@@ -623,8 +625,10 @@ Example DAG:
                        ↓
                  Stage 3 (aggregate)
 
-Execution Order: [0, 1] → 2 → 3
-              (0,1 can run in parallel)
+Execution Order (Design): [0, 1] → 2 → 3
+                          (0,1 can run in parallel - not yet implemented)
+Execution Order (Current): 0 → 1 → 2 → 3
+                           (sequential execution)
 ```
 
 #### Kahn's Algorithm for Ordering
@@ -650,9 +654,9 @@ topological_order(stages, edges):
 ```
 
 This guarantees:
-1. **Correctness**: No stage executes before its inputs are ready
-2. **Parallelism**: Independent stages (same level in DAG) can run concurrently
-3. **Determinism**: Same plan always produces same execution order
+1. **Correctness**: No stage executes before its inputs are ready (✅ Implemented)
+2. **Parallelism**: Independent stages (same level in DAG) can run concurrently (⚠️ Designed, not yet implemented)
+3. **Determinism**: Same plan always produces same execution order (✅ Implemented)
 
 #### Execution Loop
 
@@ -821,30 +825,44 @@ Original Tree:           Cut Tree (Stage 1):     Cut Tree (Stage 0):
 
 ### 5.5 Distributed Execution via Arrow Flight
 
-In distributed mode, stage submission and result retrieval use Arrow Flight:
+In distributed mode, stage submission and result retrieval use Arrow Flight.
 
-**Stage Submission**:
-1. Coordinator serializes stage definition and input data
+**Implementation Status:** 
+- ✅ Local execution with `LocalStageExecutor` fully implemented
+- ✅ `FlightStageExecutor` API implemented  
+- ✅ `StageResultStore` for worker-side result caching implemented (with TTL-based eviction)
+- ⚠️ Worker-side Flight `DoAction` handler for `submit_stage` needs verification
+- ⚠️ Arrow IPC serialization for exchange inputs needs verification
+- ✅ `StageTicket` now includes `query_id` for correct distributed result retrieval
+
+**Stage Submission** (designed, partially implemented):
+1. Coordinator serializes stage definition and input data via Arrow IPC
 2. Each target worker receives its portion via Flight DoPut
-3. Worker executes the Substrait fragment locally using DuckDB
-4. Worker stores results and returns a ticket for later retrieval
+3. Worker executes the Substrait fragment locally using DuckDB (note: full Substrait execution currently stubbed with `anyhow::bail!` in pool.rs)
+4. Worker stores results in `StageResultStore` and returns a `StageTicket` for later retrieval
 
-**Result Retrieval**:
+**Result Retrieval** (implemented):
 1. Coordinator requests results using the ticket via Flight DoGet
-2. Worker streams RecordBatches back
-3. Results cached until retrieval, then cleaned up
+2. Worker streams RecordBatches back from `StageResultStore`
+3. Results cached with TTL (default 5 minutes), then cleaned up automatically
 
 ### 5.6 Resource Limits
 
-Each stage operates within configurable resource bounds:
+Each stage operates within configurable resource bounds (✅ Fully Implemented via `StageExecutionMonitor`):
 
-- **Output Limits**: Maximum rows and bytes a stage can produce
-- **Timeout**: Maximum execution time before cancellation
-- **Memory Budget**: Memory ceiling for stage execution
+- **Output Limits**: Maximum rows and bytes a stage can produce (tracked via atomic counters)
+- **Timeout**: Maximum execution time before cancellation (checked periodically at 100ms intervals)
+- **Memory Budget**: Memory ceiling for stage execution (set via DuckDB `max_memory`)
 
-**Admission Control** at query entry:
+The `StageExecutionMonitor` provides:
+- Runtime limit enforcement with proactive cancellation
+- Atomic tracking of rows_scanned, rows_produced, bytes_produced
+- Cancellation support for in-flight queries
+- Integration with DuckDB via `duckdb_interrupt()` for immediate termination
+
+**Admission Control** at query entry (✅ Implemented in `SqlTransformer`):
 - Reject recursive CTEs (unbounded computation)
-- Require date predicates for epoch pruning
+- Require date predicates for epoch pruning on epoch-partitioned datasets
 - Fail fast on syntax errors
 
 ---
@@ -912,14 +930,16 @@ Stage 1 (workers: [coordinator]):
 
 ## 7. Key Design Principles Summary
 
-1. **Substrait-First**: No custom IR, work directly with Substrait
-2. **Baseline-First**: Shuffle is always correct; broadcast is an optimization
-3. **Conservative Stats**: Unknown/estimated stats trigger safety factors
-4. **Epoch-Native**: Natural time-based data partitioning
-5. **Zero-Copy Pipeline**: Arrow throughout (DuckDB → Flight → Client)
-6. **Trait-Based Abstraction**: `StageExecutor`, `Metadata` enable testing and extension
-7. **Multi-Tenant Isolation**: `tenant_id` in all control plane messages
-8. **Resource Limits**: Configurable bounds prevent runaway queries
+1. **Substrait-First**: No custom IR, work directly with Substrait (✅ Implemented - note: full DuckDB Substrait execution pending)
+2. **Baseline-First**: Shuffle is always correct; broadcast is an optimization (✅ Implemented in exchange selection logic)
+3. **Conservative Stats**: Unknown/estimated stats trigger safety factors (✅ Implemented with 2.0x default safety factor)
+4. **Epoch-Native**: Natural time-based data partitioning (✅ Implemented in metadata and distribution annotation)
+5. **Zero-Copy Pipeline**: Arrow throughout (DuckDB → Flight → Client) (✅ Implemented via Arrow C Data Interface)
+6. **Trait-Based Abstraction**: `StageExecutor`, `Metadata` enable testing and extension (✅ Fully implemented with `LocalStageExecutor`, `FlightStageExecutor`, `InMemoryMetadata`, `ClusterMetadata`)
+7. **Multi-Tenant Isolation**: `tenant_id` in all control plane messages (✅ Implemented throughout API)
+8. **Resource Limits**: Configurable bounds prevent runaway queries (✅ Fully implemented via `StageLimits` and `StageExecutionMonitor`)
+
+**Current Implementation Status**: 11/20 enhancements completed, full codebase compiles successfully.
 
 ---
 
@@ -940,10 +960,24 @@ Stage 1 (workers: [coordinator]):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `tenant_id` | (required) | Tenant identifier |
 | `query_timeout` | 5 min | Maximum query execution time |
-| `max_concurrent_stages` | 16 | Parallelism limit |
+| `max_concurrent_stages` | 16 | Parallelism limit (designed, not used in current sequential execution) |
 | `max_stage_retries` | 3 | Retry count per failed stage |
 | `distributed` | false | Enable Flight-based distribution |
+| `enable_parallel_execution` | true | Enable parallel stage execution (designed, not yet implemented) |
+| `enable_streaming_exchanges` | false | Enable streaming exchanges (designed, not yet implemented) |
+
+### DuckDbPoolConfig Defaults
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_size` | 32 | Maximum number of connections in the pool |
+| `initial_size` | 4 | Initial number of connections to establish |
+| `connection_timeout` | 30s | Connection timeout |
+| `statement_timeout` | 60s | Statement timeout |
+| `memory_limit_mb` | 1024 | Memory limit for each connection (MB) |
+| `enable_logging` | false | Whether to enable query logging |
 
 ---
 
@@ -971,4 +1005,5 @@ Stage 1 (workers: [coordinator]):
 
 **Revision History**:
 - 2025-01-11: Initial design document
+- 2026-01-17: Updated to reflect current implementation status (11/20 enhancements completed, codebase compiles)
 

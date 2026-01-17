@@ -2,7 +2,8 @@
 //!
 //! This module handles submitting stages to workers and executing them locally.
 
-use crate::ldp::{LdpPlan, Stage, StageId, StageInput, StageOutput, WorkerId};
+use crate::ldp::{LdpPlan, Stage, StageId, StageInput, StageLimits, StageOutput, WorkerId};
+use crate::ldp::executor::monitor::{SharedStageExecutionMonitor, StageExecutionMonitor};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +14,8 @@ use std::sync::Arc;
 /// For local execution, it wraps the output batches directly.
 #[derive(Clone, Debug)]
 pub struct StageTicket {
+    /// Query identifier for ticket scoping.
+    pub query_id: String,
     /// Stage that produced this output.
     pub stage_id: StageId,
     /// Worker that executed the stage.
@@ -25,9 +28,10 @@ pub struct StageTicket {
 
 impl StageTicket {
     /// Create a new stage ticket.
-    pub fn new(stage_id: StageId, worker_id: WorkerId) -> Self {
+    pub fn new(query_id: String, stage_id: StageId, worker_id: WorkerId) -> Self {
         let ticket_id = format!("stage_{}_worker_{}", stage_id, worker_id);
         Self {
+            query_id,
             stage_id,
             worker_id,
             partition: None,
@@ -36,9 +40,10 @@ impl StageTicket {
     }
 
     /// Create a partitioned stage ticket.
-    pub fn partitioned(stage_id: StageId, worker_id: WorkerId, partition: u32) -> Self {
+    pub fn partitioned(query_id: String, stage_id: StageId, worker_id: WorkerId, partition: u32) -> Self {
         let ticket_id = format!("stage_{}_worker_{}_p{}", stage_id, worker_id, partition);
         Self {
+            query_id,
             stage_id,
             worker_id,
             partition: Some(partition),
@@ -265,6 +270,88 @@ impl LocalStageExecutor {
         }
     }
 
+    /// Execute a stage's Substrait plan with monitoring.
+    ///
+    /// This function:
+    /// 1. Creates a DuckDB connection
+    /// 2. Registers exchange input tables from the `inputs` HashMap
+    /// 3. Executes the Substrait plan via `from_substrait()`
+    /// 4. Monitors execution against limits
+    /// 5. Collects and returns output batches
+    async fn execute_substrait_with_monitor(
+        &self,
+        substrait_bytes: &[u8],
+        inputs: &HashMap<String, Vec<RecordBatch>>,
+        monitor: &StageExecutionMonitor,
+    ) -> Result<Vec<RecordBatch>, StageExecutionError> {
+        use crate::engine::duckdb::substrait::{
+            duckdb_from_substrait_batches, drop_temp_table, register_arrow_batches,
+        };
+        use duckdb::Connection;
+
+        // Handle empty substrait plan (e.g., placeholder stages)
+        if substrait_bytes.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Create a DuckDB connection for this execution
+        let conn = Connection::open_in_memory()
+            .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+
+        // Register all exchange inputs as temporary tables
+        let mut registered_tables = Vec::new();
+        for (table_name, batches) in inputs {
+            if !batches.is_empty() {
+                register_arrow_batches(&conn, table_name, batches)
+                    .map_err(|e| StageExecutionError::ExecutionFailed(
+                        format!("Failed to register table '{}': {}", table_name, e)
+                    ))?;
+                registered_tables.push(table_name.clone());
+            }
+        }
+
+        // Execute the Substrait plan
+        let result = duckdb_from_substrait_batches(&conn, substrait_bytes);
+
+        // Clean up registered tables (optional, connection will be dropped anyway)
+        for table_name in &registered_tables {
+            let _ = drop_temp_table(&conn, table_name);
+        }
+
+        // Handle execution result
+        match result {
+            Ok(batches) => {
+                // Update monitor with output counts
+                let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                let bytes_produced: u64 = batches
+                    .iter()
+                    .map(|b| b.get_array_memory_size() as u64)
+                    .sum();
+                
+                monitor.increment_rows_produced(rows_produced);
+                monitor.increment_bytes_produced(bytes_produced);
+                
+                // Check limits
+                monitor.check_limits().map_err(|e| StageExecutionError::ExecutionFailed(
+                    format!("Limit exceeded during execution: {}", e)
+                ))?;
+                
+                Ok(batches)
+            },
+            Err(e) => {
+                // Check if it's a substrait extension not available error
+                let err_msg = e.to_string();
+                if err_msg.contains("substrait") && err_msg.contains("extension") {
+                    Err(StageExecutionError::ExecutionFailed(
+                        "DuckDB substrait extension not available. Install with: INSTALL substrait".into()
+                    ))
+                } else {
+                    Err(StageExecutionError::ExecutionFailed(err_msg))
+                }
+            }
+        }
+    }
+
     /// Check if output batches exceed stage limits.
     fn check_output_limits(
         batches: &[RecordBatch],
@@ -305,17 +392,20 @@ impl Default for LocalStageExecutor {
 impl StageExecutor for LocalStageExecutor {
     async fn submit_stage(
         &self,
-        _query_id: &str,
+        query_id: &str,
         stage: &Stage,
         inputs: HashMap<String, Vec<RecordBatch>>,
     ) -> Result<StageTickets, StageExecutionError> {
         let mut tickets = StageTickets::new();
 
+        // Create a monitor for this stage execution
+        let monitor = Arc::new(StageExecutionMonitor::new(stage.limits.clone()));
+
         // Execute on each target worker (locally, we simulate this)
         for worker_id in &stage.target_workers {
-            // Execute the substrait plan
+            // Execute the substrait plan with monitoring
             let output = self
-                .execute_substrait(&stage.substrait_plan, &inputs)
+                .execute_substrait_with_monitor(&stage.substrait_plan, &inputs, &monitor)
                 .await?;
 
             // Check output limits
@@ -324,7 +414,7 @@ impl StageExecutor for LocalStageExecutor {
             // Create ticket and store output
             match &stage.output {
                 StageOutput::Stream => {
-                    let ticket = StageTicket::new(stage.stage_id, worker_id.clone());
+                    let ticket = StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone());
                     
                     // Store output for later retrieval
                     {
@@ -341,7 +431,7 @@ impl StageExecutor for LocalStageExecutor {
                     // Create tickets and store each partition
                     for (partition_id, partition_batches) in partitioned_data.into_iter().enumerate() {
                         let part_ticket =
-                            StageTicket::partitioned(stage.stage_id, worker_id.clone(), partition_id as u32);
+                            StageTicket::partitioned(query_id.to_string(), stage.stage_id, worker_id.clone(), partition_id as u32);
                         tickets.add(part_ticket.clone());
 
                         // Store partitioned output
@@ -519,10 +609,10 @@ mod tests {
     fn test_stage_tickets() {
         let mut tickets = StageTickets::new();
 
-        tickets.add(StageTicket::new(0, "w1".into()));
-        tickets.add(StageTicket::new(0, "w2".into()));
-        tickets.add(StageTicket::partitioned(1, "coordinator".into(), 0));
-        tickets.add(StageTicket::partitioned(1, "coordinator".into(), 1));
+        tickets.add(StageTicket::new("test_query".to_string(), 0, "w1".into()));
+        tickets.add(StageTicket::new("test_query".to_string(), 0, "w2".into()));
+        tickets.add(StageTicket::partitioned("test_query".to_string(), 1, "coordinator".into(), 0));
+        tickets.add(StageTicket::partitioned("test_query".to_string(), 1, "coordinator".into(), 1));
 
         assert_eq!(tickets.all().len(), 4);
         assert_eq!(tickets.for_worker("w1").len(), 1);

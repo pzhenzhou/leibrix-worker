@@ -38,3 +38,9 @@ prost = "0.13"  # Must match substrait's prost version
 # SQL dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono"] }
 chrono = "0.4"
+
+# Additional dependencies for LDP enhancements
+rand = "0.8"
+serde_json = "1.0"
+deadpool = "0.12"
+async-trait = "0.1"

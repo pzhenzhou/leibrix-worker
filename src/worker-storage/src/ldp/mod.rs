@@ -17,6 +17,7 @@ pub mod executor;
 pub mod planner;
 pub mod proto_convert;
 pub mod substrait;
+pub mod testing;
 pub mod types;
 
 // Re-export key planner types

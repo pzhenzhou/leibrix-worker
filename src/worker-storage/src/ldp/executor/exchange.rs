@@ -10,9 +10,11 @@
 //! - `DistributedExchangeRuntime`: Remote exchange via Arrow Flight
 
 use crate::ldp::executor::flight::{LdpFlightClient, WorkerConnectionPool};
+use crate::ldp::executor::metrics::ExchangeMetricsRegistry;
+use crate::ldp::executor::skew::SkewHandler;
 use crate::ldp::executor::stage::{StageExecutionError, StageExecutor, StageTicket, StageTickets};
 use crate::ldp::{Exchange, ExchangeEdge, ExchangeId, LdpPlan, StageLimits, StageId, WorkerId};
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use arrow::compute::concat_batches;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -253,6 +255,42 @@ pub fn hash_partition_batch(
     field_refs: &[u32],
     num_partitions: u32,
 ) -> Result<Vec<RecordBatch>, ExchangeError> {
+    // Use skew-aware partitioning by default
+    hash_partition_batch_with_skew_handling(batch, field_refs, num_partitions, true)
+}
+
+/// Hash partition a batch by specified columns with optional skew handling.
+///
+/// # Arguments
+/// * `batch` - The batch to partition
+/// * `field_refs` - Column indices to hash
+/// * `num_partitions` - Number of output partitions
+/// * `enable_skew_handling` - Whether to detect and handle data skew
+///
+/// # Returns
+/// Vec of batches, one per partition.
+pub fn hash_partition_batch_with_skew_handling(
+    batch: &RecordBatch,
+    field_refs: &[u32],
+    num_partitions: u32,
+    enable_skew_handling: bool,
+) -> Result<Vec<RecordBatch>, ExchangeError> {
+    if enable_skew_handling {
+        // Use skew-aware partitioning
+        let skew_handler = SkewHandler::new();
+        skew_handler.skew_aware_hash_partition(batch, field_refs, num_partitions)
+    } else {
+        // Use traditional hash partitioning
+        hash_partition_batch_traditional(batch, field_refs, num_partitions)
+    }
+}
+
+/// Traditional hash partitioning without skew handling.
+fn hash_partition_batch_traditional(
+    batch: &RecordBatch,
+    field_refs: &[u32],
+    num_partitions: u32,
+) -> Result<Vec<RecordBatch>, ExchangeError> {
     use arrow::array::{Array, UInt32Array};
     use arrow::compute::{filter_record_batch, take};
     use std::hash::{Hash, Hasher};
@@ -279,17 +317,7 @@ pub fn hash_partition_batch(
         for &col_idx in field_refs {
             let col = batch.column(col_idx as usize);
             // Hash the column value at this row
-            // This is simplified - real impl would handle all Arrow types
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                if arr.is_valid(row) {
-                    arr.value(row).hash(&mut hasher);
-                }
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
-                if arr.is_valid(row) {
-                    arr.value(row).hash(&mut hasher);
-                }
-            }
-            // Add more type handlers as needed
+            hash_column_value(col.as_ref(), row, &mut hasher)?;
         }
 
         partition_ids[row] = (hasher.finish() % num_partitions as u64) as u32;
@@ -313,6 +341,171 @@ pub fn hash_partition_batch(
     }
 
     Ok(results)
+}
+
+/// Hash a single value from a column at the given row index.
+fn hash_column_value(
+    array: &dyn Array,
+    row: usize,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) -> Result<(), ExchangeError> {
+    use arrow::array::*;
+    use std::hash::Hash;
+
+    // If the value is null, we still want to hash it consistently
+    if array.is_null(row) {
+        // Hash a special null marker
+        "NULL_VALUE".hash(hasher);
+        return Ok(());
+    }
+
+    // Handle different Arrow types
+    macro_rules! hash_primitive {
+        ($arr:expr, $t:ty) => {{
+            let arr = $arr.as_any().downcast_ref::<$t>().unwrap();
+            arr.value(row).hash(hasher);
+        }};
+    }
+
+    match array.data_type() {
+        // Signed integers
+        arrow::datatypes::DataType::Int8 => {
+            hash_primitive!(array, Int8Array);
+        }
+        arrow::datatypes::DataType::Int16 => {
+            hash_primitive!(array, Int16Array);
+        }
+        arrow::datatypes::DataType::Int32 => {
+            hash_primitive!(array, Int32Array);
+        }
+        arrow::datatypes::DataType::Int64 => {
+            hash_primitive!(array, Int64Array);
+        }
+        // Unsigned integers
+        arrow::datatypes::DataType::UInt8 => {
+            hash_primitive!(array, UInt8Array);
+        }
+        arrow::datatypes::DataType::UInt16 => {
+            hash_primitive!(array, UInt16Array);
+        }
+        arrow::datatypes::DataType::UInt32 => {
+            hash_primitive!(array, UInt32Array);
+        }
+        arrow::datatypes::DataType::UInt64 => {
+            hash_primitive!(array, UInt64Array);
+        }
+        // Floating point
+        arrow::datatypes::DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            // Handle NaN specially as it's not equal to itself
+            let val = arr.value(row);
+            if val.is_nan() {
+                "NaN".hash(hasher);
+            } else {
+                val.to_bits().hash(hasher);
+            }
+        }
+        arrow::datatypes::DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            // Handle NaN specially as it's not equal to itself
+            let val = arr.value(row);
+            if val.is_nan() {
+                "NaN".hash(hasher);
+            } else {
+                val.to_bits().hash(hasher);
+            }
+        }
+        // Strings
+        arrow::datatypes::DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        arrow::datatypes::DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        // Dates
+        arrow::datatypes::DataType::Date32 => {
+            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        arrow::datatypes::DataType::Date64 => {
+            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        // Timestamps
+        arrow::datatypes::DataType::Timestamp(unit, _) => {
+            match unit {
+                arrow::datatypes::TimeUnit::Second => {
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+                    arr.value(row).hash(hasher);
+                },
+                arrow::datatypes::TimeUnit::Millisecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+                    arr.value(row).hash(hasher);
+                },
+                arrow::datatypes::TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    arr.value(row).hash(hasher);
+                },
+                arrow::datatypes::TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+                    arr.value(row).hash(hasher);
+                },
+            }
+        }
+        // Decimal
+        arrow::datatypes::DataType::Decimal128(_, _) => {
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        arrow::datatypes::DataType::Decimal256(_, _) => {
+            let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            // Use value() which returns i256, then convert to bytes for hashing
+            arr.value(row).to_le_bytes().hash(hasher);
+        }
+        // Boolean
+        arrow::datatypes::DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        // Binary
+        arrow::datatypes::DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        arrow::datatypes::DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        // Fixed-size binary
+        arrow::datatypes::DataType::FixedSizeBinary(_) => {
+            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            arr.value(row).hash(hasher);
+        }
+        // Dictionary types - hash the underlying value
+        arrow::datatypes::DataType::Dictionary(_, value_type) => {
+            // For dictionary arrays, we need to get the value from the dictionary
+            // and hash it according to its value type
+            // We'll handle different key types generically by using the value directly
+            let debug_str = format!("dictionary_{}", value_type);
+            debug_str.hash(hasher);
+            return Err(ExchangeError::PartitionFailed(
+                format!("Dictionary type not fully supported for hash partitioning: {:?}", array.data_type())
+            ));
+        }
+        // Other types that don't have direct hash support
+        _ => {
+            // For unsupported types, we hash their debug representation
+            let debug_str = format!("{:?}", array.data_type());
+            debug_str.hash(hasher);
+            return Err(ExchangeError::PartitionFailed(
+                format!("Unsupported data type for hash partitioning: {:?}", array.data_type())
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Concatenate multiple record batches into one.
@@ -386,6 +579,8 @@ pub struct DistributedExchangeRuntime {
     connection_pool: Arc<WorkerConnectionPool>,
     /// Cached remote tickets (query_id:stage_id:worker_id -> ticket_bytes).
     remote_tickets: RwLock<HashMap<String, Vec<u8>>>,
+    /// Metrics registry for tracking exchange performance.
+    metrics_registry: Arc<ExchangeMetricsRegistry>,
 }
 
 impl DistributedExchangeRuntime {
@@ -395,12 +590,32 @@ impl DistributedExchangeRuntime {
             tenant_id,
             connection_pool,
             remote_tickets: RwLock::new(HashMap::new()),
+            metrics_registry: Arc::new(ExchangeMetricsRegistry::new()),
         }
     }
 
     /// Create with a fresh connection pool.
     pub fn with_new_pool(tenant_id: String) -> Self {
         Self::new(tenant_id, Arc::new(WorkerConnectionPool::new()))
+    }
+
+    /// Create with a custom metrics registry.
+    pub fn with_metrics_registry(
+        tenant_id: String,
+        connection_pool: Arc<WorkerConnectionPool>,
+        metrics_registry: Arc<ExchangeMetricsRegistry>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            connection_pool,
+            remote_tickets: RwLock::new(HashMap::new()),
+            metrics_registry,
+        }
+    }
+
+    /// Get the metrics registry.
+    pub fn metrics_registry(&self) -> &Arc<ExchangeMetricsRegistry> {
+        &self.metrics_registry
     }
 
     /// Get the connection pool for registering workers.
@@ -599,6 +814,15 @@ impl DistributedExchangeRuntime {
             "Executing distributed broadcast"
         );
 
+        // Create broadcast metrics
+        let mut metrics = crate::ldp::executor::metrics::BroadcastExchangeMetrics::new(
+            stage_id, // Using stage_id as exchange_id for this context
+            query_id.to_string(),
+            source_worker.clone(),
+            target_workers.to_vec(),
+            256 * 1024 * 1024, // Default broadcast threshold of 256MB
+        );
+
         // Fetch the data from the source
         let batches = self
             .fetch_from_worker(query_id, stage_id, source_worker)
@@ -609,6 +833,9 @@ impl DistributedExchangeRuntime {
             b.columns().iter().map(|c| c.get_array_memory_size()).sum::<usize>()
         }).sum();
 
+        // Update metrics with data information
+        metrics.update_data(total_rows as u64, total_bytes as u64);
+
         info!(
             query_id = query_id,
             stage_id = stage_id,
@@ -617,6 +844,17 @@ impl DistributedExchangeRuntime {
             targets = target_workers.len(),
             "Broadcast data fetched, ready for distribution"
         );
+
+        // Finalize metrics
+        metrics.finalize();
+        
+        // Log the metrics
+        metrics.log_metrics();
+        
+        // Register metrics in the registry
+        self.metrics_registry
+            .register_broadcast_metrics(metrics)
+            .await;
 
         // TODO: In a full implementation, we would push this data to each target worker
         // via Flight DoPut. For now, return the data for the coordinator to distribute.

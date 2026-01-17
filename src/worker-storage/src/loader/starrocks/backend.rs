@@ -2,7 +2,7 @@ use crate::engine::storage_engine::{RecordBatchStream, StorageError};
 use crate::loader::adapter::SourceAdapter;
 use crate::loader::types::{Catalog, DataSource, SourceError};
 use arrow::datatypes::Schema;
-
+use std::future::Future;
 use std::sync::Arc;
 
 use super::adbc_client::StarRocksAdbcClient;

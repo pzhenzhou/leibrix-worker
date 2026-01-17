@@ -16,7 +16,7 @@ const DEFAULT_QUERY_MEMORY_MB: usize = 1024;
 
 pub struct DuckDBQueryEngine {
     /// Shared database handle for creating read connections
-    shared_db: Arc<SharedDatabase>,
+    pub shared_db: Arc<SharedDatabase>,
     /// Semaphore to limit concurrent queries
     query_limiter: Arc<Semaphore>,
     /// Maximum concurrent queries allowed

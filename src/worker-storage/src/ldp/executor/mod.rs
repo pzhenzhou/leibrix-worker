@@ -23,6 +23,11 @@
 pub mod coordinator;
 pub mod exchange;
 pub mod flight;
+pub mod metrics;
+pub mod monitor;
+pub mod performance;
+pub mod result_store;
+pub mod skew;
 pub mod stage;
 
 pub use exchange::{
@@ -35,10 +40,15 @@ pub use stage::{
     StageTicket, StageTickets,
 };
 pub use coordinator::{
-    CoordinatorConfig, CoordinatorError, LdpCoordinator, QueryResult, QueryStats, StageStatus,
+    CancellationResult, CoordinatorConfig, CoordinatorError, LdpCoordinator, QueryResult, QueryStats, StageStatus,
+};
+pub use result_store::{
+    CachedStageResult, StageResultStore, StageResultStoreStats,
 };
 
+
 use crate::ldp::{LdpPlan, StageId};
+use crate::ldp::executor::performance::PerformanceOptimizer;
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,15 +59,23 @@ pub struct LdpExecutor<E: StageExecutor> {
     stage_executor: Arc<E>,
     /// Exchange runtime.
     exchange_runtime: ExchangeRuntime<E>,
+    /// Performance optimizer for runtime optimization.
+    performance_optimizer: Arc<PerformanceOptimizer>,
 }
 
 impl<E: StageExecutor> LdpExecutor<E> {
     /// Create a new LDP executor.
     pub fn new(stage_executor: Arc<E>) -> Self {
         let exchange_runtime = ExchangeRuntime::new(stage_executor.clone());
+        let metrics_registry = Arc::new(crate::ldp::executor::metrics::LdpMetricsRegistry::new());
+        let performance_optimizer = Arc::new(
+            crate::ldp::executor::performance::PerformanceOptimizer::new(metrics_registry)
+        );
+        
         Self {
             stage_executor,
             exchange_runtime,
+            performance_optimizer,
         }
     }
 
@@ -114,6 +132,16 @@ impl<E: StageExecutor> LdpExecutor<E> {
                 .map_err(|e| ExecutionError::StageFailed(plan.root_stage, format!("{}", e)))?;
             final_batches.extend(batches);
         }
+
+        // Perform performance analysis after execution completes
+        self.performance_optimizer
+            .analyze_query_performance(&plan.query_id)
+            .await;
+
+        // Log performance insights
+        self.performance_optimizer
+            .log_performance_insights(&plan.query_id)
+            .await;
 
         Ok(final_batches)
     }

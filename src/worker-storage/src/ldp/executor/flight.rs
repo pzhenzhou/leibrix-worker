@@ -284,7 +284,7 @@ impl FlightStageExecutor {
         }
 
         // Create ticket
-        Ok(StageTicket::new(stage.stage_id, worker_id.to_string()))
+        Ok(StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.to_string()))
     }
 }
 
@@ -311,7 +311,7 @@ impl StageExecutor for FlightStageExecutor {
                     // For partitioned output, create a ticket for each partition
                     for p in 0..*partitions {
                         let part_ticket =
-                            StageTicket::partitioned(stage.stage_id, worker_id.clone(), p);
+                            StageTicket::partitioned(query_id.to_string(), stage.stage_id, worker_id.clone(), p);
                         tickets.add(part_ticket);
                     }
                 }

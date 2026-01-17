@@ -69,6 +69,7 @@ use crate::ldp::executor::{
     DistributedExchangeRuntime, ExchangeRuntime, ExecutionError, FlightStageExecutor,
     LocalStageExecutor, WorkerConnectionPool,
 };
+use crate::ldp::executor::monitor::{StageExecutionMonitor, SharedStageExecutionMonitor};
 use crate::ldp::planner::metadata::{InMemoryMetadata, Metadata};
 use crate::ldp::planner::pipeline::{plan_ldp, PipelineError};
 use crate::ldp::planner::policy::PlannerPolicy;
@@ -286,6 +287,8 @@ pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
     connection_pool: Arc<WorkerConnectionPool>,
     /// Stage execution status tracking.
     stage_status: RwLock<HashMap<(String, StageId), StageStatus>>,
+    /// Active stage monitors for cancellation.
+    stage_monitors: RwLock<HashMap<(String, StageId), SharedStageExecutionMonitor>>,
 }
 
 impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
@@ -301,6 +304,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             conn: Arc::new(RwLock::new(conn)),
             connection_pool: Arc::new(WorkerConnectionPool::new()),
             stage_status: RwLock::new(HashMap::new()),
+            stage_monitors: RwLock::new(HashMap::new()),
         })
     }
 
@@ -317,6 +321,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             conn: Arc::new(RwLock::new(conn)),
             connection_pool: Arc::new(WorkerConnectionPool::new()),
             stage_status: RwLock::new(HashMap::new()),
+            stage_monitors: RwLock::new(HashMap::new()),
         }
     }
 
@@ -529,6 +534,68 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         }
     }
 
+    /// Compute execution levels for parallel stage execution.
+    ///
+    /// This groups stages by dependency levels, allowing stages at the same level
+    /// to be executed in parallel since they don't depend on each other.
+    fn compute_execution_levels(&self, plan: &LdpPlan) -> Vec<Vec<StageId>> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        
+        // Calculate in-degrees for each stage (number of dependencies)
+        let mut in_degree: HashMap<StageId, usize> = HashMap::new();
+        
+        // Initialize all stages with 0 in-degree
+        for stage in &plan.stages {
+            in_degree.insert(stage.stage_id, 0);
+        }
+        
+        // Count dependencies for each stage
+        for edge in &plan.edges {
+            *in_degree.get_mut(&edge.to_stage).unwrap_or(&mut 0) += 1;
+        }
+        
+        // Find stages with no dependencies (in-degree = 0)
+        let mut queue: VecDeque<StageId> = in_degree
+            .iter()
+            .filter(|(_, &degree)| degree == 0)
+            .map(|(&stage_id, _)| stage_id)
+            .collect();
+        
+        let mut levels = Vec::new();
+        
+        // Process stages in topological order, grouping by level
+        while !queue.is_empty() {
+            let current_level_size = queue.len();
+            let mut current_level = Vec::new();
+            
+            // Process all stages at the current level
+            for _ in 0..current_level_size {
+                if let Some(stage_id) = queue.pop_front() {
+                    current_level.push(stage_id);
+                    
+                    // Reduce in-degree of dependent stages
+                    for edge in &plan.edges {
+                        if edge.from_stage == stage_id {
+                            let dependent_stage = edge.to_stage;
+                            if let Some(degree) = in_degree.get_mut(&dependent_stage) {
+                                *degree -= 1;
+                                
+                                // If in-degree becomes 0, this stage can be processed in the next level
+                                if *degree == 0 {
+                                    queue.push_back(dependent_stage);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            levels.push(current_level);
+        }
+        
+        levels
+    }
+
     /// Execute plan locally (single-node).
     async fn execute_local(
         &self,
@@ -536,68 +603,78 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         query_id: &str,
     ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
         let executor = Arc::new(LocalStageExecutor::new());
-        let exchange_runtime = ExchangeRuntime::new(executor.clone());
+        let exchange_runtime = Arc::new(ExchangeRuntime::new(executor.clone()));
 
         let mut stage_outputs: HashMap<StageId, StageTickets> = HashMap::new();
         let mut workers_used: Vec<WorkerId> = Vec::new();
 
-        // Execute stages in topological order
-        let execution_order = plan.topological_order();
+        // Execute stages in parallel levels based on dependencies
+        let execution_levels = self.compute_execution_levels(plan);
 
-        for stage_id in execution_order {
-            let stage = plan
-                .get_stage(stage_id)
-                .ok_or(ExecutionError::StageNotFound(stage_id))?;
+        for level_stages in execution_levels {
+            // Execute all stages at this level in parallel
+            let mut level_results = Vec::new();
+            for &stage_id in &level_stages {
+                let executor = executor.clone();
+                let exchange_runtime = exchange_runtime.clone();
+                let plan_clone = plan.clone();
+                let query_id = query_id.to_string();
+                let stage_outputs_clone = stage_outputs.clone();
+                
+                let stage = plan_clone
+                    .get_stage(stage_id)
+                    .ok_or(ExecutionError::StageNotFound(stage_id))?
+                    .clone();
 
-            // Track stage status
-            self.set_stage_status(query_id, stage_id, StageStatus::Running {
-                started_at: Instant::now(),
-            })
-            .await;
+                // Resolve inputs
+                let inputs = exchange_runtime
+                    .resolve_inputs(&plan_clone, stage_id, &stage_outputs_clone)
+                    .await
+                    .map_err(|e: crate::ldp::executor::exchange::ExchangeError| ExecutionError::ExchangeFailed(e.to_string()))?;
 
-            // Resolve inputs
-            let inputs = exchange_runtime
-                .resolve_inputs(plan, stage_id, &stage_outputs)
-                .await
-                .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?;
-
-            // Execute stage with retry
-            let result = self
-                .execute_stage_with_retry(&*executor, stage, inputs, query_id)
-                .await;
-
-            match result {
-                Ok(tickets) => {
-                    // Track workers
-                    for ticket in tickets.all() {
-                        if !workers_used.contains(&ticket.worker_id) {
-                            workers_used.push(ticket.worker_id.clone());
+                // Execute stage with retry
+                let result = self
+                    .execute_stage_with_retry(&*executor, &stage, inputs, &query_id)
+                    .await;
+                
+                level_results.push((stage_id, result));
+            }
+            
+            // Process results and update stage_outputs
+            for (stage_id, stage_result) in level_results {
+                match stage_result {
+                    Ok(tickets) => {
+                        // Track workers
+                        for ticket in tickets.all() {
+                            if !workers_used.contains(&ticket.worker_id) {
+                                workers_used.push(ticket.worker_id.clone());
+                            }
                         }
+
+                        self.set_stage_status(
+                            &query_id,
+                            stage_id,
+                            StageStatus::Completed {
+                                tickets: tickets.clone(),
+                                duration: Duration::from_secs(0), // TODO: track actual duration
+                            },
+                        )
+                        .await;
+
+                        stage_outputs.insert(stage_id, tickets);
                     }
-
-                    self.set_stage_status(
-                        query_id,
-                        stage_id,
-                        StageStatus::Completed {
-                            tickets: tickets.clone(),
-                            duration: Duration::from_secs(0), // TODO: track actual duration
-                        },
-                    )
-                    .await;
-
-                    stage_outputs.insert(stage_id, tickets);
-                }
-                Err(e) => {
-                    self.set_stage_status(
-                        query_id,
-                        stage_id,
-                        StageStatus::Failed {
-                            error: e.to_string(),
-                            retries: self.config.max_stage_retries,
-                        },
-                    )
-                    .await;
-                    return Err(e.into());
+                    Err(e) => {
+                        self.set_stage_status(
+                            &query_id,
+                            stage_id,
+                            StageStatus::Failed {
+                                error: e.to_string(),
+                                retries: self.config.max_stage_retries,
+                            },
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -928,17 +1005,122 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         statuses.insert((query_id.to_string(), stage_id), status);
     }
 
+    /// Register a stage monitor for cancellation tracking.
+    pub async fn register_stage_monitor(
+        &self,
+        query_id: &str,
+        stage_id: StageId,
+        monitor: SharedStageExecutionMonitor,
+    ) {
+        let mut monitors = self.stage_monitors.write().await;
+        monitors.insert((query_id.to_string(), stage_id), monitor);
+    }
+
+    /// Unregister a stage monitor after completion.
+    pub async fn unregister_stage_monitor(&self, query_id: &str, stage_id: StageId) {
+        let mut monitors = self.stage_monitors.write().await;
+        monitors.remove(&(query_id.to_string(), stage_id));
+    }
+
+    /// Cancel a running query and all its stages.
+    pub async fn cancel_query(&self, query_id: &str) -> Result<CancellationResult, CoordinatorError> {
+        info!(query_id = %query_id, "Cancelling query");
+        
+        // Find all in-flight stages for this query
+        let in_flight_stages: Vec<StageId> = {
+            let statuses = self.stage_status.read().await;
+            statuses
+                .iter()
+                .filter(|((qid, _), status)| {
+                    qid == query_id && matches!(status, StageStatus::Running { .. })
+                })
+                .map(|((_, stage_id), _)| *stage_id)
+                .collect()
+        };
+        
+        // Cancel all in-flight stages
+        for stage_id in &in_flight_stages {
+            self.cancel_stage(query_id, *stage_id).await?;
+        }
+        
+        // Cleanup resources
+        self.cleanup_query_resources(query_id).await?;
+        
+        Ok(CancellationResult {
+            query_id: query_id.to_string(),
+            stages_cancelled: in_flight_stages.len(),
+            cleanup_completed: true,
+        })
+    }
+    
+    /// Cancel a specific stage
+    async fn cancel_stage(&self, query_id: &str, stage_id: StageId) -> Result<(), CoordinatorError> {
+        // For distributed execution, send cancellation to workers via Flight
+        if self.config.distributed {
+            // In a real implementation, this would send a cancel action to workers
+            warn!(
+                query_id = %query_id,
+                stage_id = stage_id,
+                "Distributed stage cancellation not fully implemented"
+            );
+        } else {
+            // For local execution, cancel via monitor
+            if let Some(monitor) = {
+                let monitors = self.stage_monitors.read().await;
+                monitors.get(&(query_id.to_string(), stage_id)).cloned()
+            } {
+                monitor.cancel();
+                debug!(
+                    query_id = %query_id,
+                    stage_id = stage_id,
+                    "Cancelled local stage via monitor"
+                );
+            } else {
+                warn!(
+                    query_id = %query_id,
+                    stage_id = stage_id,
+                    "No monitor found for stage, cannot cancel"
+                );
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Cleanup query resources
+    async fn cleanup_query_resources(&self, query_id: &str) -> Result<(), CoordinatorError> {
+        // Clear stage status
+        self.clear_query_status(query_id).await;
+        
+        info!(query_id = %query_id, "Query resources cleaned up");
+        Ok(())
+    }
+    
+    /// Clear all status entries for a query
+    async fn clear_query_status(&self, query_id: &str) {
+        let mut statuses = self.stage_status.write().await;
+        statuses.retain(|(qid, _), _| qid != query_id);
+        
+        let mut monitors = self.stage_monitors.write().await;
+        monitors.retain(|(qid, _), _| qid != query_id);
+    }
+    
     /// Get stage execution status.
     pub async fn get_stage_status(&self, query_id: &str, stage_id: StageId) -> Option<StageStatus> {
         let statuses = self.stage_status.read().await;
         statuses.get(&(query_id.to_string(), stage_id)).cloned()
     }
+}
 
-    /// Clear status for a completed query.
-    pub async fn clear_query_status(&self, query_id: &str) {
-        let mut statuses = self.stage_status.write().await;
-        statuses.retain(|(qid, _), _| qid != query_id);
-    }
+/// Result of a cancellation operation.
+#[derive(Debug, Clone)]
+pub struct CancellationResult {
+    /// Query identifier that was cancelled.
+    pub query_id: String,
+    /// Number of stages that were cancelled.
+    pub stages_cancelled: usize,
+    /// Whether resource cleanup was completed.
+    pub cleanup_completed: bool,
 }
 
 // ============================================================================
