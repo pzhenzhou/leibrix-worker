@@ -76,6 +76,7 @@ use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::storage_metadata::ClusterMetadata;
 use crate::ldp::{Exchange, LdpPlan, Stage, StageId, WorkerId};
 use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
+use arrow::datatypes::DataType;
 
 // ============================================================================
 // Coordinator Error
@@ -328,6 +329,59 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// Register a dataset for SQL transformation.
     pub async fn register_dataset(&self, dataset: RegisteredDataset) {
         self.transformer.write().await.register_dataset(dataset);
+    }
+
+    /// Register a dataset schema for planning (creates planning macro in coordinator's DuckDB).
+    ///
+    /// This method creates a dummy table macro on the coordinator's DuckDB instance
+    /// that provides schema information for Substrait generation. The macro returns
+    /// no rows (WHERE FALSE) since the coordinator doesn't hold actual data.
+    ///
+    /// In production, Gateway would call this method to provide schema metadata
+    /// from the Control Plane before executing a query.
+    ///
+    /// # Arguments
+    /// * `dataset_id` - The logical dataset name (e.g., "lineitem", "orders")
+    /// * `schema` - The Arrow schema of the dataset
+    ///
+    /// # Example
+    /// ```ignore
+    /// coordinator.register_dataset_schema("lineitem", lineitem_schema).await?;
+    /// ```
+    pub async fn register_dataset_schema(
+        &self,
+        dataset_id: &str,
+        schema: Arc<arrow::datatypes::Schema>,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.write().await;
+        
+        // Generate column definitions from schema
+        let columns: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let col_name = field.name();
+                let col_type = arrow_type_to_duckdb_type(field.data_type());
+                format!("CAST(NULL AS {}) AS {}", col_type, col_name)
+            })
+            .collect();
+        
+        let columns_sql = columns.join(", ");
+        
+        // Create a macro that returns the schema but no rows
+        let macro_sql = format!(
+            "CREATE OR REPLACE MACRO scan_{}(start_date, end_date) AS TABLE (SELECT {} WHERE FALSE)",
+            dataset_id, columns_sql
+        );
+        
+        conn.execute_batch(&macro_sql)
+            .map_err(|e| CoordinatorError::PlanningFailed(
+                PipelineError::SubstraitConversion(format!(
+                    "Failed to register schema for dataset '{}': {}", dataset_id, e
+                ))
+            ))?;
+        
+        Ok(())
     }
 
     /// Register a remote worker for distributed execution.
@@ -1126,6 +1180,33 @@ pub struct CancellationResult {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Convert Arrow data type to DuckDB SQL type string.
+fn arrow_type_to_duckdb_type(data_type: &DataType) -> &str {
+    match data_type {
+        DataType::Int8 => "TINYINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INTEGER",
+        DataType::Int64 => "BIGINT",
+        DataType::UInt8 => "UTINYINT",
+        DataType::UInt16 => "USMALLINT",
+        DataType::UInt32 => "UINTEGER",
+        DataType::UInt64 => "UBIGINT",
+        DataType::Float32 => "FLOAT",
+        DataType::Float64 => "DOUBLE",
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
+        DataType::Boolean => "BOOLEAN",
+        DataType::Date32 => "DATE",
+        DataType::Date64 => "TIMESTAMP",
+        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
+        _ => "VARCHAR", // Fallback for unsupported types
+    }
+}
 
 /// Generate a unique query ID.
 fn generate_query_id() -> String {

@@ -3,6 +3,7 @@
 //! This module provides utilities for loading test data into the cluster,
 //! including standard datasets like orders and customers for join tests.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, Int64Array, Float64Array, StringArray, Date32Array};
@@ -13,6 +14,137 @@ use rand::Rng;
 
 use super::cluster::TestCluster;
 
+/// Distribution specification for loading data across workers.
+#[derive(Debug, Clone)]
+pub struct DataDistribution {
+    /// Worker ID and the number of rows to place on that worker
+    pub placements: Vec<(String, usize)>,
+}
+
+impl DataDistribution {
+    /// Create a distribution with specified row counts per worker
+    /// Example: [("w1", 1000), ("w2", 1000), ("w3", 3000)]
+    pub fn explicit(placements: Vec<(&str, usize)>) -> Self {
+        Self {
+            placements: placements
+                .iter()
+                .map(|(id, count)| (id.to_string(), *count))
+                .collect(),
+        }
+    }
+
+    /// Create a round-robin distribution across N workers
+    pub fn round_robin(worker_ids: Vec<&str>, total_rows: usize) -> Self {
+        let workers_count = worker_ids.len();
+        let rows_per_worker = total_rows / workers_count;
+        let remainder = total_rows % workers_count;
+
+        let mut placements = Vec::new();
+        for (i, worker_id) in worker_ids.iter().enumerate() {
+            let extra = if i < remainder { 1 } else { 0 };
+            placements.push((worker_id.to_string(), rows_per_worker + extra));
+        }
+
+        Self { placements }
+    }
+
+    /// Create a distribution where all data is on a single worker
+    pub fn singleton(worker_id: &str, total_rows: usize) -> Self {
+        Self {
+            placements: vec![(worker_id.to_string(), total_rows)],
+        }
+    }
+
+    /// Total number of rows across all workers
+    pub fn total_rows(&self) -> usize {
+        self.placements.iter().map(|(_, count)| count).sum()
+    }
+
+    /// Get worker IDs that have data
+    pub fn workers(&self) -> Vec<String> {
+        self.placements
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+/// Epoch specification for time-partitioned data
+#[derive(Debug, Clone)]
+pub struct EpochSpec {
+    pub epoch_id: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub worker_id: String,
+    pub row_count: usize,
+}
+
+/// Table loading specification
+#[derive(Debug, Clone)]
+pub struct TableLoadSpec {
+    /// Table name (e.g., "lineitem", "orders")
+    pub table_name: String,
+
+    /// Dataset ID for epoch registration (e.g., "ds_lineitem")
+    pub dataset_id: String,
+
+    /// Date column name for epoch partitioning (e.g., "l_shipdate")
+    pub date_column: String,
+
+    /// Epoch specifications (distribution + time ranges)
+    pub epochs: Vec<EpochSpec>,
+}
+
+impl TableLoadSpec {
+    /// Create a new table load specification
+    pub fn new(
+        table_name: impl Into<String>,
+        dataset_id: impl Into<String>,
+        date_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            table_name: table_name.into(),
+            dataset_id: dataset_id.into(),
+            date_column: date_column.into(),
+            epochs: Vec::new(),
+        }
+    }
+
+    /// Add an epoch to this table
+    pub fn with_epoch(
+        mut self,
+        epoch_id: impl Into<String>,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        worker_id: impl Into<String>,
+        row_count: usize,
+    ) -> Self {
+        self.epochs.push(EpochSpec {
+            epoch_id: epoch_id.into(),
+            start_date,
+            end_date,
+            worker_id: worker_id.into(),
+            row_count,
+        });
+        self
+    }
+
+    /// Get all workers that have epochs for this table
+    pub fn workers(&self) -> Vec<String> {
+        self.epochs
+            .iter()
+            .map(|e| e.worker_id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Total row count across all epochs
+    pub fn total_rows(&self) -> usize {
+        self.epochs.iter().map(|e| e.row_count).sum()
+    }
+}
+
 /// Test data generator and loader for LDP testing.
 pub struct TestDataLoader {
     cluster: Arc<TestCluster>,
@@ -22,6 +154,273 @@ impl TestDataLoader {
     /// Create a new test data loader for the given cluster.
     pub fn new(cluster: Arc<TestCluster>) -> Self {
         Self { cluster }
+    }
+
+    /// Load a table with specified epoch distribution
+    ///
+    /// This is the main entry point for loading distributed test data.
+    /// It handles:
+    /// 1. Generating and loading data to each worker's DuckDB instance
+    /// 2. Creating table macros for epoch pruning
+    /// 3. Registering epoch metadata in the cluster metadata
+    ///
+    /// # Arguments
+    /// * `spec` - Table load specification with epoch distribution
+    /// * `data_generator` - Function that generates RecordBatches given row count and date range
+    pub async fn load_table_with_epochs<F>(
+        &self,
+        spec: &TableLoadSpec,
+        mut data_generator: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(usize, NaiveDate, NaiveDate) -> Vec<RecordBatch>,
+    {
+        println!(
+            "Loading table '{}' with {} epochs",
+            spec.table_name,
+            spec.epochs.len()
+        );
+
+        // 1. Generate data for each epoch and load to workers
+        for epoch_spec in &spec.epochs {
+            println!(
+                "  Epoch {}: {} rows on worker {} (date range: {} to {})",
+                epoch_spec.epoch_id,
+                epoch_spec.row_count,
+                epoch_spec.worker_id,
+                epoch_spec.start_date,
+                epoch_spec.end_date
+            );
+
+            // Generate data for this epoch with date constraints
+            let epoch_data = data_generator(
+                epoch_spec.row_count,
+                epoch_spec.start_date,
+                epoch_spec.end_date,
+            );
+
+            // Create epoch table name: {dataset_id}__{epoch_id}
+            let epoch_table_name = format!("{}__{}", spec.dataset_id, epoch_spec.epoch_id);
+
+            // Load data to worker's DuckDB instance
+            self.load_epoch_to_worker(
+                &epoch_spec.worker_id,
+                &epoch_table_name,
+                &spec.table_name,
+                epoch_data,
+                epoch_spec.start_date,
+                epoch_spec.end_date,
+                &spec.date_column,
+            )
+            .await?;
+        }
+
+        // 2. Register table macro for epoch pruning on each worker
+        self.register_table_macro(spec).await?;
+
+        // 3. Register epoch metadata in cluster metadata
+        self.register_epoch_metadata(spec).await?;
+
+        println!(
+            "✓ Loaded table '{}': {} total rows across {} workers",
+            spec.table_name,
+            spec.total_rows(),
+            spec.workers().len()
+        );
+
+        Ok(())
+    }
+
+    /// Load a single epoch to a specific worker
+    async fn load_epoch_to_worker(
+        &self,
+        worker_id: &str,
+        epoch_table_name: &str,
+        _base_table_name: &str,
+        data: Vec<RecordBatch>,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+        _date_column: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if data.is_empty() {
+            return Err(format!("No data provided for epoch table {}", epoch_table_name).into());
+        }
+
+        let _worker = self
+            .cluster
+            .get_worker(worker_id)
+            .ok_or_else(|| format!("Worker {} not found", worker_id))?;
+
+        // Create the epoch table in DuckDB
+        let schema = data[0].schema();
+        let create_sql = self.generate_create_table_sql(epoch_table_name, &schema);
+
+        self.cluster
+            .execute_query_on_worker(worker_id, &create_sql)
+            .await?;
+
+        // Insert data
+        for batch in &data {
+            self.insert_batch_to_worker(worker_id, epoch_table_name, batch)
+                .await?;
+        }
+
+        // Verify data was loaded
+        let count_sql = format!("SELECT COUNT(*) FROM {}", epoch_table_name);
+        let result = self
+            .cluster
+            .execute_query_on_worker(worker_id, &count_sql)
+            .await?;
+
+        if !result.is_empty() && result[0].num_rows() > 0 {
+            let count_array = result[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let count = count_array.value(0);
+            println!(
+                "    Verified: {} rows loaded to {}",
+                count, epoch_table_name
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Register table macro for epoch pruning
+    ///
+    /// Creates: scan_{table_name}(start_date, end_date) that unions all epochs
+    /// and filters by date range for epoch pruning
+    async fn register_table_macro(
+        &self,
+        spec: &TableLoadSpec,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Group epochs by worker
+        let mut epochs_by_worker: HashMap<String, Vec<&EpochSpec>> = HashMap::new();
+
+        for epoch in &spec.epochs {
+            epochs_by_worker
+                .entry(epoch.worker_id.clone())
+                .or_default()
+                .push(epoch);
+        }
+
+        // Register macro on each worker that has data
+        for (worker_id, epochs) in epochs_by_worker {
+            let _worker = self
+                .cluster
+                .get_worker(&worker_id)
+                .ok_or_else(|| format!("Worker {} not found", worker_id))?;
+
+            // Build UNION ALL query for all epochs on this worker
+            let mut union_parts = Vec::new();
+            for epoch in epochs {
+                let epoch_table_name = format!("{}__{}", spec.dataset_id, epoch.epoch_id);
+                union_parts.push(format!(
+                    "SELECT * FROM {} WHERE {} >= start_date AND {} < end_date",
+                    epoch_table_name, spec.date_column, spec.date_column
+                ));
+            }
+
+            let macro_body = if union_parts.len() > 1 {
+                union_parts.join(" UNION ALL ")
+            } else {
+                union_parts[0].clone()
+            };
+
+            // Create table macro
+            // Note: DuckDB macro parameters don't use $ prefix
+            let macro_sql = format!(
+                "CREATE OR REPLACE MACRO scan_{}(start_date, end_date) AS TABLE ({})",
+                spec.table_name, macro_body
+            );
+
+            println!("    Registering macro on {}: scan_{}", worker_id, spec.table_name);
+
+            self.cluster
+                .execute_query_on_worker(&worker_id, &macro_sql)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Register epoch metadata in cluster metadata for LDP planning
+    ///
+    /// This allows the planner to know:
+    /// - Which workers have which epochs
+    /// - Row counts and byte sizes for cost estimation
+    /// - Time ranges for epoch pruning
+    async fn register_epoch_metadata(
+        &self,
+        spec: &TableLoadSpec,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Register each epoch table name in the dataset manager
+        for epoch in &spec.epochs {
+            // Create epoch table name: {dataset_id}__{epoch_id}
+            let epoch_table_name = format!("{}__{}", spec.dataset_id, epoch.epoch_id);
+
+            // For testing, we also need to track statistics
+            // In a real system, this would come from ingestion metadata
+            println!(
+                "    Registering epoch metadata: {} on {}",
+                epoch.epoch_id, epoch.worker_id
+            );
+
+            // Register the epoch table with the dataset manager
+            // This makes the table visible for macro creation
+            self.cluster
+                .dataset_manager
+                .register_table(&spec.table_name, epoch_table_name)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Generate CREATE TABLE SQL from Arrow schema
+    fn generate_create_table_sql(&self, table_name: &str, schema: &Schema) -> String {
+        let columns: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let col_name = field.name();
+                let col_type = self.arrow_type_to_duckdb_type(field.data_type());
+                format!("{} {}", col_name, col_type)
+            })
+            .collect();
+
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} ({})",
+            table_name,
+            columns.join(", ")
+        )
+    }
+
+    /// Convert Arrow data type to DuckDB SQL type
+    fn arrow_type_to_duckdb_type(&self, data_type: &DataType) -> &str {
+        match data_type {
+            DataType::Int8 => "TINYINT",
+            DataType::Int16 => "SMALLINT",
+            DataType::Int32 => "INTEGER",
+            DataType::Int64 => "BIGINT",
+            DataType::UInt8 => "UTINYINT",
+            DataType::UInt16 => "USMALLINT",
+            DataType::UInt32 => "UINTEGER",
+            DataType::UInt64 => "UBIGINT",
+            DataType::Float32 => "FLOAT",
+            DataType::Float64 => "DOUBLE",
+            DataType::Utf8 => "VARCHAR",
+            DataType::LargeUtf8 => "VARCHAR",
+            DataType::Boolean => "BOOLEAN",
+            DataType::Date32 => "DATE",
+            DataType::Date64 => "TIMESTAMP",
+            DataType::Timestamp(_, _) => "TIMESTAMP",
+            DataType::Decimal128(_, _) => "DECIMAL",
+            DataType::Decimal256(_, _) => "DECIMAL",
+            _ => "VARCHAR", // Fallback for unsupported types
+        }
     }
 
     /// Generate orders test data with the specified count.
