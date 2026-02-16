@@ -5,48 +5,51 @@
 //!
 //! # Pipeline Overview
 //! ```text
-//! SQL → Substrait → Annotate → Cut → LdpPlan
+//! SQL → parse → LogicalPlan → annotate → cut → LdpPlan
 //! ```
 
-use crate::engine::duckdb::substrait::duckdb_get_substrait;
-use crate::ldp::planner::annotate::{annotate_and_enforce, PlanningError};
+use crate::ldp::planner::annotate::{annotate_logical_plan, PlanningError};
 use crate::ldp::planner::cut::cut_into_stages;
 use crate::ldp::planner::metadata::Metadata;
 use crate::ldp::planner::policy::PlannerPolicy;
-use crate::ldp::substrait::reconstruct::deserialize_rel_from_substrait;
 use crate::ldp::LdpPlan;
-use duckdb::Connection;
-use substrait::proto::Plan;
+use crate::sql::logical_plan::{LogicalPlan, PlanContext};
+use crate::sql::{build_logical_plan, parse_sql, PlanBuildError, SqlTransformError};
 
 /// Error during LDP pipeline execution.
 #[derive(Debug)]
 pub enum PipelineError {
-    /// Failed to get Substrait from DuckDB.
-    SubstraitConversion(String),
-    /// Failed to deserialize Substrait.
-    SubstraitDeserialize(String),
-    /// Planning failed.
+    /// SQL parsing failed.
+    Parse(SqlTransformError),
+    /// Logical plan building failed.
+    PlanBuild(PlanBuildError),
+    /// Planning (annotation/enforcement) failed.
     Planning(PlanningError),
-    /// DuckDB connection error.
-    DuckDb(String),
 }
 
 impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipelineError::SubstraitConversion(msg) => {
-                write!(f, "Substrait conversion failed: {}", msg)
-            }
-            PipelineError::SubstraitDeserialize(msg) => {
-                write!(f, "Substrait deserialization failed: {}", msg)
-            }
+            PipelineError::Parse(err) => write!(f, "SQL parse failed: {}", err),
+            PipelineError::PlanBuild(err) => write!(f, "Plan build failed: {}", err),
             PipelineError::Planning(err) => write!(f, "Planning failed: {}", err),
-            PipelineError::DuckDb(msg) => write!(f, "DuckDB error: {}", msg),
         }
     }
 }
 
 impl std::error::Error for PipelineError {}
+
+impl From<SqlTransformError> for PipelineError {
+    fn from(err: SqlTransformError) -> Self {
+        PipelineError::Parse(err)
+    }
+}
+
+impl From<PlanBuildError> for PipelineError {
+    fn from(err: PlanBuildError) -> Self {
+        PipelineError::PlanBuild(err)
+    }
+}
 
 impl From<PlanningError> for PipelineError {
     fn from(err: PlanningError) -> Self {
@@ -59,15 +62,14 @@ impl From<PlanningError> for PipelineError {
 /// Converts a SQL query into a Leibrix Distributed Plan (LDP) ready for execution.
 ///
 /// # Pipeline Steps
-/// 1. Use DuckDB to compile SQL → Substrait
-/// 2. Deserialize Substrait into Rel tree
+/// 1. Parse SQL string into AST Statement
+/// 2. Build LogicalPlan from Statement
 /// 3. Annotate with distribution properties and insert exchanges
 /// 4. Cut into stages at exchange boundaries
 /// 5. Return LdpPlan ready for execution
 ///
 /// # Arguments
 /// * `sql` - The SQL query to plan
-/// * `conn` - DuckDB connection (for SQL → Substrait conversion)
 /// * `metadata` - Access to epoch statistics and placement
 /// * `policy` - Planner thresholds and configuration
 /// * `query_id` - Unique identifier for this query
@@ -78,13 +80,11 @@ impl From<PlanningError> for PipelineError {
 ///
 /// # Example
 /// ```ignore
-/// let conn = Connection::open_in_memory()?;
 /// let metadata = InMemoryMetadata::new();
 /// let policy = PlannerPolicy::default();
 ///
 /// let plan = plan_ldp(
 ///     "SELECT country, SUM(revenue) FROM sales GROUP BY country",
-///     &conn,
 ///     &metadata,
 ///     &policy,
 ///     "query_001"
@@ -92,61 +92,34 @@ impl From<PlanningError> for PipelineError {
 /// ```
 pub fn plan_ldp<M: Metadata>(
     sql: &str,
-    conn: &Connection,
     metadata: &M,
     policy: &PlannerPolicy,
     query_id: impl Into<String>,
 ) -> Result<LdpPlan, PipelineError> {
     let query_id = query_id.into();
 
-    // Step 1: SQL → Substrait via DuckDB
-    let substrait_bytes = duckdb_get_substrait(conn, sql)
-        .map_err(|e| PipelineError::SubstraitConversion(e.to_string()))?;
+    // Step 1: Parse SQL → Statement
+    let stmt = parse_sql(sql)?;
 
-    // Step 2: Deserialize Substrait Plan
-    let plan = deserialize_substrait_plan(&substrait_bytes)?;
-
-    // Extract the root Rel from the Plan
-    let root_rel = extract_root_rel(&plan)?;
+    // Step 2: Build LogicalPlan from Statement
+    let build_result = build_logical_plan(&stmt)?;
+    let logical_plan = build_result.plan;
+    let context = build_result.context;
 
     // Step 3: Annotate and enforce distribution requirements
-    let annotated = annotate_and_enforce(&root_rel, policy, metadata)?;
+    let annotated = annotate_logical_plan(&logical_plan, policy, metadata)?;
 
     // Step 4: Cut into stages at exchange boundaries
-    let ldp_plan = cut_into_stages(&annotated, policy, &query_id);
+    let ldp_plan = cut_into_stages(&annotated, policy, &query_id, &context);
 
     Ok(ldp_plan)
 }
 
-/// Plan from pre-compiled Substrait bytes (for testing or when Substrait is already available).
+/// Plan from a pre-built LogicalPlan (for testing or when plan is already available).
 ///
-/// Skips the SQL → Substrait step and directly processes Substrait bytes.
-pub fn plan_ldp_from_substrait<M: Metadata>(
-    substrait_bytes: &[u8],
-    metadata: &M,
-    policy: &PlannerPolicy,
-    query_id: impl Into<String>,
-) -> Result<LdpPlan, PipelineError> {
-    let query_id = query_id.into();
-
-    // Deserialize Substrait Plan
-    let plan = deserialize_substrait_plan(substrait_bytes)?;
-
-    // Extract the root Rel
-    let root_rel = extract_root_rel(&plan)?;
-
-    // Annotate and enforce
-    let annotated = annotate_and_enforce(&root_rel, policy, metadata)?;
-
-    // Cut into stages
-    let ldp_plan = cut_into_stages(&annotated, policy, &query_id);
-
-    Ok(ldp_plan)
-}
-
-/// Plan from a Substrait Rel directly (for testing).
-pub fn plan_ldp_from_rel<M: Metadata>(
-    rel: &substrait::proto::Rel,
+/// Skips the SQL parsing and plan building steps.
+pub fn plan_ldp_from_logical_plan<M: Metadata>(
+    logical_plan: &LogicalPlan,
     metadata: &M,
     policy: &PlannerPolicy,
     query_id: impl Into<String>,
@@ -154,45 +127,12 @@ pub fn plan_ldp_from_rel<M: Metadata>(
     let query_id = query_id.into();
 
     // Annotate and enforce
-    let annotated = annotate_and_enforce(rel, policy, metadata)?;
+    let annotated = annotate_logical_plan(logical_plan, policy, metadata)?;
 
-    // Cut into stages
-    let ldp_plan = cut_into_stages(&annotated, policy, &query_id);
+    // Cut into stages (no CTE context for pre-built plans)
+    let ldp_plan = cut_into_stages(&annotated, policy, &query_id, &PlanContext::default());
 
     Ok(ldp_plan)
-}
-
-/// Deserialize a Substrait Plan from bytes.
-fn deserialize_substrait_plan(bytes: &[u8]) -> Result<Plan, PipelineError> {
-    use prost::Message;
-
-    Plan::decode(bytes).map_err(|e| PipelineError::SubstraitDeserialize(e.to_string()))
-}
-
-/// Extract the root Rel from a Substrait Plan.
-fn extract_root_rel(plan: &Plan) -> Result<substrait::proto::Rel, PipelineError> {
-    // A Substrait Plan contains relations in plan.relations
-    // Each relation can be a Root or a Rel
-    // We need to find the main query relation
-
-    for relation in &plan.relations {
-        if let Some(rel_type) = &relation.rel_type {
-            match rel_type {
-                substrait::proto::plan_rel::RelType::Root(root) => {
-                    if let Some(input) = &root.input {
-                        return Ok(input.clone());
-                    }
-                }
-                substrait::proto::plan_rel::RelType::Rel(rel) => {
-                    return Ok(rel.clone());
-                }
-            }
-        }
-    }
-
-    Err(PipelineError::SubstraitDeserialize(
-        "No root relation found in Substrait plan".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -200,23 +140,96 @@ mod tests {
     use super::*;
     use crate::ldp::planner::metadata::InMemoryMetadata;
     use crate::ldp::planner::policy::PlannerPolicy;
+    use crate::sql::logical_plan::LogicalPlan;
+    use sqlparser::ast::TableFactor;
+
+    fn create_simple_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: "test_table".into(),
+            alias: None,
+            table_factor: TableFactor::Table {
+                name: vec![sqlparser::ast::Ident::new("test_table")].into(),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            },
+        }
+    }
 
     #[test]
-    fn test_plan_ldp_from_rel() {
-        // Create a simple ReadRel for testing
-        use crate::ldp::substrait::reconstruct::create_read_rel;
-
-        let read_rel = create_read_rel("test_table", None);
+    fn test_plan_ldp_from_logical_plan() {
+        let logical_plan = create_simple_scan();
         let metadata = InMemoryMetadata::new();
-        let policy = PlannerPolicy::default();
+        let policy = PlannerPolicy::with_coordinator("coordinator");
 
-        let result = plan_ldp_from_rel(&read_rel, &metadata, &policy, "test_query");
+        let result = plan_ldp_from_logical_plan(&logical_plan, &metadata, &policy, "test_query");
 
-        // Should succeed for a simple read
+        // Should succeed for a simple scan
         assert!(result.is_ok());
 
         let plan = result.unwrap();
         assert_eq!(plan.query_id, "test_query");
+        assert!(!plan.stages.is_empty());
+    }
+
+    #[test]
+    fn test_plan_ldp_simple_select() {
+        let sql = "SELECT * FROM test_table";
+        let metadata = InMemoryMetadata::new();
+        let policy = PlannerPolicy::with_coordinator("coordinator");
+
+        let result = plan_ldp(sql, &metadata, &policy, "test_query");
+
+        // Should succeed for simple SQL
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert_eq!(plan.query_id, "test_query");
+        assert!(!plan.stages.is_empty());
+    }
+
+    #[test]
+    fn test_plan_ldp_invalid_sql() {
+        let sql = "SELECT * FROM"; // Invalid SQL
+        let metadata = InMemoryMetadata::new();
+        let policy = PlannerPolicy::with_coordinator("coordinator");
+
+        let result = plan_ldp(sql, &metadata, &policy, "test_query");
+
+        // Should fail with parse error
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), PipelineError::Parse(_)));
+    }
+
+    #[test]
+    fn test_plan_ldp_with_filter() {
+        let sql = "SELECT * FROM test_table WHERE id > 100";
+        let metadata = InMemoryMetadata::new();
+        let policy = PlannerPolicy::with_coordinator("coordinator");
+
+        let result = plan_ldp(sql, &metadata, &policy, "test_query");
+
+        assert!(result.is_ok());
+        let plan = result.unwrap();
+        assert!(!plan.stages.is_empty());
+    }
+
+    #[test]
+    fn test_plan_ldp_with_aggregation() {
+        let sql = "SELECT country, COUNT(*) FROM test_table GROUP BY country";
+        let metadata = InMemoryMetadata::new();
+        let policy = PlannerPolicy::with_coordinator("coordinator");
+
+        let result = plan_ldp(sql, &metadata, &policy, "test_query");
+
+        assert!(result.is_ok());
+        let plan = result.unwrap();
         assert!(!plan.stages.is_empty());
     }
 }

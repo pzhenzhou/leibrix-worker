@@ -4,10 +4,8 @@
 //! DuckDB table macros that enable epoch-based time range filtering
 //! for testing purposes.
 
-use crate::engine::duckdb::query_engine_impl::DuckDBQueryEngine;
-use crate::ldp::executor::coordinator::LdpCoordinator;
-use crate::ldp::types::WorkerId;
 use crate::ldp::testing::cluster::TestWorker;
+use crate::ldp::types::WorkerId;
 use duckdb::{Connection, Error as DuckDBError};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -32,7 +30,8 @@ impl LogicalDatasetManager {
 
     pub async fn register_table(&self, dataset_name: &str, table_name: String) {
         let mut datasets = self.datasets.write().await;
-        datasets.entry(dataset_name.to_string())
+        datasets
+            .entry(dataset_name.to_string())
             .or_insert_with(Vec::new)
             .push(table_name);
     }
@@ -49,13 +48,13 @@ impl Default for LogicalDatasetManager {
 pub enum MacroError {
     #[error("DuckDB error: {0}")]
     DuckDB(#[from] DuckDBError),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("General error: {0}")]
     General(String),
 }
@@ -107,9 +106,9 @@ pub fn create_epoch_table_macro(
         .iter()
         .map(|table| format!("SELECT * FROM \"{}\"", table)) // Quote table names to handle special chars
         .collect();
-    
+
     let union_sql = union_clauses.join(" UNION ALL ");
-    
+
     let macro_sql = format!(
         r#"
         CREATE OR REPLACE MACRO scan_{}(start_date, end_date) AS TABLE (
@@ -119,12 +118,9 @@ pub fn create_epoch_table_macro(
                   AND CAST({} AS DATE) < CAST(end_date AS DATE)
         )
         "#,
-        dataset_name,
-        union_sql,
-        date_column,
-        date_column
+        dataset_name, union_sql, date_column, date_column
     );
-    
+
     conn.execute_batch(&macro_sql)?;
     Ok(())
 }
@@ -133,21 +129,21 @@ pub fn create_epoch_table_macro(
 ///
 /// This function collects all epoch tables across workers in the cluster and creates
 /// a macro on the coordinator that unions them together with time-based filtering.
-pub async fn register_dataset_with_macros(
-    _coordinator: &crate::ldp::executor::coordinator::LdpCoordinator,
+pub async fn register_dataset_with_macros<M: crate::ldp::planner::metadata::Metadata>(
+    _coordinator: &crate::ldp::executor::coordinator::LdpCoordinator<M>,
     dataset_manager: &LogicalDatasetManager,
     dataset_name: &str,
-    date_column: &str,
+    _date_column: &str,
 ) -> Result<(), MacroError> {
     // For now, this is a placeholder since coordinator doesn't expose DuckDB connection
     // In a real implementation, we would get the connection and create macros
-    
+
     // Get all registered epoch tables for this dataset from the dataset manager
     let _epoch_tables = dataset_manager.get_dataset_tables(dataset_name).await;
-    
+
     // TODO: Create the macro using the collected epoch tables
     // This requires coordinator to expose its DuckDB connection or provide a macro registration API
-    
+
     Ok(())
 }
 
@@ -158,14 +154,14 @@ pub async fn register_dataset_with_macros(
 pub async fn register_worker_macros(
     worker: &TestWorker,
     dataset_name: &str,
-    date_column: &str,
+    _date_column: &str,
 ) -> Result<(), MacroError> {
     // TODO: Implement proper macro registration once QueryEngine API is finalized
     // This requires:
     // 1. Getting a DuckDB connection from the worker's query engine
     // 2. Querying for tables matching the dataset pattern
     // 3. Building and executing a CREATE MACRO statement
-    
+
     // For now, just log that we're skipping this
     // (we don't have access to the dataset manager here)
     tracing::debug!(
@@ -173,7 +169,7 @@ pub async fn register_worker_macros(
         worker.worker_id,
         dataset_name
     );
-    
+
     Ok(())
 }
 
@@ -190,7 +186,7 @@ pub async fn setup_cluster_epoch_macros(
         println!("Setting up epoch macros for worker: {}", worker_id);
         register_worker_macros(worker, dataset_name, date_column).await?;
     }
-    
+
     Ok(())
 }
 
@@ -198,64 +194,64 @@ pub async fn setup_cluster_epoch_macros(
 mod tests {
     use super::*;
     use crate::engine::duckdb::DuckDBConfig;
-    use crate::ldp::testing::cluster::{TestCluster, TestClusterConfig};
 
     #[tokio::test]
     async fn test_create_simple_epoch_macro() {
         let config = DuckDBConfig::default();
         let db = crate::engine::duckdb::SharedDatabase::new(&config).unwrap();
         let conn = db.get().unwrap();
-        
+
         // Create a test table
         conn.execute_batch("CREATE TABLE test_dataset__epoch_001 (id INTEGER, dt DATE)")
             .unwrap();
         conn.execute_batch("INSERT INTO test_dataset__epoch_001 VALUES (1, '2022-01-01')")
             .unwrap();
-            
+
         // Create the macro
         let result = create_epoch_table_macro(
             &conn,
             "test_dataset",
             "dt",
-            &["test_dataset__epoch_001".to_string()]
+            &["test_dataset__epoch_001".to_string()],
         );
-        
+
         assert!(result.is_ok());
-        
+
         // Test that the macro works
-        let mut stmt = conn.prepare("SELECT * FROM scan_test_dataset('2022-01-01', '2022-02-01')").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM scan_test_dataset('2022-01-01', '2022-02-01')")
+            .unwrap();
         let rows: Vec<(i32, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-            
+
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1);
     }
-    
+
     #[tokio::test]
     async fn test_create_empty_epoch_macro() {
         let config = DuckDBConfig::default();
         let db = crate::engine::duckdb::SharedDatabase::new(&config).unwrap();
         let conn = db.get().unwrap();
-        
+
         // Create an empty macro
-        let result = create_epoch_table_macro(
-            &conn,
-            "empty_dataset",
-            "dt",
-            &[]
-        );
-        
+        let result = create_epoch_table_macro(&conn, "empty_dataset", "dt", &[]);
+
         assert!(result.is_ok());
-        
+
         // Test that the macro works (should return no rows)
-        let mut stmt = conn.prepare("SELECT * FROM scan_empty_dataset('2022-01-01', '2022-02-01')").unwrap();
-        let rows: Vec<(i32)> = stmt
-            .query_map([], |row| row.get(0))?
+        let mut stmt = conn
+            .prepare("SELECT * FROM scan_empty_dataset('2022-01-01', '2022-02-01')")
+            .unwrap();
+        let rows: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-            
+
         assert_eq!(rows.len(), 0);
     }
 }

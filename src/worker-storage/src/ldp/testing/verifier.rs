@@ -4,13 +4,11 @@
 //! with reference results to ensure correctness.
 
 use arrow::array::*;
-use arrow::compute::{cast, SortOptions};
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use arrow::row::{Row, RowConverter, SortField};
+use arrow::row::{RowConverter, SortField};
 use std::sync::Arc;
-use tracing::debug;
 
 /// Test result verifier for comparing distributed vs reference results.
 pub struct TestVerifier;
@@ -490,7 +488,7 @@ mod tests {
         let batch2 = create_test_batch_with_ints(vec![3, 1, 2]); // Different order
 
         // Should pass when ordering is not checked
-        let result = TestVerifier::assert_results_equal(&[batch1], &[batch2], false);
+        let result = TestVerifier::assert_results_equal(&[batch1.clone()], &[batch2.clone()], false);
         assert!(result.is_ok());
 
         // Should fail when ordering is checked
@@ -513,7 +511,7 @@ mod tests {
         let batch2 = create_test_batch_with_floats(vec![1.0002, 2.0002, 3.0002]); // Very close values
 
         // Should pass with tolerance of 0.001
-        let result = TestVerifier::assert_results_approximately_equal(&[batch1], &[batch2], 0.001, true);
+        let result = TestVerifier::assert_results_approximately_equal(&[batch1.clone()], &[batch2.clone()], 0.001, true);
         assert!(result.is_ok());
 
         // Should fail with tighter tolerance

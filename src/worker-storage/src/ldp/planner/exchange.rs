@@ -12,6 +12,7 @@
 
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::{Distribution, DistributionAnnotation, Exchange, RequiredDistribution, WorkerId};
+use crate::sql::logical_plan::ColumnRef;
 
 /// Result of exchange determination.
 #[derive(Clone, Debug)]
@@ -118,12 +119,12 @@ pub fn determine_exchange(
             determine_gather_exchange(est_rows, est_bytes, stats_exact, policy)
         }
 
-        RequiredDistribution::HashPartitioned { field_refs } => {
+        RequiredDistribution::HashPartitioned { column_refs } => {
             // Need to redistribute by hash keys
             determine_hash_or_broadcast_exchange(
                 actual,
                 annotation,
-                field_refs,
+                column_refs,
                 policy,
                 is_join_context,
                 target_workers,
@@ -160,7 +161,7 @@ fn determine_gather_exchange(
 fn determine_hash_or_broadcast_exchange(
     actual: &Distribution,
     annotation: &DistributionAnnotation,
-    required_field_refs: &[u32],
+    required_column_refs: &[crate::sql::logical_plan::ColumnRef],
     policy: &PlannerPolicy,
     is_join_context: bool,
     target_workers: &[WorkerId],
@@ -195,7 +196,7 @@ fn determine_hash_or_broadcast_exchange(
 
     // Create hash partition exchange
     ExchangeDecision::Insert(Exchange::hash_partition(
-        required_field_refs.to_vec(),
+        required_column_refs.to_vec(),
         policy.default_partitions,
     ))
 }
@@ -222,16 +223,51 @@ pub fn determine_join_exchanges(
     right_annotation: &DistributionAnnotation,
     left_actual: &Distribution,
     right_actual: &Distribution,
-    left_keys: &[u32],
-    right_keys: &[u32],
+    left_keys: &[ColumnRef],
+    right_keys: &[ColumnRef],
     policy: &PlannerPolicy,
     target_workers: &[WorkerId],
 ) -> (ExchangeDecision, ExchangeDecision) {
+    // === Colocation Optimization 1: Replicated build side ===
+    // If the right side is already replicated by control-plane placement,
+    // no exchange is needed for either side.
+    if matches!(right_actual, Distribution::Replicated { .. }) {
+        tracing::info!(
+            "Detected replicated build side - skipping exchanges (colocation optimization)"
+        );
+        return (ExchangeDecision::None, ExchangeDecision::None);
+    }
+
+    // === Colocation Optimization 2: Co-partitioned join ===
+    // If both sides are hash-partitioned on the join keys with matching worker sets,
+    // they are already colocated for local joins.
+    if let (
+        Distribution::HashPartitioned {
+            column_refs: left_partition_keys,
+            workers: left_workers,
+        },
+        Distribution::HashPartitioned {
+            column_refs: right_partition_keys,
+            workers: right_workers,
+        },
+    ) = (left_actual, right_actual)
+    {
+        if keys_match(left_partition_keys, left_keys)
+            && keys_match(right_partition_keys, right_keys)
+            && left_workers == right_workers
+        {
+            tracing::info!(
+                "Detected co-partitioned join on matching keys - skipping exchanges (colocation optimization)"
+            );
+            return (ExchangeDecision::None, ExchangeDecision::None);
+        }
+    }
+
     let left_requirement = RequiredDistribution::HashPartitioned {
-        field_refs: left_keys.to_vec(),
+        column_refs: left_keys.to_vec(),
     };
     let right_requirement = RequiredDistribution::HashPartitioned {
-        field_refs: right_keys.to_vec(),
+        column_refs: right_keys.to_vec(),
     };
 
     // Check if already satisfied
@@ -333,6 +369,14 @@ pub fn determine_join_exchanges(
     }
 }
 
+fn keys_match(partition_keys: &[ColumnRef], join_keys: &[ColumnRef]) -> bool {
+    partition_keys.len() == join_keys.len()
+        && partition_keys
+            .iter()
+            .zip(join_keys.iter())
+            .all(|(partition_key, join_key)| partition_key.matches(join_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,7 +470,7 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            field_refs: vec![0],
+            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
         };
 
         // In join context with exact stats -> broadcast
@@ -462,7 +506,7 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            field_refs: vec![0],
+            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
         };
 
         // Not join context -> shuffle even if small
@@ -476,8 +520,9 @@ mod tests {
         );
 
         match decision {
-            ExchangeDecision::Insert(Exchange::HashPartition { field_refs, .. }) => {
-                assert_eq!(field_refs, vec![0]);
+            ExchangeDecision::Insert(Exchange::HashPartition { column_refs, .. }) => {
+                assert_eq!(column_refs.len(), 1);
+                assert_eq!(column_refs[0].column, "col0");
             }
             _ => panic!("Expected HashPartition exchange, got {:?}", decision),
         }
@@ -498,7 +543,7 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            field_refs: vec![0],
+            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
         };
 
         // Join context but uncertain stats -> shuffle (baseline)
@@ -517,5 +562,89 @@ mod tests {
             ExchangeDecision::Insert(Exchange::HashPartition { .. }) => {}
             _ => panic!("Expected HashPartition exchange (baseline), got {:?}", decision),
         }
+    }
+
+    #[test]
+    fn test_join_shortcut_replicated_build_side() {
+        let policy = test_policy();
+        let left_actual = Distribution::EpochPartitioned {
+            workers: vec!["w1".into(), "w2".into()],
+        };
+        let right_actual = Distribution::Replicated {
+            workers: vec!["w1".into(), "w2".into()],
+        };
+
+        let left_annotation = DistributionAnnotation::with_source(
+            left_actual.clone(),
+            10_000,
+            1_000_000,
+            StatsSource::Exact,
+        );
+        let right_annotation = DistributionAnnotation::with_source(
+            right_actual.clone(),
+            1_000,
+            100_000,
+            StatsSource::Exact,
+        );
+
+        let left_key = ColumnRef { table: None, column: "col0".into() };
+        let right_key = ColumnRef { table: None, column: "col0".into() };
+
+        let (left_decision, right_decision) = determine_join_exchanges(
+            &left_annotation,
+            &right_annotation,
+            &left_actual,
+            &right_actual,
+            &[left_key],
+            &[right_key],
+            &policy,
+            &["w1".into(), "w2".into()],
+        );
+
+        assert!(matches!(left_decision, ExchangeDecision::None));
+        assert!(matches!(right_decision, ExchangeDecision::None));
+    }
+
+    #[test]
+    fn test_join_shortcut_co_partitioned() {
+        let policy = test_policy();
+        let left_actual = Distribution::HashPartitioned {
+            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            workers: vec!["w1".into(), "w2".into(), "w3".into()],
+        };
+        let right_actual = Distribution::HashPartitioned {
+            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            workers: vec!["w1".into(), "w2".into(), "w3".into()],
+        };
+
+        let left_annotation = DistributionAnnotation::with_source(
+            left_actual.clone(),
+            100_000,
+            10_000_000,
+            StatsSource::Exact,
+        );
+        let right_annotation = DistributionAnnotation::with_source(
+            right_actual.clone(),
+            100_000,
+            10_000_000,
+            StatsSource::Exact,
+        );
+
+        let left_key = ColumnRef { table: None, column: "col0".into() };
+        let right_key = ColumnRef { table: None, column: "col0".into() };
+
+        let (left_decision, right_decision) = determine_join_exchanges(
+            &left_annotation,
+            &right_annotation,
+            &left_actual,
+            &right_actual,
+            &[left_key],
+            &[right_key],
+            &policy,
+            &["w1".into(), "w2".into(), "w3".into()],
+        );
+
+        assert!(matches!(left_decision, ExchangeDecision::None));
+        assert!(matches!(right_decision, ExchangeDecision::None));
     }
 }

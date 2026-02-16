@@ -53,6 +53,17 @@ pub struct PlannerPolicy {
     /// Used for conservative admission control.
     /// Default: 2.0 (assume 2x the estimated size)
     pub safety_factor: f64,
+
+    /// Enable streaming pipelined execution path.
+    /// When true, stages execute concurrently with bounded memory buffers,
+    /// reducing latency and memory footprint compared to batch mode.
+    /// Default: false (batch mode) for stability.
+    pub enable_streaming_pipeline: bool,
+
+    /// Target buffer size per exchange for streaming mode.
+    /// Controls memory usage during pipelined execution.
+    /// Default: 32MB.
+    pub pipeline_buffer_bytes: u64,
 }
 
 impl Default for PlannerPolicy {
@@ -65,11 +76,50 @@ impl Default for PlannerPolicy {
             default_partitions: 16,
             coordinator: String::new(),
             safety_factor: 2.0,                           // 2x for uncertain stats
+            enable_streaming_pipeline: false,
+            pipeline_buffer_bytes: 32 * 1024 * 1024,
         }
     }
 }
 
 impl PlannerPolicy {
+    /// Conservative preset: disable broadcast optimization, maximize safety.
+    pub fn conservative() -> Self {
+        Self {
+            broadcast_bytes_max: 0,
+            shuffle_bytes_max: u64::MAX,
+            gather_rows_max: u64::MAX,
+            gather_bytes_max: u64::MAX,
+            default_partitions: 16,
+            coordinator: String::new(),
+            safety_factor: 3.0,
+            enable_streaming_pipeline: false,
+            pipeline_buffer_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    /// Aggressive preset: favor broadcast and trust stats more.
+    pub fn aggressive() -> Self {
+        Self {
+            broadcast_bytes_max: 1024 * 1024 * 1024,      // 1GB
+            shuffle_bytes_max: 10 * 1024 * 1024 * 1024,   // 10GB
+            gather_rows_max: 100_000_000,
+            gather_bytes_max: 10 * 1024 * 1024 * 1024,
+            default_partitions: 32,
+            coordinator: String::new(),
+            safety_factor: 1.1,
+            enable_streaming_pipeline: false,
+            pipeline_buffer_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    /// Testing preset: enables common optimizations with deterministic thresholds.
+    pub fn for_testing() -> Self {
+        Self::default()
+            .with_broadcast_enabled(true)
+            .with_safety_factor(1.0)
+    }
+
     /// Create a new policy with the given coordinator.
     pub fn with_coordinator(coordinator: impl Into<String>) -> Self {
         Self {
@@ -111,6 +161,35 @@ impl PlannerPolicy {
     /// Builder method to set safety factor.
     pub fn safety_factor(mut self, factor: f64) -> Self {
         self.safety_factor = factor;
+        self
+    }
+
+    /// Alias for consistency with fluent style in tests/configuration.
+    pub fn with_safety_factor(self, factor: f64) -> Self {
+        self.safety_factor(factor)
+    }
+
+    /// Enable/disable broadcast by threshold toggling.
+    pub fn with_broadcast_enabled(mut self, enabled: bool) -> Self {
+        self.broadcast_bytes_max = if enabled {
+            256 * 1024 * 1024
+        } else {
+            0
+        };
+        self
+    }
+
+    /// Enable or disable streaming pipelined execution.
+    /// When enabled, stages execute concurrently with bounded buffers.
+    pub fn with_streaming_pipeline(mut self, enabled: bool) -> Self {
+        self.enable_streaming_pipeline = enabled;
+        self
+    }
+
+    /// Set target streaming exchange buffer size.
+    /// Controls memory usage during pipelined execution.
+    pub fn with_pipeline_buffer_bytes(mut self, bytes: u64) -> Self {
+        self.pipeline_buffer_bytes = bytes;
         self
     }
 
@@ -185,6 +264,8 @@ mod tests {
         assert_eq!(policy.gather_bytes_max, 5 * 1024 * 1024 * 1024);
         assert_eq!(policy.default_partitions, 16);
         assert_eq!(policy.safety_factor, 2.0);
+        assert!(!policy.enable_streaming_pipeline);
+        assert_eq!(policy.pipeline_buffer_bytes, 32 * 1024 * 1024);
     }
 
     #[test]
@@ -281,5 +362,21 @@ mod tests {
             1 * 1024 * 1024 * 1024,
             false, // uncertain
         ));
+    }
+
+    #[test]
+    fn test_policy_presets() {
+        let conservative = PlannerPolicy::conservative();
+        assert_eq!(conservative.broadcast_bytes_max, 0);
+        assert_eq!(conservative.safety_factor, 3.0);
+
+        let aggressive = PlannerPolicy::aggressive();
+        assert_eq!(aggressive.broadcast_bytes_max, 1024 * 1024 * 1024);
+        assert_eq!(aggressive.default_partitions, 32);
+        assert_eq!(aggressive.safety_factor, 1.1);
+
+        let testing = PlannerPolicy::for_testing();
+        assert!(testing.broadcast_bytes_max > 0);
+        assert_eq!(testing.safety_factor, 1.0);
     }
 }

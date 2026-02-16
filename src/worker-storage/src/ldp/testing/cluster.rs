@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::engine::duckdb::arrow_utils::register_arrow_batches_persistent;
 use crate::ldp::executor::coordinator::LdpCoordinator;
 use crate::ldp::executor::stage::LocalStageExecutor;
 use crate::ldp::planner::PlannerPolicy;
@@ -21,6 +21,8 @@ pub struct TestCluster {
     pub workers: HashMap<String, TestWorker>,
     /// Coordinator for distributed execution.
     pub coordinator: Arc<LdpCoordinator<crate::ldp::planner::metadata::InMemoryMetadata>>,
+    /// Planner metadata (shared with coordinator for registration after construction).
+    pub metadata: Arc<crate::ldp::planner::metadata::InMemoryMetadata>,
     /// Dataset manager for logical table operations.
     pub dataset_manager: Arc<LogicalDatasetManager>,
     /// Cluster-wide configuration.
@@ -119,6 +121,7 @@ impl TestWorker {
 impl TestCluster {
     /// Create a new test cluster with the given configuration.
     pub async fn new(config: TestClusterConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config = config;
         let mut workers = HashMap::new();
 
         // Create workers
@@ -129,24 +132,43 @@ impl TestCluster {
             workers.insert(worker.worker_id.clone(), worker);
         }
 
+        // Ensure coordinator is a concrete worker for deterministic local execution.
+        if config.policy.coordinator.is_empty() {
+            config.policy.coordinator = "w1".to_string();
+        }
+
         // Create dataset manager
         let dataset_manager = Arc::new(LogicalDatasetManager::new());
 
-        // Create coordinator using the simple constructor
-        let coordinator_config = crate::ldp::executor::coordinator::CoordinatorConfig::new(config.tenant_id.clone());
+        // Create coordinator using cluster policy (including coordinator worker).
+        // Use only 1 retry in tests to avoid 60+ second hangs on deterministic failures.
+        let coordinator_config = crate::ldp::executor::coordinator::CoordinatorConfig::new(
+            config.tenant_id.clone(),
+        )
+        .with_policy(config.policy.clone())
+        .with_retries(1);
         let metadata = Arc::new(crate::ldp::planner::metadata::InMemoryMetadata::new());
         
         let coordinator = Arc::new(
-            crate::ldp::executor::coordinator::LdpCoordinator::new(coordinator_config, metadata)
+            crate::ldp::executor::coordinator::LdpCoordinator::new(coordinator_config, metadata.clone())
                 .map_err(|e| format!("Failed to create coordinator: {:?}", e))?
         );
 
         let cluster = Self {
             workers,
             coordinator,
+            metadata,
             dataset_manager,
             config,
         };
+
+        // Wire worker databases into the coordinator so stage SQL can read local catalogs.
+        for (worker_id, worker) in &cluster.workers {
+            cluster.coordinator.register_worker_database(
+                worker_id.clone(),
+                worker.query_engine.shared_db.clone(),
+            );
+        }
 
         info!(
             "Created test cluster with {} workers and coordinator",
@@ -231,10 +253,7 @@ impl TestCluster {
         // Register the table in the worker's DuckDB instance
         tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let conn = shared_db.get()?;
-            for batch in &data {
-                // Create table from first batch if doesn't exist
-                conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM arrow('{}')", table_name_owned, "placeholder"))?;
-            }
+            register_arrow_batches_persistent(&conn, &table_name_owned, &data)?;
             Ok(())
         }).await??;
 

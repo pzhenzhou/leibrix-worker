@@ -256,17 +256,17 @@ mod tests {
         let pool = DuckDbConnectionPool::new(config).await.unwrap();
         
         // Acquire one connection
-        let conn1 = pool.acquire().await.unwrap();
-        assert!(conn1.execute("CREATE TABLE test (id INTEGER)", []).is_ok());
-        
+        let mut conn1 = pool.acquire().await.unwrap();
+        assert!(conn1.execute("CREATE TABLE test (id INTEGER)", &[]).is_ok());
+
         // Acquire another connection
-        let conn2 = pool.acquire().await.unwrap();
-        assert!(conn2.execute("INSERT INTO test VALUES (1)", []).is_ok());
-        
+        let mut conn2 = pool.acquire().await.unwrap();
+        assert!(conn2.execute("INSERT INTO test VALUES (1)", &[]).is_ok());
+
         // Try to acquire a third connection (should work as we return first one)
         drop(conn1);
-        let conn3 = pool.acquire().await.unwrap();
-        assert!(conn3.execute("SELECT * FROM test", []).is_ok());
+        let mut conn3 = pool.acquire().await.unwrap();
+        assert!(conn3.execute("SELECT * FROM test", &[]).is_ok());
     }
 
     #[tokio::test]
@@ -275,9 +275,9 @@ mod tests {
         let pool = DuckDbConnectionPool::new(config).await.unwrap();
         
         let mut conn = pool.acquire().await.unwrap();
-        conn.execute("CREATE TABLE numbers (id INTEGER, name TEXT)", [])
+        conn.execute("CREATE TABLE numbers (id INTEGER, name TEXT)", &[])
             .unwrap();
-        conn.execute("INSERT INTO numbers VALUES (1, 'one'), (2, 'two')", [])
+        conn.execute("INSERT INTO numbers VALUES (1, 'one'), (2, 'two')", &[])
             .unwrap();
         
         let results: Vec<i32> = conn.prepare_execute("SELECT id FROM numbers ORDER BY id", |row| {

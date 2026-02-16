@@ -214,7 +214,7 @@ where
     /// 1. Deserializes the SubmitStageRequest from the action body
     /// 2. Validates tenant ID
     /// 3. Deserializes and registers exchange inputs as temporary tables
-    /// 4. Executes the Substrait plan via DuckDB
+    /// 4. Executes the SQL stage via DuckDB
     /// 5. Stores results in the stage result cache
     /// 6. Returns a serialized SubmitStageResponse with a ticket
     async fn handle_submit_stage(
@@ -236,7 +236,7 @@ where
             tenant_id = %request.tenant_id,
             query_id = %request.query_id,
             stage_id = request.stage_id,
-            substrait_len = request.substrait_plan.len(),
+            stage_sql_len = request.stage_sql.len(),
             exchange_inputs = request.exchange_inputs.len(),
             "Received submit_stage request"
         );
@@ -264,12 +264,12 @@ where
         // Execute the stage with DuckDB (with timeout)
         let start_time = Instant::now();
         
-        let batches = if request.substrait_plan.is_empty() {
+        let batches = if request.stage_sql.is_empty() {
             // Empty plan (placeholder for testing)
             warn!(
                 query_id = %request.query_id,
                 stage_id = request.stage_id,
-                "Empty Substrait plan, returning empty result"
+                "Empty stage SQL, returning empty result"
             );
             Vec::new()
         } else {
@@ -281,7 +281,7 @@ where
             let execution_future = self.execute_stage_with_duckdb(
                 &request.query_id,
                 request.stage_id,
-                &request.substrait_plan,
+                &request.stage_sql,
                 &exchange_input_batches,
             );
 
@@ -450,23 +450,23 @@ where
         Ok(Response::new(Box::pin(stream)))
     }
 
-    /// Execute a stage's Substrait plan with DuckDB and exchange inputs.
+    /// Execute a stage's SQL with DuckDB and exchange inputs.
     ///
     /// This method runs in a blocking task to avoid blocking the async runtime.
     async fn execute_stage_with_duckdb(
         &self,
         query_id: &str,
         stage_id: u32,
-        substrait_plan: &[u8],
+        stage_sql: &str,
         exchange_inputs: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, String> {
         use duckdb::Connection;
-        use worker_storage::engine::duckdb::substrait::{
-            duckdb_from_substrait_batches, drop_temp_table, register_arrow_batches,
+        use worker_storage::engine::duckdb::arrow_utils::{
+            drop_temp_table, register_arrow_batches,
         };
 
         // Clone data for move into blocking task
-        let substrait_plan = substrait_plan.to_vec();
+        let stage_sql = stage_sql.to_string();
         let exchange_inputs = exchange_inputs.clone();
         let query_id = query_id.to_string();
 
@@ -510,15 +510,21 @@ where
                 );
             }
 
-            // Execute Substrait plan
+            // Execute SQL stage
             debug!(
                 query_id = %query_id,
                 stage_id = stage_id,
                 registered_tables = ?registered_tables,
-                "Executing Substrait plan"
+                "Executing stage SQL"
             );
 
-            let result = duckdb_from_substrait_batches(&conn, &substrait_plan);
+            let result = {
+                let mut stmt = conn.prepare(&stage_sql)
+                    .map_err(|e| format!("Failed to prepare SQL: {}", e))?;
+                let rows = stmt.query_arrow([])
+                    .map_err(|e| format!("Failed to execute SQL: {}", e))?;
+                Ok::<Vec<RecordBatch>, String>(rows.collect())
+            };
 
             // Clean up registered tables
             for table_name in &registered_tables {
@@ -532,18 +538,11 @@ where
                         stage_id = stage_id,
                         output_batches = batches.len(),
                         output_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                        "Substrait execution successful"
+                        "Stage SQL execution successful"
                     );
                     Ok(batches)
                 }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("substrait") && err_msg.contains("extension") {
-                        Err("DuckDB substrait extension not available. Install with: INSTALL substrait; LOAD substrait;".into())
-                    } else {
-                        Err(format!("Substrait execution failed: {}", err_msg))
-                    }
-                }
+                Err(e) => Err(format!("Stage SQL execution failed: {}", e)),
             }
         })
         .await

@@ -7,4 +7,6 @@
 pub mod cluster;
 pub mod data_loader;
 pub mod macro_helpers;
+pub mod scenarios;
+pub mod tpch_data;
 pub mod verifier;

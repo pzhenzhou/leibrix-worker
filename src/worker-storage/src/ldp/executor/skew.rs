@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use arrow::array::{Array, BooleanArray};
 use arrow::record_batch::RecordBatch;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::ldp::executor::exchange::{hash_partition_batch, ExchangeError};
+use crate::ldp::executor::exchange::{hash_partition_batch_with_skew_handling, ExchangeError};
 
 /// Configuration for skew detection and handling.
 #[derive(Debug, Clone)]
@@ -409,7 +409,12 @@ impl SkewHandler {
                 "No skew detected (coefficient: {:.2}), using regular hash partitioning",
                 skew_result.skew_coefficient
             );
-            return hash_partition_batch(batch, field_refs, num_partitions);
+            return hash_partition_batch_with_skew_handling(
+                batch,
+                field_refs,
+                num_partitions,
+                false,
+            );
         }
         
         info!(
@@ -431,7 +436,6 @@ impl SkewHandler {
         num_partitions: u32,
         skew_result: &SkewDetectionResult,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
-        use arrow::array::{UInt32Array, BooleanArray};
         use arrow::compute::filter_record_batch;
         
         let mut partitioned_batches = vec![RecordBatch::new_empty(batch.schema()); num_partitions as usize];
@@ -730,7 +734,9 @@ mod tests {
     
     #[test]
     fn test_skew_detection_no_skew() {
-        let handler = SkewHandler::new();
+        let mut config = SkewHandlingConfig::default();
+        config.min_rows_for_skew_detection = 1;
+        let handler = SkewHandler::with_config(config);
         
         // Create a batch with uniformly distributed keys
         let schema = Arc::new(Schema::new(vec![
@@ -754,7 +760,10 @@ mod tests {
     
     #[test]
     fn test_skew_detection_with_skew() {
-        let handler = SkewHandler::new();
+        let mut config = SkewHandlingConfig::default();
+        config.min_rows_for_skew_detection = 1;
+        config.skew_threshold = 0.8;
+        let handler = SkewHandler::with_config(config);
         
         // Create a batch with skewed keys (key 1 appears much more frequently)
         let schema = Arc::new(Schema::new(vec![

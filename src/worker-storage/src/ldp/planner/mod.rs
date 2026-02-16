@@ -16,17 +16,27 @@
 pub mod annotate;
 pub mod cut;
 pub mod exchange;
+pub mod inspect;
 pub mod metadata;
 pub mod pipeline;
 pub mod policy;
 pub mod requirements;
 pub mod storage_metadata;
 
-pub use annotate::{annotate_and_enforce, AnnotatedRel, AnnotationResult, PlanningError};
-pub use cut::{cut_into_stages, extract_stage_substrait};
+pub use annotate::{
+    annotate_logical_plan, AnnotatedPlan, AnnotationResult, PlanningError,
+    // Old Substrait-based exports (to be removed in Phase 3):
+    // annotate_and_enforce, AnnotatedRel
+};
+pub use cut::{cut_into_stages, extract_stage_sql};
 pub use exchange::{determine_exchange, ExchangeDecision, RejectReason};
+pub use inspect::PlanInspector;
 pub use metadata::{InMemoryMetadata, Metadata, TableScanStats};
-pub use pipeline::{plan_ldp, plan_ldp_from_rel, plan_ldp_from_substrait, PipelineError};
+pub use pipeline::{
+    plan_ldp,
+    plan_ldp_from_logical_plan,
+    PipelineError,
+};
 pub use policy::*;
-pub use requirements::{get_requirements, satisfies};
+pub use requirements::{all_satisfied, get_logical_plan_requirements, satisfies, unsatisfied_requirements};
 pub use storage_metadata::{ClusterMetadata, EpochPlacement, StorageEngineMetadata, date_to_ms, ms_to_date};

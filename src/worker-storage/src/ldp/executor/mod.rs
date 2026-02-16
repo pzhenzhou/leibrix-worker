@@ -9,7 +9,7 @@
 //! ```text
 //! LdpCoordinator (orchestrates full query lifecycle)
 //!   ├── SQL Transformation + Admission Control
-//!   ├── LDP Planning (SQL → Substrait → LDP)
+//!   ├── LDP Planning (SQL → LogicalPlan → LDP)
 //!   └── LdpExecutor (stage execution)
 //!         ├── StageExecutor (trait)
 //!         │     ├── LocalStageExecutor (single-node DuckDB)

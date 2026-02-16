@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn, debug};
 
-use crate::ldp::{StageId, WorkerId};
+use crate::ldp::StageId;
 use crate::ldp::executor::metrics::{LdpMetricsRegistry, StageExecutionMetrics, QueryExecutionMetrics};
 
 /// Performance thresholds and configuration for optimization decisions.
@@ -253,7 +253,7 @@ impl PerformanceOptimizer {
     /// Get performance summary for a query.
     pub async fn get_performance_summary(&self, query_id: &str) -> PerformanceSummary {
         let stage_metrics = self.metrics_registry.get_query_stage_metrics(query_id).await;
-        let query_metric = self.metrics_registry.get_query_metrics(query_id).await;
+        let _query_metric = self.metrics_registry.get_query_metrics(query_id).await;
         
         // Calculate aggregates
         let total_stages = stage_metrics.len();

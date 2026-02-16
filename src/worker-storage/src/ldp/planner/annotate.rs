@@ -1,4 +1,4 @@
-//! Distribution annotation and exchange enforcement.
+//! Distribution annotation and exchange enforcement for LogicalPlan.
 //!
 //! This module implements the core LDP planning algorithm:
 //! 1. Bottom-up annotation of distribution properties
@@ -6,67 +6,72 @@
 //!
 //! # Algorithm Overview
 //! ```text
-//! annotate_and_enforce(rel):
+//! annotate_logical_plan(plan):
 //!   1. Recursively process children
-//!   2. Get requirements for this operator
+//!   2. Get requirements for this operator  
 //!   3. For each unsatisfied requirement, determine exchange
 //!   4. Compute output distribution based on operator semantics
 //!   5. Return annotated node with any inserted exchanges
 //! ```
 
 use crate::ldp::planner::exchange::{determine_exchange, determine_join_exchanges, ExchangeDecision, RejectReason};
-use crate::ldp::planner::metadata::{Metadata, TableScanStats};
+use crate::ldp::planner::metadata::Metadata;
 use crate::ldp::planner::policy::PlannerPolicy;
-use crate::ldp::planner::requirements::get_requirements;
-use crate::ldp::substrait::children::get_substrait_children;
-use crate::ldp::substrait::helpers::{
-    all_groupings_empty, extract_grouping_field_refs, extract_hash_join_key_refs,
-    extract_join_key_refs, is_join_operator,
-};
-use crate::ldp::{Distribution, DistributionAnnotation, Exchange, RequiredDistribution, StatsSource, WorkerId};
-use std::collections::HashMap;
-use substrait::proto::rel::RelType;
-use substrait::proto::Rel;
+use crate::ldp::planner::requirements::get_logical_plan_requirements;
+use crate::ldp::{Distribution, DistributionAnnotation, Exchange, StatsSource, WorkerId};
+use crate::sql::logical_plan::LogicalPlan;
 
-/// An annotated Substrait Rel with distribution information and optional exchange.
+/// An annotated LogicalPlan with distribution information and optional exchange.
 #[derive(Clone, Debug)]
-pub struct AnnotatedRel {
-    /// The original Substrait Rel.
-    pub rel: Rel,
+pub struct AnnotatedPlan {
+    /// The logical plan node.
+    pub plan: LogicalPlan,
 
     /// Distribution annotation (output distribution + stats).
+    ///
+    /// **Note**: When `exchange_before` is `Some`, this holds the *post-exchange*
+    /// distribution (what the parent sees).  The original pre-exchange
+    /// distribution is stored in `pre_exchange_distribution`.
     pub annotation: DistributionAnnotation,
 
     /// Exchange to insert BEFORE this node (if any).
     /// This exchange transforms the child's distribution to meet requirements.
     pub exchange_before: Option<Exchange>,
 
-    /// Annotated children (in order matching Rel's inputs).
-    pub children: Vec<AnnotatedRel>,
+    /// The distribution this node *actually* produces before the exchange is
+    /// applied.  Stage cutting uses this to assign the correct target workers
+    /// to the stage (which executes BEFORE the exchange).  `None` when there
+    /// is no exchange.
+    pub pre_exchange_distribution: Option<Distribution>,
+
+    /// Annotated children (in order matching plan's inputs).
+    pub children: Vec<AnnotatedPlan>,
 }
 
-impl AnnotatedRel {
-    /// Create a new annotated rel without exchange.
-    pub fn new(rel: Rel, annotation: DistributionAnnotation, children: Vec<AnnotatedRel>) -> Self {
+impl AnnotatedPlan {
+    /// Create a new annotated plan without exchange.
+    pub fn new(plan: LogicalPlan, annotation: DistributionAnnotation, children: Vec<AnnotatedPlan>) -> Self {
         Self {
-            rel,
+            plan,
             annotation,
             exchange_before: None,
+            pre_exchange_distribution: None,
             children,
         }
     }
 
-    /// Create a new annotated rel with an exchange.
+    /// Create a new annotated plan with an exchange.
     pub fn with_exchange(
-        rel: Rel,
+        plan: LogicalPlan,
         annotation: DistributionAnnotation,
-        children: Vec<AnnotatedRel>,
+        children: Vec<AnnotatedPlan>,
         exchange: Exchange,
     ) -> Self {
         Self {
-            rel,
+            plan,
             annotation,
             exchange_before: Some(exchange),
+            pre_exchange_distribution: None,
             children,
         }
     }
@@ -86,7 +91,7 @@ impl AnnotatedRel {
 }
 
 /// Result of the annotation process.
-pub type AnnotationResult = Result<AnnotatedRel, PlanningError>;
+pub type AnnotationResult = Result<AnnotatedPlan, PlanningError>;
 
 /// Error during LDP planning.
 #[derive(Clone, Debug)]
@@ -115,7 +120,7 @@ impl std::fmt::Display for PlanningError {
 
 impl std::error::Error for PlanningError {}
 
-/// Main entry point: annotate a Substrait plan and enforce distribution requirements.
+/// Main entry point: annotate a LogicalPlan and enforce distribution requirements.
 ///
 /// This function:
 /// 1. Recursively processes the plan bottom-up
@@ -123,46 +128,42 @@ impl std::error::Error for PlanningError {}
 /// 3. Inserts exchanges where requirements are not satisfied
 ///
 /// # Arguments
-/// * `rel` - The root of the Substrait plan
+/// * `plan` - The root of the LogicalPlan
 /// * `policy` - Planning thresholds and configuration
 /// * `metadata` - Access to epoch statistics and placement
 ///
 /// # Returns
-/// * `Ok(AnnotatedRel)` - Successfully annotated plan with exchanges
+/// * `Ok(AnnotatedPlan)` - Successfully annotated plan with exchanges
 /// * `Err(PlanningError)` - Planning failed (query rejected or invalid)
-pub fn annotate_and_enforce<M: Metadata>(
-    rel: &Rel,
+pub fn annotate_logical_plan<M: Metadata>(
+    plan: &LogicalPlan,
     policy: &PlannerPolicy,
     metadata: &M,
 ) -> AnnotationResult {
-    annotate_recursive(rel, policy, metadata, &[])
+    annotate_recursive(plan, policy, metadata, &[])
 }
 
 /// Recursive helper for annotation.
 fn annotate_recursive<M: Metadata>(
-    rel: &Rel,
+    plan: &LogicalPlan,
     policy: &PlannerPolicy,
     metadata: &M,
     target_workers: &[WorkerId],
 ) -> AnnotationResult {
-    let Some(rel_type) = &rel.rel_type else {
-        return Err(PlanningError::InvalidPlan("Rel has no rel_type".into()));
-    };
-
     // 1. Process children recursively
-    let substrait_children = get_substrait_children(rel);
-    let mut annotated_children: Vec<AnnotatedRel> = Vec::with_capacity(substrait_children.len());
+    let logical_children = plan.children();
+    let mut annotated_children: Vec<AnnotatedPlan> = Vec::with_capacity(logical_children.len());
 
-    for child in substrait_children {
+    for child in logical_children {
         let annotated = annotate_recursive(child, policy, metadata, target_workers)?;
         annotated_children.push(annotated);
     }
 
     // 2. Get requirements for this operator
-    let requirements = get_requirements(rel);
+    let requirements = get_logical_plan_requirements(plan);
 
     // 3. Check if this is a join (needs special handling)
-    let is_join = is_join_operator(rel);
+    let is_join = matches!(plan, LogicalPlan::Join { .. });
 
     // 4. Process requirements and determine exchanges
     let mut exchanges_to_insert: Vec<Option<Exchange>> = vec![None; annotated_children.len()];
@@ -170,7 +171,7 @@ fn annotate_recursive<M: Metadata>(
     if is_join && annotated_children.len() == 2 {
         // Special handling for joins - use determine_join_exchanges
         let (left_exchange, right_exchange) = handle_join_exchanges(
-            rel_type,
+            plan,
             &annotated_children[0],
             &annotated_children[1],
             policy,
@@ -216,14 +217,20 @@ fn annotate_recursive<M: Metadata>(
     // 5. Apply exchanges to children
     for (child, exchange_opt) in annotated_children.iter_mut().zip(exchanges_to_insert.into_iter()) {
         if let Some(exchange) = exchange_opt {
+            // Save the pre-exchange distribution so stage cutting can assign
+            // the correct target workers to the stage that runs BEFORE the exchange.
+            let pre_exchange_dist = child.annotation.distribution.clone();
+
             // Update child's annotation to reflect post-exchange distribution
+            // (this is what the parent operator sees).
             let new_distribution = compute_post_exchange_distribution(
                 &exchange,
                 policy,
-                child.annotation.distribution.workers(),
+                pre_exchange_dist.workers(),
             );
             child.annotation.distribution = new_distribution;
             child.exchange_before = Some(exchange);
+            child.pre_exchange_distribution = Some(pre_exchange_dist);
         }
     }
 
@@ -234,7 +241,7 @@ fn annotate_recursive<M: Metadata>(
         .collect();
 
     let (output_distribution, output_rows, output_bytes, output_stats_source) =
-        compute_output_distribution(rel, &child_distributions, &annotated_children, policy, metadata)?;
+        compute_output_distribution(plan, &child_distributions, &annotated_children, policy, metadata)?;
 
     let annotation = DistributionAnnotation::with_source(
         output_distribution,
@@ -243,43 +250,28 @@ fn annotate_recursive<M: Metadata>(
         output_stats_source,
     );
 
-    Ok(AnnotatedRel::new(rel.clone(), annotation, annotated_children))
+    Ok(AnnotatedPlan::new(plan.clone(), annotation, annotated_children))
 }
 
 /// Handle exchange determination for join operators.
 fn handle_join_exchanges(
-    rel_type: &RelType,
-    left_child: &AnnotatedRel,
-    right_child: &AnnotatedRel,
+    plan: &LogicalPlan,
+    left_child: &AnnotatedPlan,
+    right_child: &AnnotatedPlan,
     policy: &PlannerPolicy,
     target_workers: &[WorkerId],
 ) -> Result<(ExchangeDecision, ExchangeDecision), PlanningError> {
-    // Extract join keys based on join type
-    let (left_keys, right_keys) = match rel_type {
-        RelType::Join(join) => {
-            match extract_join_key_refs(join) {
-                Ok(keys) if keys.is_valid() => (keys.left_keys, keys.right_keys),
-                Ok(keys) if keys.is_cross_join() => {
-                    // Cross join - no hash partitioning, might broadcast smaller side
-                    return Ok((ExchangeDecision::None, ExchangeDecision::None));
-                }
-                _ => {
-                    // Can't extract keys - conservative fallback
-                    return Ok((ExchangeDecision::None, ExchangeDecision::None));
-                }
+    // Extract join keys from LogicalPlan::Join
+    let (left_keys, right_keys) = match plan {
+        LogicalPlan::Join { left_keys, right_keys, .. } => {
+            if left_keys.is_empty() || right_keys.is_empty() {
+                //Cross join - no hash partitioning
+                return Ok((ExchangeDecision::None, ExchangeDecision::None));
             }
-        }
-        RelType::HashJoin(join) => extract_hash_join_key_refs(join),
-        RelType::MergeJoin(_) | RelType::NestedLoopJoin(_) | RelType::Cross(_) => {
-            // These don't have standard hash partitioning requirements
-            return Ok((ExchangeDecision::None, ExchangeDecision::None));
+            (left_keys.clone(), right_keys.clone())
         }
         _ => return Ok((ExchangeDecision::None, ExchangeDecision::None)),
     };
-
-    if left_keys.is_empty() || right_keys.is_empty() {
-        return Ok((ExchangeDecision::None, ExchangeDecision::None));
-    }
 
     let (left_decision, right_decision) = determine_join_exchanges(
         &left_child.annotation,
@@ -317,7 +309,7 @@ fn compute_post_exchange_distribution(
             workers: targets.clone(),
         },
         Exchange::HashPartition {
-            field_refs,
+            column_refs,
             partitions,
         } => {
             // After hash partition, data should be spread across known workers.
@@ -328,7 +320,7 @@ fn compute_post_exchange_distribution(
                 vec![policy.coordinator.clone(); *partitions as usize]
             };
             Distribution::HashPartitioned {
-                field_refs: field_refs.clone(),
+                column_refs: column_refs.clone(),
                 workers,
             }
         }
@@ -338,7 +330,7 @@ fn compute_post_exchange_distribution(
 /// Compute the output distribution for an operator given its inputs.
 ///
 /// # Arguments
-/// * `rel` - The operator
+/// * `plan` - The operator
 /// * `child_distributions` - Distributions of child inputs (post-exchange)
 /// * `annotated_children` - Full annotations of children (for stats)
 /// * `policy` - Planning configuration
@@ -347,31 +339,16 @@ fn compute_post_exchange_distribution(
 /// # Returns
 /// (distribution, est_rows, est_bytes, stats_source)
 fn compute_output_distribution<M: Metadata>(
-    rel: &Rel,
+    plan: &LogicalPlan,
     child_distributions: &[&Distribution],
-    annotated_children: &[AnnotatedRel],
+    annotated_children: &[AnnotatedPlan],
     policy: &PlannerPolicy,
     metadata: &M,
 ) -> Result<(Distribution, u64, u64, StatsSource), PlanningError> {
-    let Some(rel_type) = &rel.rel_type else {
-        return Err(PlanningError::InvalidPlan("Rel has no rel_type".into()));
-    };
-
-    match rel_type {
-        // ===== Leaf: Read from table =====
-        RelType::Read(read) => {
-            let table_name = read
-                .read_type
-                .as_ref()
-                .and_then(|rt| match rt {
-                    substrait::proto::read_rel::ReadType::NamedTable(nt) => {
-                        nt.names.first().cloned()
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let scan_stats = metadata.get_table_scan_stats(&table_name);
+    match plan {
+        // ===== Leaf: Scan =====
+        LogicalPlan::Scan { table_name, .. } => {
+            let scan_stats = metadata.get_table_scan_stats(table_name);
             Ok((
                 scan_stats.to_distribution(),
                 scan_stats.rows,
@@ -380,8 +357,20 @@ fn compute_output_distribution<M: Metadata>(
             ))
         }
 
+        // ===== ExchangeRead (placeholder for remote data) =====
+        LogicalPlan::ExchangeRead { .. } => {
+            // ExchangeRead nodes are only used during stage cutting.
+            // At planning time, they shouldn't appear.
+            Ok((
+                Distribution::Singleton { worker: policy.coordinator.clone() },
+                0,
+                0,
+                StatsSource::Unknown,
+            ))
+        }
+
         // ===== Distribution-preserving operators =====
-        RelType::Filter(_) => {
+        LogicalPlan::Filter { .. } => {
             // Filter preserves distribution, applies selectivity to stats
             if let Some(child) = annotated_children.first() {
                 // Heuristic: assume 50% selectivity
@@ -397,12 +386,14 @@ fn compute_output_distribution<M: Metadata>(
             } else {
                 Ok((
                     Distribution::Singleton { worker: policy.coordinator.clone() },
-                    0, 0, StatsSource::Unknown,
+                    0,
+                    0,
+                    StatsSource::Unknown,
                 ))
             }
         }
 
-        RelType::Project(_) => {
+        LogicalPlan::Project { .. } => {
             // Project preserves distribution
             if let Some(child) = annotated_children.first() {
                 Ok((
@@ -414,22 +405,30 @@ fn compute_output_distribution<M: Metadata>(
             } else {
                 Ok((
                     Distribution::Singleton { worker: policy.coordinator.clone() },
-                    0, 0, StatsSource::Unknown,
+                    0,
+                    0,
+                    StatsSource::Unknown,
                 ))
             }
         }
 
         // ===== Singleton-output operators =====
-        RelType::Sort(_) | RelType::Fetch(_) => {
+        LogicalPlan::Sort { .. } | LogicalPlan::Limit { .. } => {
             // After gather, output is Singleton
             let (rows, bytes, source) = if let Some(child) = annotated_children.first() {
-                (child.annotation.est_rows, child.annotation.est_bytes, child.annotation.stats_source)
+                (
+                    child.annotation.est_rows,
+                    child.annotation.est_bytes,
+                    child.annotation.stats_source,
+                )
             } else {
                 (0, 0, StatsSource::Unknown)
             };
 
             Ok((
-                Distribution::Singleton { worker: policy.coordinator.clone() },
+                Distribution::Singleton {
+                    worker: policy.coordinator.clone(),
+                },
                 rows,
                 bytes,
                 source,
@@ -437,14 +436,13 @@ fn compute_output_distribution<M: Metadata>(
         }
 
         // ===== Aggregate =====
-        RelType::Aggregate(agg) => {
+        LogicalPlan::Aggregate { group_keys, .. } => {
             let (rows, bytes, source) = if let Some(child) = annotated_children.first() {
-                if all_groupings_empty(agg) {
+                if group_keys.is_empty() {
                     // Global aggregate: 1 row output
                     (1, 100, child.annotation.stats_source)
                 } else {
                     // Grouped aggregate: estimate based on NDV (heuristic)
-                    let group_keys = extract_grouping_field_refs(agg);
                     let estimated_groups = estimate_group_cardinality(
                         child.annotation.est_rows,
                         group_keys.len(),
@@ -454,7 +452,11 @@ fn compute_output_distribution<M: Metadata>(
                     } else {
                         100
                     };
-                    (estimated_groups, estimated_groups * bytes_per_row, child.annotation.stats_source)
+                    (
+                        estimated_groups,
+                        estimated_groups * bytes_per_row,
+                        child.annotation.stats_source,
+                    )
                 }
             } else {
                 (0, 0, StatsSource::Unknown)
@@ -463,25 +465,34 @@ fn compute_output_distribution<M: Metadata>(
             // Output distribution depends on whether this is partial or final agg
             let output_dist = if let Some(child_dist) = child_distributions.first() {
                 match child_dist {
-                    Distribution::Singleton { worker } => Distribution::Singleton { worker: worker.clone() },
-                    Distribution::HashPartitioned { field_refs, workers } => {
+                    Distribution::Singleton { worker } => Distribution::Singleton {
+                        worker: worker.clone(),
+                    },
+                    Distribution::HashPartitioned {
+                        column_refs,
+                        workers,
+                    } => {
                         // Partial aggregate preserves partitioning
                         Distribution::HashPartitioned {
-                            field_refs: field_refs.clone(),
+                            column_refs: column_refs.clone(),
                             workers: workers.clone(),
                         }
                     }
-                    _ => Distribution::Singleton { worker: policy.coordinator.clone() },
+                    _ => Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
                 }
             } else {
-                Distribution::Singleton { worker: policy.coordinator.clone() }
+                Distribution::Singleton {
+                    worker: policy.coordinator.clone(),
+                }
             };
 
             Ok((output_dist, rows, bytes, source))
         }
 
         // ===== Join operators =====
-        RelType::Join(_) | RelType::HashJoin(_) | RelType::MergeJoin(_) => {
+        LogicalPlan::Join { .. } => {
             // Join output distribution follows the left side (probe side)
             let (dist, rows, bytes, source) = if annotated_children.len() >= 2 {
                 let left = &annotated_children[0].annotation;
@@ -497,54 +508,54 @@ fn compute_output_distribution<M: Metadata>(
 
                 let combined_source = combine_stats_sources(left.stats_source, right.stats_source);
 
-                (left.distribution.clone(), est_rows, est_rows * bytes_per_row, combined_source)
+                (
+                    left.distribution.clone(),
+                    est_rows,
+                    est_rows * bytes_per_row,
+                    combined_source,
+                )
             } else {
-                (Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown)
+                (
+                    Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
+                    0,
+                    0,
+                    StatsSource::Unknown,
+                )
             };
 
             Ok((dist, rows, bytes, source))
         }
 
-        RelType::Cross(_) | RelType::NestedLoopJoin(_) => {
-            // Cross product: rows = left * right
-            if annotated_children.len() >= 2 {
-                let left = &annotated_children[0].annotation;
-                let right = &annotated_children[1].annotation;
-
-                let est_rows = left.est_rows.saturating_mul(right.est_rows);
-                let est_bytes = est_rows * 100; // rough estimate
-
-                Ok((
-                    left.distribution.clone(),
-                    est_rows,
-                    est_bytes,
-                    combine_stats_sources(left.stats_source, right.stats_source),
-                ))
-            } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-            }
-        }
-
         // ===== Set operators =====
-        RelType::Set(set) => {
+        LogicalPlan::SetOp { .. } => {
             // UNION ALL: sum of rows, inherit distribution from first input
-            let total_rows: u64 = annotated_children.iter().map(|c| c.annotation.est_rows).sum();
-            let total_bytes: u64 = annotated_children.iter().map(|c| c.annotation.est_bytes).sum();
+            let total_rows: u64 = annotated_children
+                .iter()
+                .map(|c| c.annotation.est_rows)
+                .sum();
+            let total_bytes: u64 = annotated_children
+                .iter()
+                .map(|c| c.annotation.est_bytes)
+                .sum();
 
             let dist = annotated_children
                 .first()
                 .map(|c| c.annotation.distribution.clone())
-                .unwrap_or(Distribution::Singleton { worker: policy.coordinator.clone() });
+                .unwrap_or(Distribution::Singleton {
+                    worker: policy.coordinator.clone(),
+                });
 
-            let source = annotated_children
-                .iter()
-                .fold(StatsSource::Exact, |acc, c| combine_stats_sources(acc, c.annotation.stats_source));
+            let source = annotated_children.iter().fold(StatsSource::Exact, |acc, c| {
+                combine_stats_sources(acc, c.annotation.stats_source)
+            });
 
             Ok((dist, total_rows, total_bytes, source))
         }
 
         // ===== Window =====
-        RelType::Window(_) => {
+        LogicalPlan::Window { .. } => {
             // Window preserves row count, might change distribution based on PARTITION BY
             if let Some(child) = annotated_children.first() {
                 Ok((
@@ -554,55 +565,20 @@ fn compute_output_distribution<M: Metadata>(
                     child.annotation.stats_source,
                 ))
             } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-            }
-        }
-
-        // ===== Extension operators =====
-        RelType::ExtensionLeaf(_) => {
-            // Leaf extension: unknown distribution
-            Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-        }
-
-        RelType::ExtensionSingle(_) => {
-            // Passthrough extension
-            if let Some(child) = annotated_children.first() {
                 Ok((
-                    child.annotation.distribution.clone(),
-                    child.annotation.est_rows,
-                    child.annotation.est_bytes,
-                    child.annotation.stats_source,
-                ))
-            } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-            }
-        }
-
-        RelType::ExtensionMulti(_) => {
-            // Multi-input extension: use first input's distribution
-            if let Some(child) = annotated_children.first() {
-                let total_rows: u64 = annotated_children.iter().map(|c| c.annotation.est_rows).sum();
-                let total_bytes: u64 = annotated_children.iter().map(|c| c.annotation.est_bytes).sum();
-                Ok((
-                    child.annotation.distribution.clone(),
-                    total_rows,
-                    total_bytes,
+                    Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
+                    0,
+                    0,
                     StatsSource::Unknown,
                 ))
-            } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
             }
         }
 
-        // ===== Write/DDL =====
-        RelType::Write(_) | RelType::Ddl(_) | RelType::Update(_) => {
-            // Write operations have no meaningful distribution output
-            Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-        }
-
-        // ===== Exchange (already present in plan) =====
-        RelType::Exchange(_) => {
-            // Passthrough for existing exchanges
+        // ===== SubqueryScan =====
+        LogicalPlan::SubqueryScan { .. } => {
+            // Subquery scan preserves child distribution
             if let Some(child) = annotated_children.first() {
                 Ok((
                     child.annotation.distribution.clone(),
@@ -611,29 +587,15 @@ fn compute_output_distribution<M: Metadata>(
                     child.annotation.stats_source,
                 ))
             } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
-            }
-        }
-
-        // ===== Expand =====
-        RelType::Expand(_) => {
-            // Expand multiplies rows
-            if let Some(child) = annotated_children.first() {
-                let multiplier = 2u64; // heuristic
                 Ok((
-                    child.annotation.distribution.clone(),
-                    child.annotation.est_rows * multiplier,
-                    child.annotation.est_bytes * multiplier,
-                    child.annotation.stats_source,
+                    Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
+                    0,
+                    0,
+                    StatsSource::Unknown,
                 ))
-            } else {
-                Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
             }
-        }
-
-        // ===== Reference =====
-        RelType::Reference(_) => {
-            Ok((Distribution::Singleton { worker: policy.coordinator.clone() }, 0, 0, StatsSource::Unknown))
         }
     }
 }
@@ -664,8 +626,8 @@ mod tests {
     use super::*;
     use crate::ldp::planner::metadata::InMemoryMetadata;
     use crate::ldp::EpochStats;
-    use substrait::proto::read_rel::ReadType;
-    use substrait::proto::{FilterRel, ProjectRel, ReadRel, SortRel};
+    use crate::sql::logical_plan::ColumnRef;
+    use sqlparser::ast::{Expr, Ident, ObjectName, ObjectNamePart, TableFactor};
 
     fn test_policy() -> PlannerPolicy {
         PlannerPolicy::with_coordinator("coordinator")
@@ -681,27 +643,32 @@ mod tests {
             .with_epoch("e2", "sales", EpochStats::exact(2000, 20000), "w2".into())
     }
 
-    fn create_read_rel(table: &str) -> Rel {
-        Rel {
-            rel_type: Some(RelType::Read(Box::new(ReadRel {
-                read_type: Some(ReadType::NamedTable(
-                    substrait::proto::read_rel::NamedTable {
-                        names: vec![table.to_string()],
-                        advanced_extension: None,
-                    },
-                )),
-                ..Default::default()
-            }))),
+    fn create_scan(table: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: table.to_string(),
+            alias: None,
+            table_factor: TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                partitions: vec![],
+                with_ordinality: false,
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            },
         }
     }
 
     #[test]
-    fn test_annotate_read() {
+    fn test_annotate_scan() {
         let policy = test_policy();
         let metadata = test_metadata();
-        let rel = create_read_rel("sales");
+        let plan = create_scan("sales");
 
-        let result = annotate_and_enforce(&rel, &policy, &metadata);
+        let result = annotate_logical_plan(&plan, &policy, &metadata);
         assert!(result.is_ok());
 
         let annotated = result.unwrap();
@@ -719,14 +686,12 @@ mod tests {
         let policy = test_policy();
         let metadata = test_metadata();
 
-        let filter = Rel {
-            rel_type: Some(RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(create_read_rel("sales"))),
-                ..Default::default()
-            }))),
+        let plan = LogicalPlan::Filter {
+            input: Box::new(create_scan("sales")),
+            predicate: Expr::Identifier(Ident::new("dummy")),
         };
 
-        let result = annotate_and_enforce(&filter, &policy, &metadata);
+        let result = annotate_logical_plan(&plan, &policy, &metadata);
         assert!(result.is_ok());
 
         let annotated = result.unwrap();
@@ -740,14 +705,12 @@ mod tests {
         let policy = test_policy();
         let metadata = test_metadata();
 
-        let sort = Rel {
-            rel_type: Some(RelType::Sort(Box::new(SortRel {
-                input: Some(Box::new(create_read_rel("sales"))),
-                ..Default::default()
-            }))),
+        let plan = LogicalPlan::Sort {
+            input: Box::new(create_scan("sales")),
+            order_by: vec![],
         };
 
-        let result = annotate_and_enforce(&sort, &policy, &metadata);
+        let result = annotate_logical_plan(&plan, &policy, &metadata);
         assert!(result.is_ok());
 
         let annotated = result.unwrap();
@@ -764,21 +727,23 @@ mod tests {
         let policy = test_policy();
         let metadata = test_metadata();
 
-        let sort = Rel {
-            rel_type: Some(RelType::Sort(Box::new(SortRel {
-                input: Some(Box::new(create_read_rel("sales"))),
-                ..Default::default()
-            }))),
+        let plan = LogicalPlan::Sort {
+            input: Box::new(create_scan("sales")),
+            order_by: vec![],
         };
 
-        let annotated = annotate_and_enforce(&sort, &policy, &metadata).unwrap();
+        let annotated = annotate_logical_plan(&plan, &policy, &metadata).unwrap();
         assert_eq!(annotated.count_exchanges(), 1);
     }
 
     #[test]
-    fn test_compute_post_exchange_distribution_uses_upstream_workers() {
-        let exchange = Exchange::hash_partition(vec![0], 4);
-        let dist = compute_post_exchange_distribution(&exchange, &test_policy(), &["w1".into(), "w2".into()]);
+    fn test_compute_post_exchange_uses_upstream_workers() {
+        let exchange = Exchange::hash_partition(vec![ColumnRef::unqualified("id")], 4);
+        let dist = compute_post_exchange_distribution(
+            &exchange,
+            &test_policy(),
+            &["w1".into(), "w2".into()],
+        );
 
         match dist {
             Distribution::HashPartitioned { workers, .. } => {

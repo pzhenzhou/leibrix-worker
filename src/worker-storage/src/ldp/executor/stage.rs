@@ -2,11 +2,14 @@
 //!
 //! This module handles submitting stages to workers and executing them locally.
 
-use crate::ldp::{LdpPlan, Stage, StageId, StageInput, StageLimits, StageOutput, WorkerId};
-use crate::ldp::executor::monitor::{SharedStageExecutionMonitor, StageExecutionMonitor};
+use crate::engine::duckdb::SharedDatabase;
+use crate::ldp::{LdpPlan, Stage, StageId, StageOutput, WorkerId};
+use crate::ldp::executor::monitor::StageExecutionMonitor;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Ticket representing a stage's output stream.
 ///
@@ -116,6 +119,50 @@ pub struct StageExecutionStats {
     pub execution_time_ms: u64,
 }
 
+/// Streaming RecordBatch output for pipelined stage execution.
+///
+/// This wraps a tokio mpsc receiver that yields RecordBatches incrementally,
+/// enabling concurrent stage execution with bounded memory buffers.
+pub struct RecordBatchStream {
+    /// Receiver for record batches.
+    receiver: mpsc::Receiver<Result<RecordBatch, StageExecutionError>>,
+    /// Schema of the record batches in this stream.
+    schema: Arc<Schema>,
+}
+
+impl RecordBatchStream {
+    /// Create a new record batch stream.
+    pub fn new(
+        receiver: mpsc::Receiver<Result<RecordBatch, StageExecutionError>>,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self { receiver, schema }
+    }
+
+    /// Get the next record batch from the stream.
+    ///
+    /// Returns None when the stream is exhausted.
+    pub async fn next(&mut self) -> Option<Result<RecordBatch, StageExecutionError>> {
+        self.receiver.recv().await
+    }
+
+    /// Get the schema of batches in this stream.
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    /// Collect all remaining batches into a vector.
+    ///
+    /// This consumes the stream and blocks until all batches are received.
+    pub async fn collect(mut self) -> Result<Vec<RecordBatch>, StageExecutionError> {
+        let mut batches = Vec::new();
+        while let Some(batch_result) = self.next().await {
+            batches.push(batch_result?);
+        }
+        Ok(batches)
+    }
+}
+
 /// Error during stage execution.
 #[derive(Clone, Debug)]
 pub enum StageExecutionError {
@@ -123,7 +170,7 @@ pub enum StageExecutionError {
     StageNotFound(StageId),
     /// Worker not available.
     WorkerUnavailable(WorkerId),
-    /// Substrait plan execution failed.
+    /// SQL/stage execution failed.
     ExecutionFailed(String),
     /// Output limits exceeded.
     LimitsExceeded {
@@ -180,6 +227,25 @@ pub trait StageExecutor: Send + Sync {
         inputs: HashMap<String, Vec<RecordBatch>>,
     ) -> Result<StageTickets, StageExecutionError>;
 
+    /// Submit a stage for streaming execution with incremental inputs.
+    ///
+    /// This enables pipelined execution where downstream stages can begin
+    /// processing before upstream stages complete.
+    ///
+    /// # Arguments
+    /// * `query_id` - The query identifier for ticket registration
+    /// * `stage` - The stage to execute
+    /// * `input_streams` - Streaming inputs from upstream stages
+    ///
+    /// # Returns
+    /// A stream of output batches that can be consumed incrementally.
+    async fn submit_stage_streaming(
+        &self,
+        query_id: &str,
+        stage: &Stage,
+        input_streams: HashMap<String, RecordBatchStream>,
+    ) -> Result<RecordBatchStream, StageExecutionError>;
+
     /// Fetch output from a stage ticket.
     ///
     /// # Arguments
@@ -197,6 +263,8 @@ pub trait StageExecutor: Send + Sync {
 pub struct LocalStageExecutor {
     /// Cached stage outputs (for local execution without Flight).
     outputs: tokio::sync::RwLock<HashMap<String, Vec<RecordBatch>>>,
+    /// Worker DuckDB databases used to execute local catalog scans.
+    worker_databases: HashMap<WorkerId, Arc<SharedDatabase>>,
 }
 
 impl LocalStageExecutor {
@@ -204,119 +272,65 @@ impl LocalStageExecutor {
     pub fn new() -> Self {
         Self {
             outputs: tokio::sync::RwLock::new(HashMap::new()),
+            worker_databases: HashMap::new(),
         }
     }
 
-    /// Execute a stage's Substrait plan with DuckDB.
+    /// Create a local executor backed by per-worker DuckDB databases.
+    pub fn with_databases(worker_databases: HashMap<WorkerId, Arc<SharedDatabase>>) -> Self {
+        Self {
+            outputs: tokio::sync::RwLock::new(HashMap::new()),
+            worker_databases,
+        }
+    }
+
+    /// Execute a stage's SQL with monitoring.
     ///
     /// This function:
     /// 1. Creates a DuckDB connection
     /// 2. Registers exchange input tables from the `inputs` HashMap
-    /// 3. Executes the Substrait plan via `from_substrait()`
-    /// 4. Collects and returns output batches
-    async fn execute_substrait(
-        &self,
-        substrait_bytes: &[u8],
-        inputs: &HashMap<String, Vec<RecordBatch>>,
-    ) -> Result<Vec<RecordBatch>, StageExecutionError> {
-        use crate::engine::duckdb::substrait::{
-            duckdb_from_substrait_batches, drop_temp_table, register_arrow_batches,
-        };
-        use duckdb::Connection;
-
-        // Handle empty substrait plan (e.g., placeholder stages)
-        if substrait_bytes.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Create a DuckDB connection for this execution
-        let conn = Connection::open_in_memory()
-            .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
-
-        // Register all exchange inputs as temporary tables
-        let mut registered_tables = Vec::new();
-        for (table_name, batches) in inputs {
-            if !batches.is_empty() {
-                register_arrow_batches(&conn, table_name, batches)
-                    .map_err(|e| StageExecutionError::ExecutionFailed(
-                        format!("Failed to register table '{}': {}", table_name, e)
-                    ))?;
-                registered_tables.push(table_name.clone());
-            }
-        }
-
-        // Execute the Substrait plan
-        let result = duckdb_from_substrait_batches(&conn, substrait_bytes);
-
-        // Clean up registered tables (optional, connection will be dropped anyway)
-        for table_name in &registered_tables {
-            let _ = drop_temp_table(&conn, table_name);
-        }
-
-        // Handle execution result
-        match result {
-            Ok(batches) => Ok(batches),
-            Err(e) => {
-                // Check if it's a substrait extension not available error
-                let err_msg = e.to_string();
-                if err_msg.contains("substrait") && err_msg.contains("extension") {
-                    Err(StageExecutionError::ExecutionFailed(
-                        "DuckDB substrait extension not available. Install with: INSTALL substrait".into()
-                    ))
-                } else {
-                    Err(StageExecutionError::ExecutionFailed(err_msg))
-                }
-            }
-        }
-    }
-
-    /// Execute a stage's Substrait plan with monitoring.
-    ///
-    /// This function:
-    /// 1. Creates a DuckDB connection
-    /// 2. Registers exchange input tables from the `inputs` HashMap
-    /// 3. Executes the Substrait plan via `from_substrait()`
+    /// 3. Executes SQL via DuckDB's Arrow query interface
     /// 4. Monitors execution against limits
     /// 5. Collects and returns output batches
-    async fn execute_substrait_with_monitor(
+    async fn execute_sql_with_monitor(
         &self,
-        substrait_bytes: &[u8],
+        worker_id: &str,
+        stage_sql: &str,
         inputs: &HashMap<String, Vec<RecordBatch>>,
+        requires_local_catalog: bool,
         monitor: &StageExecutionMonitor,
     ) -> Result<Vec<RecordBatch>, StageExecutionError> {
-        use crate::engine::duckdb::substrait::{
-            duckdb_from_substrait_batches, drop_temp_table, register_arrow_batches,
-        };
         use duckdb::Connection;
 
-        // Handle empty substrait plan (e.g., placeholder stages)
-        if substrait_bytes.is_empty() {
+        // Handle empty SQL (e.g., placeholder stages)
+        if stage_sql.is_empty() {
             return Ok(vec![]);
         }
 
-        // Create a DuckDB connection for this execution
-        let conn = Connection::open_in_memory()
-            .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+        // Execute stage SQL against the target worker's shared database when available.
+        // For local-catalog stages (table/macro scans), never fall back to another worker:
+        // that would hide placement bugs and produce non-deterministic behavior.
+        let target_db = self.worker_databases.get(worker_id).cloned();
 
-        // Register all exchange inputs as temporary tables
-        let mut registered_tables = Vec::new();
-        for (table_name, batches) in inputs {
-            if !batches.is_empty() {
-                register_arrow_batches(&conn, table_name, batches)
-                    .map_err(|e| StageExecutionError::ExecutionFailed(
-                        format!("Failed to register table '{}': {}", table_name, e)
-                    ))?;
-                registered_tables.push(table_name.clone());
+        let result = if let Some(shared_db) = target_db {
+            let conn = shared_db.get().map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!(
+                    "Failed to get DuckDB connection for worker '{}': {}",
+                    worker_id, e
+                ))
+            })?;
+            Self::run_sql_with_inputs(&conn, stage_sql, inputs)
+        } else {
+            if requires_local_catalog {
+                return Err(StageExecutionError::ExecutionFailed(format!(
+                    "Missing worker database for '{}' while stage requires local catalog access",
+                    worker_id
+                )));
             }
-        }
-
-        // Execute the Substrait plan
-        let result = duckdb_from_substrait_batches(&conn, substrait_bytes);
-
-        // Clean up registered tables (optional, connection will be dropped anyway)
-        for table_name in &registered_tables {
-            let _ = drop_temp_table(&conn, table_name);
-        }
+            let conn = Connection::open_in_memory()
+                .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+            Self::run_sql_with_inputs(&conn, stage_sql, inputs)
+        };
 
         // Handle execution result
         match result {
@@ -338,18 +352,78 @@ impl LocalStageExecutor {
                 
                 Ok(batches)
             },
-            Err(e) => {
-                // Check if it's a substrait extension not available error
-                let err_msg = e.to_string();
-                if err_msg.contains("substrait") && err_msg.contains("extension") {
-                    Err(StageExecutionError::ExecutionFailed(
-                        "DuckDB substrait extension not available. Install with: INSTALL substrait".into()
+            Err(e) => Err(e)
+        }
+    }
+
+    /// Register exchange inputs, execute SQL, and clean up temp tables.
+    fn run_sql_with_inputs(
+        conn: &duckdb::Connection,
+        stage_sql: &str,
+        inputs: &HashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, StageExecutionError> {
+        use crate::engine::duckdb::arrow_utils::{drop_temp_table, register_arrow_batches};
+
+        let mut registered_tables = Vec::new();
+        for (table_name, batches) in inputs {
+            if !batches.is_empty() {
+                register_arrow_batches(conn, table_name, batches).map_err(|e| {
+                    StageExecutionError::ExecutionFailed(format!(
+                        "Failed to register table '{}': {:#}",
+                        table_name, e
                     ))
-                } else {
-                    Err(StageExecutionError::ExecutionFailed(err_msg))
-                }
+                })?;
+                registered_tables.push(table_name.clone());
+            } else {
+                // Exchange returned no data.  We still need the table to exist
+                // so that SQL referencing it (e.g. `SELECT * FROM __exchange_0`)
+                // does not fail with "table does not exist".  Create a stub
+                // empty table.  This can happen legitimately when an upstream
+                // stage produces zero rows.
+                tracing::debug!(
+                    table_name = table_name.as_str(),
+                    "Registering empty exchange table (0 batches)"
+                );
+                conn.execute(
+                    &format!(
+                        "CREATE TEMPORARY TABLE IF NOT EXISTS \"{}\" AS SELECT 1 WHERE FALSE",
+                        table_name.replace('"', "\"\"")
+                    ),
+                    [],
+                )
+                .map_err(|e| {
+                    StageExecutionError::ExecutionFailed(format!(
+                        "Failed to create empty stub for '{}': {}",
+                        table_name, e
+                    ))
+                })?;
+                registered_tables.push(table_name.clone());
             }
         }
+
+        let result = {
+            let mut stmt = conn.prepare(stage_sql).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Failed to prepare SQL: {}", e))
+            })?;
+
+            let rows = stmt.query_arrow([]).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Failed to execute SQL: {}", e))
+            })?;
+            let schema = rows.get_schema();
+
+            let batches: Vec<RecordBatch> = rows.collect();
+            if batches.is_empty() {
+                Ok::<Vec<RecordBatch>, StageExecutionError>(vec![RecordBatch::new_empty(schema)])
+            } else {
+                Ok::<Vec<RecordBatch>, StageExecutionError>(batches)
+            }
+        };
+
+        for table_name in &registered_tables {
+            let _ = drop_temp_table(conn, table_name);
+        }
+
+        result
     }
 
     /// Check if output batches exceed stage limits.
@@ -397,15 +471,25 @@ impl StageExecutor for LocalStageExecutor {
         inputs: HashMap<String, Vec<RecordBatch>>,
     ) -> Result<StageTickets, StageExecutionError> {
         let mut tickets = StageTickets::new();
+        let requires_local_catalog = stage
+            .inputs
+            .iter()
+            .any(|input| matches!(input, crate::ldp::StageInput::LocalCatalog));
 
         // Create a monitor for this stage execution
         let monitor = Arc::new(StageExecutionMonitor::new(stage.limits.clone()));
 
         // Execute on each target worker (locally, we simulate this)
         for worker_id in &stage.target_workers {
-            // Execute the substrait plan with monitoring
+            // Execute the SQL stage with monitoring
             let output = self
-                .execute_substrait_with_monitor(&stage.substrait_plan, &inputs, &monitor)
+                .execute_sql_with_monitor(
+                    worker_id,
+                    &stage.stage_sql,
+                    &inputs,
+                    requires_local_catalog,
+                    &monitor,
+                )
                 .await?;
 
             // Check output limits
@@ -424,9 +508,9 @@ impl StageExecutor for LocalStageExecutor {
 
                     tickets.add(ticket);
                 }
-                StageOutput::Partitioned { partitions, field_refs } => {
+                StageOutput::Partitioned { partitions, column_refs } => {
                     // Partition the output data by hash
-                    let partitioned_data = Self::partition_batches(&output, *partitions, field_refs)?;
+                    let partitioned_data = Self::partition_batches(&output, *partitions, column_refs)?;
                     
                     // Create tickets and store each partition
                     for (partition_id, partition_batches) in partitioned_data.into_iter().enumerate() {
@@ -445,6 +529,65 @@ impl StageExecutor for LocalStageExecutor {
         Ok(tickets)
     }
 
+    async fn submit_stage_streaming(
+        &self,
+        query_id: &str,
+        stage: &Stage,
+        input_streams: HashMap<String, RecordBatchStream>,
+    ) -> Result<RecordBatchStream, StageExecutionError> {
+        // Get the output schema (we'll need it for the stream)
+        // For now, we'll execute and get the schema from the first batch
+        // In a real implementation, we could extract it from the stage SQL
+        let (tx, rx) = mpsc::channel(32);
+
+        // Clone stage for the async task
+        let stage_clone = stage.clone();
+        let _query_id = query_id.to_string();
+
+        // Spawn background task to execute stage with streaming inputs
+        tokio::spawn(async move {
+            // First, collect all input batches from streams
+            let mut inputs = HashMap::new();
+            for (table_name, mut stream) in input_streams {
+                let mut batches = Vec::new();
+                while let Some(batch_result) = stream.next().await {
+                    match batch_result {
+                        Ok(batch) => batches.push(batch),
+                        Err(e) => {
+                            // Send error downstream
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                }
+                inputs.insert(table_name, batches);
+            }
+
+            // Execute SQL with DuckDB
+            match execute_stage_batches(&stage_clone, &inputs).await {
+                Ok(output_batches) => {
+                    // Stream output batches to downstream
+                    for batch in output_batches {
+                        if tx.send(Ok(batch)).await.is_err() {
+                            // Downstream closed, stop execution
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Send error downstream
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        });
+
+        // Create a dummy schema - in practice we'd extract this from SQL metadata or first batch
+        // For now, return a stream that will yield batches with their own schemas
+        let schema = Arc::new(Schema::empty());
+
+        Ok(RecordBatchStream::new(rx, schema))
+    }
+
     async fn fetch_output(&self, ticket: &StageTicket) -> Result<Vec<RecordBatch>, StageExecutionError> {
         let outputs = self.outputs.read().await;
         outputs
@@ -452,6 +595,80 @@ impl StageExecutor for LocalStageExecutor {
             .cloned()
             .ok_or_else(|| StageExecutionError::InputNotReady(ticket.ticket_id.clone()))
     }
+}
+
+/// Helper function to execute a stage with batched inputs.
+async fn execute_stage_batches(
+    stage: &Stage,
+    inputs: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<Vec<RecordBatch>, StageExecutionError> {
+    use crate::engine::duckdb::arrow_utils::{
+        drop_temp_table, register_arrow_batches,
+    };
+    use duckdb::Connection;
+
+    // Handle empty SQL
+    if stage.stage_sql.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Create DuckDB connection
+    let conn = Connection::open_in_memory()
+        .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+
+    // Register all exchange inputs as temporary tables
+    let mut registered_tables = Vec::new();
+    for (table_name, batches) in inputs {
+        if !batches.is_empty() {
+            register_arrow_batches(&conn, table_name, batches)
+                .map_err(|e| StageExecutionError::ExecutionFailed(
+                    format!("Failed to register table '{}': {:#}", table_name, e)
+                ))?;
+            registered_tables.push(table_name.clone());
+        } else {
+            // Create empty stub table so SQL doesn't fail
+            conn.execute(
+                &format!(
+                    "CREATE TEMPORARY TABLE IF NOT EXISTS \"{}\" AS SELECT 1 WHERE FALSE",
+                    table_name.replace('"', "\"\"")
+                ),
+                [],
+            )
+            .map_err(|e| StageExecutionError::ExecutionFailed(
+                format!("Failed to create empty stub for '{}': {}", table_name, e)
+            ))?;
+            registered_tables.push(table_name.clone());
+        }
+    }
+
+    // Execute the SQL query
+    let result = {
+        let mut stmt = conn.prepare(&stage.stage_sql)
+            .map_err(|e| StageExecutionError::ExecutionFailed(
+                format!("Failed to prepare SQL: {}", e)
+            ))?;
+        
+        let rows = stmt
+            .query_arrow([])
+            .map_err(|e| StageExecutionError::ExecutionFailed(
+                format!("Failed to execute SQL: {}", e)
+            ))?;
+        let schema = rows.get_schema();
+        
+        let batches: Vec<RecordBatch> = rows.collect();
+        if batches.is_empty() {
+            Ok::<Vec<RecordBatch>, StageExecutionError>(vec![RecordBatch::new_empty(schema)])
+        } else {
+            Ok::<Vec<RecordBatch>, StageExecutionError>(batches)
+        }
+    };
+
+    // Clean up registered tables
+    for table_name in &registered_tables {
+        let _ = drop_temp_table(&conn, table_name);
+    }
+
+    result
 }
 
 /// Helper function to partition record batches by hash.
@@ -463,9 +680,9 @@ impl LocalStageExecutor {
     fn partition_batches(
         batches: &[RecordBatch],
         num_partitions: u32,
-        field_refs: &[u32],
+        column_refs: &[crate::sql::logical_plan::ColumnRef],
     ) -> Result<Vec<Vec<RecordBatch>>, StageExecutionError> {
-        use crate::ldp::executor::exchange::hash_partition_batch;
+        use crate::ldp::executor::exchange::{hash_partition_batch, resolve_column_indices};
         use arrow::compute::concat_batches;
         
         if batches.is_empty() {
@@ -489,8 +706,14 @@ impl LocalStageExecutor {
             return Ok(vec![vec![]; num_partitions as usize]);
         }
 
+        // Resolve column references to field indices
+        let field_indices = resolve_column_indices(column_refs, &schema)
+            .map_err(|e| StageExecutionError::ExecutionFailed(
+                format!("Failed to resolve column references: {}", e)
+            ))?;
+
         // Use the same hash partitioning logic as exchanges to keep consistency.
-        let partitions = hash_partition_batch(&combined, field_refs, num_partitions)
+        let partitions = hash_partition_batch(&combined, &field_indices, num_partitions)
             .map_err(|e| StageExecutionError::ExecutionFailed(format!("Partitioning failed: {}", e)))?
             .into_iter()
             .map(|batch| if batch.num_rows() > 0 { vec![batch] } else { vec![] })
@@ -504,7 +727,7 @@ impl LocalStageExecutor {
 ///
 /// Returns stages in order such that all dependencies are executed first.
 pub fn topological_sort(plan: &LdpPlan) -> Vec<StageId> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     let mut in_degree: HashMap<StageId, usize> = HashMap::new();
     let mut adjacency: HashMap<StageId, Vec<StageId>> = HashMap::new();
@@ -565,7 +788,7 @@ mod tests {
             target_workers: vec!["w1".into(), "w2".into()],
             inputs: vec![StageInput::LocalCatalog],
             output: StageOutput::Stream,
-            substrait_plan: vec![],
+            stage_sql: String::new(),
             limits: StageLimits::default(),
         });
 
@@ -578,7 +801,7 @@ mod tests {
                 table_name: "__exchange_0".into(),
             }],
             output: StageOutput::Stream,
-            substrait_plan: vec![],
+            stage_sql: String::new(),
             limits: StageLimits::default(),
         });
 
@@ -628,7 +851,7 @@ mod tests {
             target_workers: vec!["local".into()],
             inputs: vec![StageInput::LocalCatalog],
             output: StageOutput::Stream,
-            substrait_plan: vec![],
+            stage_sql: String::new(),
             limits: StageLimits::default(),
         };
 

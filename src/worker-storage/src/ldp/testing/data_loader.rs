@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, Int64Array, Float64Array, StringArray, Date32Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{NaiveDate, NaiveDateTime, Datelike};
+use chrono::{NaiveDate, Datelike};
 use rand::Rng;
 
 use super::cluster::TestCluster;
@@ -356,13 +356,13 @@ impl TestDataLoader {
         &self,
         spec: &TableLoadSpec,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Register each epoch table name in the dataset manager
+        use crate::ldp::EpochStats;
+
+        // Register each epoch table name in the dataset manager AND planner metadata
         for epoch in &spec.epochs {
             // Create epoch table name: {dataset_id}__{epoch_id}
             let epoch_table_name = format!("{}__{}", spec.dataset_id, epoch.epoch_id);
 
-            // For testing, we also need to track statistics
-            // In a real system, this would come from ingestion metadata
             println!(
                 "    Registering epoch metadata: {} on {}",
                 epoch.epoch_id, epoch.worker_id
@@ -374,6 +374,23 @@ impl TestDataLoader {
                 .dataset_manager
                 .register_table(&spec.table_name, epoch_table_name)
                 .await;
+
+            // Register with InMemoryMetadata so the planner knows distribution
+            let start_ms = epoch.start_date.and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp_millis() as u64)
+                .unwrap_or(0);
+            let end_ms = epoch.end_date.and_hms_opt(23, 59, 59)
+                .map(|dt| dt.and_utc().timestamp_millis() as u64)
+                .unwrap_or(u64::MAX);
+            let estimated_bytes = epoch.row_count as u64 * 100; // rough estimate
+
+            self.cluster.metadata.add_epoch_with_time_range(
+                &epoch.epoch_id,
+                &spec.table_name,
+                EpochStats::exact(epoch.row_count as u64, estimated_bytes),
+                epoch.worker_id.clone(),
+                (start_ms, end_ms),
+            );
         }
 
         Ok(())
@@ -714,10 +731,6 @@ impl TestDataLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ldp::executor::coordinator::LdpCoordinator;
-    use crate::ldp::executor::stage::LogicalDatasetManager;
-    use crate::ldp::planner::PlannerPolicy;
-
     #[tokio::test]
     async fn test_generate_orders() {
         let orders = TestDataLoader::generate_orders(5);
@@ -749,17 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_loader_creation() {
-        // Create a minimal cluster for testing
-        let config = crate::ldp::executor::coordinator::CoordinatorConfig::builder()
-            .with_tenant_id("test-tenant".to_string())
-            .with_policy(PlannerPolicy::default())
-            .build();
-            
-        let dataset_manager = Arc::new(LogicalDatasetManager::new());
-        let coordinator = Arc::new(LdpCoordinator::new(config, dataset_manager.clone()));
-        
-        // For this test, we'll create a minimal cluster-like structure
-        // Since the full cluster involves more complex setup, we'll test the data loader methods individually
+        // Test the data loader methods individually without a full cluster
         let orders = TestDataLoader::generate_orders(10);
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].num_rows(), 10);

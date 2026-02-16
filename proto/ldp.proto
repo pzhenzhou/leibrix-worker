@@ -22,8 +22,8 @@ message SingletonDistribution {
 }
 
 message HashPartitionedDistribution {
-  // Field indices into the schema (Substrait convention)
-  repeated uint32 field_refs = 1;
+  // Column references for partition keys
+  repeated ColumnRef column_refs = 1;
   repeated string worker_ids = 2;
 }
 
@@ -35,6 +35,13 @@ message ReplicatedDistribution {
   repeated string worker_ids = 1;
 }
 
+// Reference to a column (qualified or unqualified).
+message ColumnRef {
+  // Optional table qualifier (e.g., "orders", "o")
+  optional string table = 1;
+  // Column name (e.g., "id", "order_id")
+  string column = 2;
+}
 
 // Defines how data moves between stages.
 message Exchange {
@@ -54,7 +61,7 @@ message BroadcastExchange {
 }
 
 message HashPartitionExchange {
-  repeated uint32 field_refs = 1;
+  repeated ColumnRef column_refs = 1;
   uint32 partitions = 2;
 }
 
@@ -91,7 +98,7 @@ message StreamOutput {
 
 message PartitionedOutput {
   uint32 partitions = 1;
-  repeated uint32 field_refs = 2;  // Hash keys for partitioning
+  repeated ColumnRef column_refs = 2;  // Hash keys for partitioning
 }
 
 // Resource limits for stage execution.
@@ -108,8 +115,8 @@ message Stage {
   repeated string target_worker_ids = 2;
   repeated StageInput inputs = 3;
   StageOutput output = 4;
-  // Substrait plan fragment (serialized Substrait protobuf)
-  bytes substrait_plan = 5;
+  // SQL fragment for this stage (executable SELECT statement)
+  string stage_sql = 5;
   StageLimits limits = 6;
 }
 
@@ -148,8 +155,8 @@ message SubmitStageRequest {
   string tenant_id = 1;
   string query_id = 2;
   uint32 stage_id = 3;
-  // The Substrait plan fragment to execute
-  bytes substrait_plan = 4;
+  // The SQL fragment to execute (SELECT statement)
+  string stage_sql = 4;
   StageLimits limits = 5;
   // Exchange inputs to register before execution
   repeated ExchangeInputRegistration exchange_inputs = 6;

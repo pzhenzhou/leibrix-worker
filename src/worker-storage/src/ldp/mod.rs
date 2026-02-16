@@ -3,28 +3,27 @@
 //! This module implements distributed query execution for bounded, in-memory analytics.
 //!
 //! # Design Principles
-//! - Work directly with Substrait as the logical plan representation
-//! - No custom IR - traverse and annotate Substrait directly
+//! - SQL-delegating architecture: LogicalPlan as intermediate representation
 //! - Single unified algorithm driven by distribution property enforcement
+//! - Each stage carries a SQL string for DuckDB execution
 //!
 //! # Key Components
 //! - `types`: Core data structures (Distribution, Exchange, Stage, LdpPlan)
 //! - `planner`: LDP generation (annotate_and_enforce, cut_into_stages)
-//! - `substrait`: Utilities for working with Substrait plans
 //! - `executor`: LDP execution (LdpExecutor, ExchangeRuntime)
 
 pub mod executor;
 pub mod planner;
 pub mod proto_convert;
-pub mod substrait;
 pub mod testing;
 pub mod types;
 
 // Re-export key planner types
 pub use planner::{
-    annotate_and_enforce, cut_into_stages, extract_stage_substrait, plan_ldp,
-    plan_ldp_from_rel, plan_ldp_from_substrait, AnnotatedRel, AnnotationResult,
-    ExchangeDecision, InMemoryMetadata, Metadata, PipelineError, PlannerPolicy,
+    annotate_logical_plan, extract_stage_sql, AnnotatedPlan,
+    plan_ldp, plan_ldp_from_logical_plan,
+    cut_into_stages, AnnotationResult,
+    ExchangeDecision, InMemoryMetadata, Metadata, PipelineError, PlanInspector, PlannerPolicy,
     PlanningError, RejectReason, TableScanStats,
 };
 pub use types::*;

@@ -5,6 +5,7 @@
 
 use crate::ldp::{Distribution, EpochStats, StatsSource, WorkerId};
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// Trait for accessing metadata during LDP planning.
 ///
@@ -63,6 +64,7 @@ pub trait Metadata: Send + Sync {
             bytes: total_bytes,
             workers,
             stats_source,
+            distribution: None,
         }
     }
 }
@@ -78,11 +80,18 @@ pub struct TableScanStats {
     pub workers: Vec<WorkerId>,
     /// Combined confidence level (Exact only if ALL epoch stats are exact).
     pub stats_source: StatsSource,
+    /// Optional explicit distribution (e.g., Replicated, HashPartitioned)
+    /// provided by control-plane metadata.
+    pub distribution: Option<Distribution>,
 }
 
 impl TableScanStats {
     /// Convert to a Distribution annotation.
     pub fn to_distribution(&self) -> Distribution {
+        if let Some(distribution) = &self.distribution {
+            return distribution.clone();
+        }
+
         if self.workers.len() == 1 {
             Distribution::Singleton {
                 worker: self.workers[0].clone(),
@@ -96,12 +105,36 @@ impl TableScanStats {
 }
 
 /// In-memory implementation of Metadata for testing and simple use cases.
-#[derive(Clone, Debug, Default)]
+///
+/// Uses interior mutability (`RwLock`) so metadata can be registered after
+/// the instance is shared behind `Arc` (e.g., in the coordinator).
 pub struct InMemoryMetadata {
     /// epoch_id -> (stats, worker_id)
-    epochs: HashMap<String, (EpochStats, WorkerId)>,
+    epochs: RwLock<HashMap<String, (EpochStats, WorkerId)>>,
     /// table_name -> vec of (epoch_id, time_range)
-    table_epochs: HashMap<String, Vec<(String, Option<(u64, u64)>)>>,
+    table_epochs: RwLock<HashMap<String, Vec<(String, Option<(u64, u64)>)>>>,
+    /// table_name -> table-level scan stats from master/control plane
+    table_stats: RwLock<HashMap<String, TableScanStats>>,
+}
+
+impl std::fmt::Debug for InMemoryMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryMetadata")
+            .field("epochs", &*self.epochs.read().unwrap())
+            .field("table_epochs", &*self.table_epochs.read().unwrap())
+            .field("table_stats", &*self.table_stats.read().unwrap())
+            .finish()
+    }
+}
+
+impl Default for InMemoryMetadata {
+    fn default() -> Self {
+        Self {
+            epochs: RwLock::new(HashMap::new()),
+            table_epochs: RwLock::new(HashMap::new()),
+            table_stats: RwLock::new(HashMap::new()),
+        }
+    }
 }
 
 impl InMemoryMetadata {
@@ -112,7 +145,7 @@ impl InMemoryMetadata {
 
     /// Register an epoch with its stats and worker.
     pub fn add_epoch(
-        &mut self,
+        &self,
         epoch_id: impl Into<String>,
         table_name: impl Into<String>,
         stats: EpochStats,
@@ -121,8 +154,13 @@ impl InMemoryMetadata {
         let epoch_id = epoch_id.into();
         let table_name = table_name.into();
 
-        self.epochs.insert(epoch_id.clone(), (stats, worker));
+        self.epochs
+            .write()
+            .unwrap()
+            .insert(epoch_id.clone(), (stats, worker));
         self.table_epochs
+            .write()
+            .unwrap()
             .entry(table_name)
             .or_default()
             .push((epoch_id, None));
@@ -130,7 +168,7 @@ impl InMemoryMetadata {
 
     /// Register an epoch with time range for time-based filtering.
     pub fn add_epoch_with_time_range(
-        &mut self,
+        &self,
         epoch_id: impl Into<String>,
         table_name: impl Into<String>,
         stats: EpochStats,
@@ -140,8 +178,13 @@ impl InMemoryMetadata {
         let epoch_id = epoch_id.into();
         let table_name = table_name.into();
 
-        self.epochs.insert(epoch_id.clone(), (stats, worker));
+        self.epochs
+            .write()
+            .unwrap()
+            .insert(epoch_id.clone(), (stats, worker));
         self.table_epochs
+            .write()
+            .unwrap()
             .entry(table_name)
             .or_default()
             .push((epoch_id, Some(time_range)));
@@ -149,7 +192,7 @@ impl InMemoryMetadata {
 
     /// Builder method to add an epoch.
     pub fn with_epoch(
-        mut self,
+        self,
         epoch_id: impl Into<String>,
         table_name: impl Into<String>,
         stats: EpochStats,
@@ -161,7 +204,7 @@ impl InMemoryMetadata {
 
     /// Builder method to add an epoch with time range.
     pub fn with_epoch_time_range(
-        mut self,
+        self,
         epoch_id: impl Into<String>,
         table_name: impl Into<String>,
         stats: EpochStats,
@@ -173,20 +216,51 @@ impl InMemoryMetadata {
     }
 
     /// Sort epochs by time range start for a table.
-    pub fn sort_epochs_by_time(&mut self, table_name: &str) {
-        if let Some(epochs) = self.table_epochs.get_mut(table_name) {
+    pub fn sort_epochs_by_time(&self, table_name: &str) {
+        let mut table_epochs = self.table_epochs.write().unwrap();
+        if let Some(epochs) = table_epochs.get_mut(table_name) {
             epochs.sort_by_key(|(_, time_range)| time_range.map(|(start, _)| start).unwrap_or(0));
         }
+    }
+
+    /// Register table scan statistics received from control plane.
+    pub fn register_table_stats(
+        &self,
+        table_name: &str,
+        workers: Vec<String>,
+        distribution: Distribution,
+        row_count: u64,
+        byte_size: u64,
+        stats_source: StatsSource,
+    ) {
+        self.table_stats.write().unwrap().insert(
+            table_name.to_string(),
+            TableScanStats {
+                rows: row_count,
+                bytes: byte_size,
+                workers,
+                stats_source,
+                distribution: Some(distribution),
+            },
+        );
     }
 }
 
 impl Metadata for InMemoryMetadata {
     fn get_epoch_stats(&self, epoch_id: &str) -> Option<EpochStats> {
-        self.epochs.get(epoch_id).map(|(stats, _)| stats.clone())
+        self.epochs
+            .read()
+            .unwrap()
+            .get(epoch_id)
+            .map(|(stats, _)| stats.clone())
     }
 
     fn get_epoch_worker(&self, epoch_id: &str) -> Option<WorkerId> {
-        self.epochs.get(epoch_id).map(|(_, worker)| worker.clone())
+        self.epochs
+            .read()
+            .unwrap()
+            .get(epoch_id)
+            .map(|(_, worker)| worker.clone())
     }
 
     fn get_epochs_for_table(
@@ -199,8 +273,24 @@ impl Metadata for InMemoryMetadata {
         let start_ms = start_epoch.and_then(|s| s.parse::<u64>().ok());
         let end_ms = end_epoch.and_then(|s| s.parse::<u64>().ok());
 
-        self.table_epochs
-            .get(table_name)
+        let table_epochs = self.table_epochs.read().unwrap();
+        let epochs = self.epochs.read().unwrap();
+
+        // The SQL transformer rewrites table names to macro calls, e.g.
+        // `orders` → `scan_orders(...)`.  The metadata stores epochs under the
+        // original base table name.  If a direct lookup fails and the name
+        // starts with `scan_`, fall back to the base name so the annotator
+        // resolves the correct distribution.
+        let resolved_name = if table_epochs.contains_key(table_name) {
+            table_name
+        } else if let Some(base) = table_name.strip_prefix("scan_") {
+            if table_epochs.contains_key(base) { base } else { table_name }
+        } else {
+            table_name
+        };
+
+        table_epochs
+            .get(resolved_name)
             .map(|epoch_entries| {
                 epoch_entries
                     .iter()
@@ -220,7 +310,7 @@ impl Metadata for InMemoryMetadata {
                         };
 
                         if matches {
-                            self.epochs
+                            epochs
                                 .get(id)
                                 .map(|(_, worker)| (id.clone(), worker.clone()))
                         } else {
@@ -230,6 +320,64 @@ impl Metadata for InMemoryMetadata {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn get_table_scan_stats(&self, table_name: &str) -> TableScanStats {
+        // If we have registered table stats from control plane, use those.
+        // Try direct lookup first; if the name starts with `scan_`, also
+        // check the base name (the SQL transformer rewrites `orders` →
+        // `scan_orders(...)`).
+        {
+            let stats_guard = self.table_stats.read().unwrap();
+            if let Some(scan_stats) = stats_guard.get(table_name) {
+                return scan_stats.clone();
+            }
+            if let Some(base) = table_name.strip_prefix("scan_") {
+                if let Some(scan_stats) = stats_guard.get(base) {
+                    return scan_stats.clone();
+                }
+            }
+        }
+
+        // Otherwise, aggregate from epoch metadata
+        // (get_epochs_for_table already handles scan_ prefix resolution)
+        let epochs = self.get_epochs_for_table(table_name, None, None);
+        let mut total_rows = 0u64;
+        let mut total_bytes = 0u64;
+        let mut workers = Vec::new();
+        let mut all_exact = true;
+
+        for (epoch_id, worker_id) in &epochs {
+            if let Some(stats) = self.get_epoch_stats(epoch_id) {
+                total_rows += stats.rows;
+                total_bytes += stats.bytes;
+                if stats.stats_source != StatsSource::Exact {
+                    all_exact = false;
+                }
+            } else {
+                all_exact = false;
+            }
+
+            if !workers.contains(worker_id) {
+                workers.push(worker_id.clone());
+            }
+        }
+
+        let stats_source = if all_exact && !epochs.is_empty() {
+            StatsSource::Exact
+        } else if !epochs.is_empty() {
+            StatsSource::Estimated
+        } else {
+            StatsSource::Unknown
+        };
+
+        TableScanStats {
+            rows: total_rows,
+            bytes: total_bytes,
+            workers,
+            stats_source,
+            distribution: None,
+        }
     }
 }
 
@@ -273,6 +421,7 @@ mod tests {
             bytes: 10000,
             workers: vec!["w1".into()],
             stats_source: StatsSource::Exact,
+            distribution: None,
         };
         assert!(matches!(
             single_worker.to_distribution(),
@@ -284,6 +433,7 @@ mod tests {
             bytes: 10000,
             workers: vec!["w1".into(), "w2".into()],
             stats_source: StatsSource::Exact,
+            distribution: None,
         };
         assert!(matches!(
             multi_worker.to_distribution(),
@@ -360,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_sort_epochs_by_time() {
-        let mut metadata = InMemoryMetadata::new();
+        let metadata = InMemoryMetadata::new();
 
         // Add epochs out of order
         metadata.add_epoch_with_time_range(
@@ -387,5 +537,49 @@ mod tests {
         assert_eq!(epochs[0].0, "e1");
         assert_eq!(epochs[1].0, "e2");
         assert_eq!(epochs[2].0, "e3");
+    }
+
+    #[test]
+    fn test_exact_stats_enables_registered_distribution() {
+        let metadata = InMemoryMetadata::new();
+        metadata.register_table_stats(
+            "products",
+            vec!["w1".into()],
+            Distribution::Singleton {
+                worker: "w1".into(),
+            },
+            10_000,
+            5_000_000,
+            StatsSource::Exact,
+        );
+
+        let scan_stats = metadata.get_table_scan_stats("products");
+        assert_eq!(scan_stats.rows, 10_000);
+        assert_eq!(scan_stats.bytes, 5_000_000);
+        assert_eq!(scan_stats.stats_source, StatsSource::Exact);
+        assert!(matches!(
+            scan_stats.to_distribution(),
+            Distribution::Singleton { .. }
+        ));
+    }
+
+    #[test]
+    fn test_unknown_stats_keeps_conservative_source() {
+        let metadata = InMemoryMetadata::new();
+        metadata.register_table_stats(
+            "products",
+            vec!["w1".into()],
+            Distribution::Singleton {
+                worker: "w1".into(),
+            },
+            0,
+            0,
+            StatsSource::Unknown,
+        );
+
+        let scan_stats = metadata.get_table_scan_stats("products");
+        assert_eq!(scan_stats.rows, 0);
+        assert_eq!(scan_stats.bytes, 0);
+        assert_eq!(scan_stats.stats_source, StatsSource::Unknown);
     }
 }

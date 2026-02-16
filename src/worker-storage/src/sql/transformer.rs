@@ -352,7 +352,7 @@ impl SqlTransformer {
                 self.rewrite_expr_subqueries(low, replacements)?;
                 self.rewrite_expr_subqueries(high, replacements)?;
             }
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case { operand, else_result, .. } => {
                 if let Some(op) = operand {
                     self.rewrite_expr_subqueries(op, replacements)?;
                 }

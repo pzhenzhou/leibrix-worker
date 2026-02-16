@@ -6,6 +6,7 @@
 //! - Stage and LdpPlan for the execution plan structure
 
 use std::collections::HashMap;
+use crate::sql::logical_plan::ColumnRef;
 
 // ============================================================================
 // Identifiers
@@ -77,10 +78,10 @@ pub enum Distribution {
     /// Used after Gather exchange or for scalar aggregates.
     Singleton { worker: WorkerId },
 
-    /// Data is partitioned by hash of field references across workers.
-    /// Field refs are indices into the schema (Substrait convention).
+    /// Data is partitioned by hash of column references across workers.
+    /// Column refs identify partition keys (table.column or unqualified).
     HashPartitioned {
-        field_refs: Vec<u32>,
+        column_refs: Vec<ColumnRef>,
         workers: Vec<WorkerId>,
     },
 
@@ -186,9 +187,9 @@ pub enum RequiredDistribution {
     /// Data must be on a single node (e.g., Sort, Fetch, scalar Aggregate).
     Singleton,
 
-    /// Data must be hash-partitioned by these field references.
+    /// Data must be hash-partitioned by these column references.
     /// (e.g., GROUP BY columns, JOIN keys).
-    HashPartitioned { field_refs: Vec<u32> },
+    HashPartitioned { column_refs: Vec<ColumnRef> },
 }
 
 impl RequiredDistribution {
@@ -197,12 +198,18 @@ impl RequiredDistribution {
         match self {
             RequiredDistribution::Any => true,
             RequiredDistribution::Singleton => actual.is_singleton(),
-            RequiredDistribution::HashPartitioned { field_refs } => {
+            RequiredDistribution::HashPartitioned { column_refs } => {
                 match actual {
                     Distribution::HashPartitioned {
-                        field_refs: actual_refs,
+                        column_refs: actual_refs,
                         ..
-                    } => field_refs == actual_refs,
+                    } => {
+                        column_refs.len() == actual_refs.len()
+                            && column_refs
+                                .iter()
+                                .zip(actual_refs.iter())
+                                .all(|(required, actual)| required.matches(actual))
+                    }
                     Distribution::Replicated { .. } => true, // Replicated satisfies any partitioning
                     _ => false,
                 }
@@ -225,10 +232,10 @@ pub enum Exchange {
     /// Used for small dimension tables in broadcast joins.
     Broadcast { targets: Vec<WorkerId> },
 
-    /// Repartition data by hash of field references.
+    /// Repartition data by hash of column references.
     /// Used for shuffle joins and distributed GROUP BY.
     HashPartition {
-        field_refs: Vec<u32>,
+        column_refs: Vec<ColumnRef>,
         partitions: u32,
     },
 }
@@ -247,9 +254,9 @@ impl Exchange {
     }
 
     /// Create a HashPartition exchange.
-    pub fn hash_partition(field_refs: Vec<u32>, partitions: u32) -> Self {
+    pub fn hash_partition(column_refs: Vec<ColumnRef>, partitions: u32) -> Self {
         Exchange::HashPartition {
-            field_refs,
+            column_refs,
             partitions,
         }
     }
@@ -278,7 +285,7 @@ pub enum StageOutput {
     Stream,
 
     /// Multiple partitioned streams (for HashPartition exchange).
-    Partitioned { partitions: u32, field_refs: Vec<u32> },
+    Partitioned { partitions: u32, column_refs: Vec<ColumnRef> },
 }
 
 impl Default for StageOutput {
@@ -316,7 +323,7 @@ impl Default for StageLimits {
 
 /// A single execution stage in the LDP plan.
 ///
-/// Each stage is a valid Substrait subplan that can be executed
+/// Each stage is a valid SQL fragment that can be executed
 /// independently on a set of workers.
 #[derive(Clone, Debug)]
 pub struct Stage {
@@ -332,23 +339,23 @@ pub struct Stage {
     /// Output format of this stage.
     pub output: StageOutput,
 
-    /// Substrait plan fragment (serialized bytes).
-    /// This is NOT a custom IR - it's the actual Substrait protobuf.
-    pub substrait_plan: Vec<u8>,
+    /// SQL fragment for this stage (SELECT statement).
+    /// This is NOT IR - it's executable SQL that delegates to DuckDB.
+    pub stage_sql: String,
 
     /// Resource limits for execution.
     pub limits: StageLimits,
 }
 
 impl Stage {
-    /// Create a new stage with the given ID and plan.
-    pub fn new(stage_id: StageId, substrait_plan: Vec<u8>) -> Self {
+    /// Create a new stage with the given ID and SQL fragment.
+    pub fn new(stage_id: StageId, stage_sql: String) -> Self {
         Self {
             stage_id,
             target_workers: Vec::new(),
             inputs: Vec::new(),
             output: StageOutput::default(),
-            substrait_plan,
+            stage_sql,
             limits: StageLimits::default(),
         }
     }
@@ -580,25 +587,31 @@ mod tests {
         assert!(RequiredDistribution::Singleton.is_satisfied_by(&singleton));
         assert!(
             !RequiredDistribution::HashPartitioned {
-                field_refs: vec![0]
+                column_refs: vec![ColumnRef::unqualified("col0")]
             }
             .is_satisfied_by(&singleton)
         );
 
         let hash_partitioned = Distribution::HashPartitioned {
-            field_refs: vec![0, 1],
+            column_refs: vec![
+                ColumnRef::unqualified("col0"),
+                ColumnRef::unqualified("col1"),
+            ],
             workers: vec!["w1".to_string(), "w2".to_string()],
         };
 
         assert!(
             RequiredDistribution::HashPartitioned {
-                field_refs: vec![0, 1]
+                column_refs: vec![
+                    ColumnRef::unqualified("col0"),
+                    ColumnRef::unqualified("col1"),
+                ]
             }
             .is_satisfied_by(&hash_partitioned)
         );
         assert!(
             !RequiredDistribution::HashPartitioned {
-                field_refs: vec![0]
+                column_refs: vec![ColumnRef::unqualified("col0")]
             }
             .is_satisfied_by(&hash_partitioned)
         );
@@ -606,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_stage_has_exchange_inputs() {
-        let mut stage = Stage::new(0, vec![]);
+        let mut stage = Stage::new(0, String::new());
         assert!(!stage.has_exchange_inputs());
 
         stage.inputs.push(StageInput::LocalCatalog);
@@ -623,8 +636,8 @@ mod tests {
     fn test_ldp_plan_navigation() {
         let mut plan = LdpPlan::new("q1".to_string(), "coordinator".to_string());
 
-        plan.stages.push(Stage::new(0, vec![]));
-        plan.stages.push(Stage::new(1, vec![]));
+        plan.stages.push(Stage::new(0, String::new()));
+        plan.stages.push(Stage::new(1, String::new()));
 
         plan.edges.push(ExchangeEdge {
             exchange_id: 0,

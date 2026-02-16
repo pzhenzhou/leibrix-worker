@@ -38,9 +38,9 @@ pub struct SingletonDistribution {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HashPartitionedDistribution {
-    /// Field indices into the schema (Substrait convention)
-    #[prost(uint32, repeated, tag = "1")]
-    pub field_refs: ::prost::alloc::vec::Vec<u32>,
+    /// Column references for partition keys
+    #[prost(message, repeated, tag = "1")]
+    pub column_refs: ::prost::alloc::vec::Vec<ColumnRef>,
     #[prost(string, repeated, tag = "2")]
     pub worker_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
@@ -59,6 +59,19 @@ pub struct EpochPartitionedDistribution {
 pub struct ReplicatedDistribution {
     #[prost(string, repeated, tag = "1")]
     pub worker_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Reference to a column (qualified or unqualified).
+#[allow(non_camel_case_types)]
+#[allow(clippy::large_enum_variant)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ColumnRef {
+    /// Optional table qualifier (e.g., "orders", "o")
+    #[prost(string, optional, tag = "1")]
+    pub table: ::core::option::Option<::prost::alloc::string::String>,
+    /// Column name (e.g., "id", "order_id")
+    #[prost(string, tag = "2")]
+    pub column: ::prost::alloc::string::String,
 }
 /// Defines how data moves between stages.
 #[allow(non_camel_case_types)]
@@ -105,8 +118,8 @@ pub struct BroadcastExchange {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HashPartitionExchange {
-    #[prost(uint32, repeated, tag = "1")]
-    pub field_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, repeated, tag = "1")]
+    pub column_refs: ::prost::alloc::vec::Vec<ColumnRef>,
     #[prost(uint32, tag = "2")]
     pub partitions: u32,
 }
@@ -185,8 +198,8 @@ pub struct PartitionedOutput {
     #[prost(uint32, tag = "1")]
     pub partitions: u32,
     /// Hash keys for partitioning
-    #[prost(uint32, repeated, tag = "2")]
-    pub field_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, repeated, tag = "2")]
+    pub column_refs: ::prost::alloc::vec::Vec<ColumnRef>,
 }
 /// Resource limits for stage execution.
 #[allow(non_camel_case_types)]
@@ -217,9 +230,9 @@ pub struct Stage {
     pub inputs: ::prost::alloc::vec::Vec<StageInput>,
     #[prost(message, optional, tag = "4")]
     pub output: ::core::option::Option<StageOutput>,
-    /// Substrait plan fragment (serialized Substrait protobuf)
-    #[prost(bytes = "vec", tag = "5")]
-    pub substrait_plan: ::prost::alloc::vec::Vec<u8>,
+    /// SQL fragment for this stage (executable SELECT statement)
+    #[prost(string, tag = "5")]
+    pub stage_sql: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "6")]
     pub limits: ::core::option::Option<StageLimits>,
 }
@@ -268,9 +281,9 @@ pub struct SubmitStageRequest {
     pub query_id: ::prost::alloc::string::String,
     #[prost(uint32, tag = "3")]
     pub stage_id: u32,
-    /// The Substrait plan fragment to execute
-    #[prost(bytes = "vec", tag = "4")]
-    pub substrait_plan: ::prost::alloc::vec::Vec<u8>,
+    /// The SQL fragment to execute (SELECT statement)
+    #[prost(string, tag = "4")]
+    pub stage_sql: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
     pub limits: ::core::option::Option<StageLimits>,
     /// Exchange inputs to register before execution

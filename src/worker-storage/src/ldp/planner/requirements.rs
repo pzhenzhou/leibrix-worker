@@ -1,232 +1,119 @@
-//! Distribution requirements for Substrait operators.
+//! Distribution requirements for LogicalPlan operators.
 //!
-//! This module contains `get_requirements()` - THE ONLY place where we
-//! inspect the specific RelType to determine distribution requirements.
+//! This module contains `get_logical_plan_requirements()` - THE ONLY place where we
+//! inspect the specific LogicalPlan variant to determine distribution requirements.
 //!
 //! # Design Principle
 //! All operator-specific logic for requirements is centralized here.
-//! Other planner code only deals with generic Rel nodes and distributions.
+//! Other planner code only deals with generic plan nodes and distributions.
 
-use crate::ldp::substrait::helpers::{
-    all_groupings_empty, extract_grouping_field_refs, extract_hash_join_key_refs,
-    extract_join_key_refs,
-};
 use crate::ldp::{Distribution, RequiredDistribution};
-use substrait::proto::rel::RelType;
-use substrait::proto::Rel;
+use crate::sql::logical_plan::LogicalPlan;
 
-/// Get the distribution requirements for a Rel's inputs.
+/// Get the distribution requirements for a LogicalPlan's inputs.
 ///
-/// This is THE ONLY place we inspect RelType to determine requirements.
+/// This is THE ONLY place we inspect LogicalPlan variants to determine requirements.
 /// Returns a vector of requirements, one per input (in order).
 ///
 /// # Requirements by Operator Type
 ///
 /// | Operator | Input Count | Requirements |
 /// |----------|-------------|--------------|
-/// | Read | 0 | (none) |
+/// | Scan | 0 | (none) |
+/// | ExchangeRead | 0 | (none) |
 /// | Filter | 1 | Any |
 /// | Project | 1 | Any |
 /// | Aggregate | 1 | HashPartitioned(group_keys) or Singleton if global |
 /// | Sort | 1 | Singleton |
-/// | Fetch | 1 | Singleton |
-/// | Join | 2 | HashPartitioned(join_keys) for each side |
-/// | HashJoin | 2 | HashPartitioned(join_keys) for each side |
-/// | Cross | 2 | Any, Any (broadcast smaller side separately) |
-/// | Set | N | Any for all inputs |
+/// | Limit | 1 | Singleton |
+/// | Join | 2 | HashPartitioned(join_keys) for each side (or Any for cross join) |
+/// | SetOp | 2+ | Any for all inputs |
+/// | Window | 1 | Singleton (conservative; could partition by PARTITION BY keys) |
+/// | SubqueryScan | 1 | Any |
 ///
 /// # Returns
-/// - Empty vector for leaf operators (Read, ExtensionLeaf)
+/// - Empty vector for leaf operators (Scan, ExchangeRead)
 /// - One requirement for unary operators (Filter, Project, Sort, etc.)
-/// - Two requirements for binary operators (Join, Cross)
-/// - N requirements for N-ary operators (Set/Union)
-pub fn get_requirements(rel: &Rel) -> Vec<RequiredDistribution> {
-    let Some(rel_type) = &rel.rel_type else {
-        return vec![];
-    };
-
-    match rel_type {
+/// - Two requirements for binary operators (Join)
+/// - N requirements for N-ary operators (SetOp/Union)
+pub fn get_logical_plan_requirements(plan: &LogicalPlan) -> Vec<RequiredDistribution> {
+    match plan {
         // ===== Leaf operators (0 inputs) =====
-        RelType::Read(_) | RelType::ExtensionLeaf(_) => vec![],
+        LogicalPlan::Scan { .. } | LogicalPlan::ExchangeRead { .. } => vec![],
 
         // ===== Distribution-preserving unary operators =====
         // These don't care about input distribution
-        RelType::Filter(_) | RelType::Project(_) => {
+        LogicalPlan::Filter { .. } | LogicalPlan::Project { .. } => {
             vec![RequiredDistribution::Any]
         }
 
         // ===== Singleton-requiring operators =====
         // Global Sort requires all data on one node
-        RelType::Sort(_) => vec![RequiredDistribution::Singleton],
+        LogicalPlan::Sort { .. } => vec![RequiredDistribution::Singleton],
 
         // LIMIT/OFFSET requires all data on one node
-        RelType::Fetch(_) => vec![RequiredDistribution::Singleton],
+        LogicalPlan::Limit { .. } => vec![RequiredDistribution::Singleton],
 
         // ===== Aggregate =====
         // Global aggregate (no GROUP BY) -> Singleton
         // Grouped aggregate -> HashPartitioned by group keys
-        RelType::Aggregate(agg) => {
-            if all_groupings_empty(agg) {
+        LogicalPlan::Aggregate { group_keys, .. } => {
+            if group_keys.is_empty() {
                 // Global aggregate: SUM(*), COUNT(*), etc.
                 vec![RequiredDistribution::Singleton]
             } else {
                 // Grouped aggregate: GROUP BY col1, col2
-                let group_keys = extract_grouping_field_refs(agg);
-                if group_keys.is_empty() {
-                    // Fallback: treat as global
-                    vec![RequiredDistribution::Singleton]
-                } else {
-                    vec![RequiredDistribution::HashPartitioned {
-                        field_refs: group_keys,
-                    }]
-                }
+                vec![RequiredDistribution::HashPartitioned {
+                    column_refs: group_keys.clone(),
+                }]
             }
         }
 
         // ===== Join operators =====
         // Both inputs need to be hash-partitioned by their respective join keys
-        RelType::Join(join) => {
-            match extract_join_key_refs(join) {
-                Ok(keys) if keys.is_valid() => {
-                    // Equi-join with extractable keys
-                    vec![
-                        RequiredDistribution::HashPartitioned {
-                            field_refs: keys.left_keys,
-                        },
-                        RequiredDistribution::HashPartitioned {
-                            field_refs: keys.right_keys,
-                        },
-                    ]
-                }
-                Ok(keys) if keys.is_cross_join() => {
-                    // Cross join - no partitioning requirement
-                    // (one side will be broadcast in practice)
-                    vec![RequiredDistribution::Any, RequiredDistribution::Any]
-                }
-                _ => {
-                    // Can't extract keys - treat as requiring Singleton (conservative)
-                    vec![
-                        RequiredDistribution::Singleton,
-                        RequiredDistribution::Singleton,
-                    ]
-                }
-            }
-        }
-
-        // HashJoin has explicit key fields
-        RelType::HashJoin(join) => {
-            let (left_keys, right_keys) = extract_hash_join_key_refs(join);
-            if !left_keys.is_empty() && !right_keys.is_empty() {
+        LogicalPlan::Join {
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            if left_keys.is_empty() || right_keys.is_empty() {
+                // Cross join - no partitioning requirement
+                // (one side will be broadcast in practice)
+                vec![RequiredDistribution::Any, RequiredDistribution::Any]
+            } else {
+                // Equi-join with keys
                 vec![
                     RequiredDistribution::HashPartitioned {
-                        field_refs: left_keys,
+                        column_refs: left_keys.clone(),
                     },
                     RequiredDistribution::HashPartitioned {
-                        field_refs: right_keys,
+                        column_refs: right_keys.clone(),
                     },
                 ]
-            } else {
-                // No keys - treat as cross join
-                vec![RequiredDistribution::Any, RequiredDistribution::Any]
             }
-        }
-
-        // MergeJoin also has explicit key fields
-        RelType::MergeJoin(join) => {
-            let left_keys: Vec<u32> = join
-                .left_keys
-                .iter()
-                .filter_map(|fr| {
-                    crate::ldp::substrait::helpers::extract_field_ref_from_expression(
-                        &substrait::proto::Expression {
-                            rex_type: Some(substrait::proto::expression::RexType::Selection(
-                                Box::new(fr.clone()),
-                            )),
-                        },
-                    )
-                })
-                .collect();
-
-            let right_keys: Vec<u32> = join
-                .right_keys
-                .iter()
-                .filter_map(|fr| {
-                    crate::ldp::substrait::helpers::extract_field_ref_from_expression(
-                        &substrait::proto::Expression {
-                            rex_type: Some(substrait::proto::expression::RexType::Selection(
-                                Box::new(fr.clone()),
-                            )),
-                        },
-                    )
-                })
-                .collect();
-
-            if !left_keys.is_empty() && !right_keys.is_empty() {
-                vec![
-                    RequiredDistribution::HashPartitioned {
-                        field_refs: left_keys,
-                    },
-                    RequiredDistribution::HashPartitioned {
-                        field_refs: right_keys,
-                    },
-                ]
-            } else {
-                vec![RequiredDistribution::Any, RequiredDistribution::Any]
-            }
-        }
-
-        // NestedLoopJoin - no hash partitioning possible
-        RelType::NestedLoopJoin(_) => {
-            vec![RequiredDistribution::Any, RequiredDistribution::Any]
-        }
-
-        // Cross join
-        RelType::Cross(_) => {
-            vec![RequiredDistribution::Any, RequiredDistribution::Any]
         }
 
         // ===== Set operators (UNION, INTERSECT, EXCEPT) =====
-        RelType::Set(set) => {
-            // All inputs can have any distribution
+        LogicalPlan::SetOp { .. } => {
+            // Both inputs can have any distribution
             // (they'll be gathered/combined at the coordinator)
-            vec![RequiredDistribution::Any; set.inputs.len()]
+            vec![RequiredDistribution::Any, RequiredDistribution::Any]
         }
 
         // ===== Window functions =====
         // Window may need partitioning by PARTITION BY clause
         // For now, conservatively require Singleton (can be optimized later
         // when we properly extract PARTITION BY keys from the window function spec)
-        RelType::Window(_window) => {
-            // TODO: Extract partition keys from window.partition_expressions
-            // when the Substrait API is better understood
+        LogicalPlan::Window { .. } => {
+            // TODO: Extract partition keys from window expressions
+            // when better analysis is implemented
             vec![RequiredDistribution::Singleton]
         }
 
-        // ===== Extension operators =====
-        RelType::ExtensionSingle(_) => {
-            // Conservative: pass through
+        // ===== SubqueryScan =====
+        LogicalPlan::SubqueryScan { .. } => {
             vec![RequiredDistribution::Any]
         }
-
-        RelType::ExtensionMulti(ext) => {
-            // One Any per input
-            vec![RequiredDistribution::Any; ext.inputs.len()]
-        }
-
-        // ===== Write/DDL operators =====
-        RelType::Write(_) => vec![RequiredDistribution::Any],
-        RelType::Ddl(_) => vec![],
-        RelType::Update(_) => vec![RequiredDistribution::Any],
-
-        // ===== Exchange operator =====
-        // Exchange itself doesn't impose requirements on its input
-        RelType::Exchange(_) => vec![RequiredDistribution::Any],
-
-        // ===== Expand (for CUBE/ROLLUP) =====
-        RelType::Expand(_) => vec![RequiredDistribution::Any],
-
-        // ===== Reference (named relation reference) =====
-        RelType::Reference(_) => vec![],
     }
 }
 
@@ -241,7 +128,7 @@ pub fn satisfies(actual: &Distribution, required: &RequiredDistribution) -> bool
 ///
 /// # Arguments
 /// * `child_distributions` - The actual distributions of child nodes
-/// * `requirements` - The requirements from `get_requirements()`
+/// * `requirements` - The requirements from `get_logical_plan_requirements()`
 ///
 /// # Returns
 /// * `true` if all requirements are satisfied
@@ -280,100 +167,218 @@ pub fn unsatisfied_requirements<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use substrait::proto::read_rel::ReadType;
-    use substrait::proto::{AggregateRel, FetchRel, FilterRel, ProjectRel, ReadRel, SortRel};
+    use crate::sql::logical_plan::ColumnRef;
+    use sqlparser::ast::{Expr, Ident, ObjectName, ObjectNamePart, SetOperator, SetQuantifier, TableFactor};
 
-    fn create_read_rel() -> Rel {
-        Rel {
-            rel_type: Some(RelType::Read(Box::new(ReadRel {
-                read_type: Some(ReadType::NamedTable(
-                    substrait::proto::read_rel::NamedTable {
-                        names: vec!["test".to_string()],
-                        advanced_extension: None,
-                    },
-                )),
-                ..Default::default()
-            }))),
+    fn create_scan(table: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: table.to_string(),
+            alias: None,
+            table_factor: TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                partitions: vec![],
+                with_ordinality: false,
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            },
         }
     }
 
     #[test]
-    fn test_read_requirements() {
-        let read = create_read_rel();
-        let reqs = get_requirements(&read);
-        assert!(reqs.is_empty(), "Read should have no input requirements");
+    fn test_scan_requirements() {
+        let scan = create_scan("test");
+        let reqs = get_logical_plan_requirements(&scan);
+        assert!(reqs.is_empty(), "Scan should have no input requirements");
+    }
+
+    #[test]
+    fn test_exchange_read_requirements() {
+        let exchange_read = LogicalPlan::ExchangeRead {
+            exchange_id: 0,
+            alias: "__exchange_0".to_string(),
+        };
+        let reqs = get_logical_plan_requirements(&exchange_read);
+        assert!(reqs.is_empty(), "ExchangeRead should have no input requirements");
     }
 
     #[test]
     fn test_filter_requirements() {
-        let filter = Rel {
-            rel_type: Some(RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(create_read_rel())),
-                ..Default::default()
-            }))),
+        let filter = LogicalPlan::Filter {
+            input: Box::new(create_scan("test")),
+            predicate: Expr::Identifier(Ident::new("dummy")),
         };
 
-        let reqs = get_requirements(&filter);
+        let reqs = get_logical_plan_requirements(&filter);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Any);
     }
 
     #[test]
     fn test_project_requirements() {
-        let project = Rel {
-            rel_type: Some(RelType::Project(Box::new(ProjectRel {
-                input: Some(Box::new(create_read_rel())),
-                ..Default::default()
-            }))),
+        let project = LogicalPlan::Project {
+            input: Box::new(create_scan("test")),
+            items: vec![],
         };
 
-        let reqs = get_requirements(&project);
+        let reqs = get_logical_plan_requirements(&project);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Any);
     }
 
     #[test]
     fn test_sort_requirements() {
-        let sort = Rel {
-            rel_type: Some(RelType::Sort(Box::new(SortRel {
-                input: Some(Box::new(create_read_rel())),
-                ..Default::default()
-            }))),
+        let sort = LogicalPlan::Sort {
+            input: Box::new(create_scan("test")),
+            order_by: vec![],
         };
 
-        let reqs = get_requirements(&sort);
+        let reqs = get_logical_plan_requirements(&sort);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Singleton);
     }
 
     #[test]
-    fn test_fetch_requirements() {
-        let fetch = Rel {
-            rel_type: Some(RelType::Fetch(Box::new(FetchRel {
-                input: Some(Box::new(create_read_rel())),
-                ..Default::default()
-            }))),
+    fn test_limit_requirements() {
+        let limit = LogicalPlan::Limit {
+            input: Box::new(create_scan("test")),
+            limit: None,
+            offset: None,
         };
 
-        let reqs = get_requirements(&fetch);
+        let reqs = get_logical_plan_requirements(&limit);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Singleton);
     }
 
     #[test]
     fn test_global_aggregate_requirements() {
-        // Empty groupings = global aggregate
-        let agg = Rel {
-            rel_type: Some(RelType::Aggregate(Box::new(AggregateRel {
-                input: Some(Box::new(create_read_rel())),
-                groupings: vec![],
-                ..Default::default()
-            }))),
+        // Empty group_keys = global aggregate
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(create_scan("test")),
+            group_by: sqlparser::ast::GroupByExpr::Expressions(vec![], vec![]),
+            aggr_exprs: vec![],
+            having: None,
+            group_keys: vec![], // Empty = global aggregate
         };
 
-        let reqs = get_requirements(&agg);
+        let reqs = get_logical_plan_requirements(&agg);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_grouped_aggregate_requirements() {
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(create_scan("test")),
+            group_by: sqlparser::ast::GroupByExpr::Expressions(vec![], vec![]),
+            aggr_exprs: vec![],
+            having: None,
+            group_keys: vec![
+                ColumnRef::unqualified("region"),
+                ColumnRef::unqualified("category"),
+            ],
+        };
+
+        let reqs = get_logical_plan_requirements(&agg);
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0] {
+            RequiredDistribution::HashPartitioned { column_refs } => {
+                assert_eq!(column_refs.len(), 2);
+                assert_eq!(column_refs[0].column, "region");
+                assert_eq!(column_refs[1].column, "category");
+            }
+            _ => panic!("Expected HashPartitioned requirement"),
+        }
+    }
+
+    #[test]
+    fn test_join_requirements() {
+        let join = LogicalPlan::Join {
+            left: Box::new(create_scan("orders")),
+            right: Box::new(create_scan("lineitem")),
+            join_op: sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![ColumnRef::qualified("orders", "id")],
+            right_keys: vec![ColumnRef::qualified("lineitem", "order_id")],
+        };
+
+        let reqs = get_logical_plan_requirements(&join);
+        assert_eq!(reqs.len(), 2);
+
+        match &reqs[0] {
+            RequiredDistribution::HashPartitioned { column_refs } => {
+                assert_eq!(column_refs.len(), 1);
+                assert_eq!(column_refs[0].column, "id");
+            }
+            _ => panic!("Expected HashPartitioned for left"),
+        }
+
+        match &reqs[1] {
+            RequiredDistribution::HashPartitioned { column_refs } => {
+                assert_eq!(column_refs.len(), 1);
+                assert_eq!(column_refs[0].column, "order_id");
+            }
+            _ => panic!("Expected HashPartitioned for right"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join_requirements() {
+        let cross_join = LogicalPlan::Join {
+            left: Box::new(create_scan("t1")),
+            right: Box::new(create_scan("t2")),
+            join_op: sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![], // Empty = cross join
+            right_keys: vec![],
+        };
+
+        let reqs = get_logical_plan_requirements(&cross_join);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0], RequiredDistribution::Any);
+        assert_eq!(reqs[1], RequiredDistribution::Any);
+    }
+
+    #[test]
+    fn test_set_op_requirements() {
+        let union = LogicalPlan::SetOp {
+            left: Box::new(create_scan("t1")),
+            right: Box::new(create_scan("t2")),
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+        };
+
+        let reqs = get_logical_plan_requirements(&union);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0], RequiredDistribution::Any);
+        assert_eq!(reqs[1], RequiredDistribution::Any);
+    }
+
+    #[test]
+    fn test_window_requirements() {
+        let window = LogicalPlan::Window {
+            input: Box::new(create_scan("test")),
+            window_exprs: vec![],
+        };
+
+        let reqs = get_logical_plan_requirements(&window);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_subquery_scan_requirements() {
+        let subquery = LogicalPlan::SubqueryScan {
+            input: Box::new(create_scan("test")),
+            alias: sqlparser::ast::TableAlias { name: Ident::new("sub"), columns: vec![], explicit: false },
+        };
+
+        let reqs = get_logical_plan_requirements(&subquery);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0], RequiredDistribution::Any);
     }
 
     #[test]
@@ -382,7 +387,7 @@ mod tests {
             worker: "w1".into(),
         };
         let hash_part = Distribution::HashPartitioned {
-            field_refs: vec![0],
+            column_refs: vec![ColumnRef::unqualified("id")],
             workers: vec!["w1".into(), "w2".into()],
         };
         let replicated = Distribution::Replicated {
@@ -399,7 +404,7 @@ mod tests {
 
         // HashPartitioned requirement
         let hash_req = RequiredDistribution::HashPartitioned {
-            field_refs: vec![0],
+            column_refs: vec![ColumnRef::unqualified("id")],
         };
         assert!(satisfies(&hash_part, &hash_req));
         assert!(satisfies(&replicated, &hash_req)); // Replicated satisfies any hash req
@@ -413,7 +418,7 @@ mod tests {
                 worker: "w1".into(),
             },
             Distribution::HashPartitioned {
-                field_refs: vec![0],
+                column_refs: vec![ColumnRef::unqualified("id")],
                 workers: vec!["w1".into()],
             },
         ];
@@ -421,14 +426,14 @@ mod tests {
         let reqs_satisfied = vec![
             RequiredDistribution::Any,
             RequiredDistribution::HashPartitioned {
-                field_refs: vec![0],
+                column_refs: vec![ColumnRef::unqualified("id")],
             },
         ];
         assert!(all_satisfied(&dists, &reqs_satisfied));
 
         let reqs_unsatisfied = vec![
             RequiredDistribution::HashPartitioned {
-                field_refs: vec![1],
+                column_refs: vec![ColumnRef::unqualified("other")],
             },
             RequiredDistribution::Singleton,
         ];

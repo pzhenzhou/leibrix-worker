@@ -5,16 +5,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use tokio::time::timeout;
 
-use worker_storage::ldp::executor::coordinator::LdpCoordinator;
-use worker_storage::ldp::executor::stage::LocalStageExecutor;
-use worker_storage::ldp::planner::metadata::InMemoryMetadata;
 use worker_storage::ldp::planner::policy::PlannerPolicy;
-use worker_storage::ldp::testing::cluster::{TestCluster, TestClusterConfig};
+use worker_storage::ldp::testing::cluster::TestCluster;
 use worker_storage::ldp::testing::data_loader::TestDataLoader;
 use worker_storage::ldp::testing::verifier::TestVerifier;
 use worker_storage::ldp::testing::macro_helpers::register_dataset_with_macros;
@@ -22,15 +16,15 @@ use worker_storage::ldp::testing::macro_helpers::register_dataset_with_macros;
 #[tokio::test]
 async fn test_gather_exchange_e2e() {
     // Create a test cluster with 2 workers
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load test data distributed across workers
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     data_loader.load_standard_test_data().await.unwrap();
 
     // Register epoch macros for the test datasets
@@ -59,16 +53,16 @@ async fn test_gather_exchange_e2e() {
 #[tokio::test]
 async fn test_broadcast_exchange_e2e() {
     // Create a test cluster with 2 workers
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
         .policy(PlannerPolicy::default().with_broadcast_enabled(true)) // Enable broadcast
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load orders data distributed across workers
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     data_loader.load_standard_test_data().await.unwrap();
     
     // Load small customers table on one worker (candidate for broadcast)
@@ -101,15 +95,15 @@ async fn test_broadcast_exchange_e2e() {
 #[tokio::test]
 async fn test_hash_partition_exchange_e2e() {
     // Create a test cluster with 3 workers
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(3)
         .tenant_id("test-tenant".to_string())
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load test data with multiple workers to enable hash partitioning
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     
     // Generate larger dataset to make hash partitioning beneficial
     let orders = TestDataLoader::generate_orders(3000);
@@ -141,15 +135,15 @@ async fn test_hash_partition_exchange_e2e() {
 #[tokio::test]
 async fn test_parallel_stage_execution_e2e() {
     // Create a test cluster with 3 workers
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(3)
         .tenant_id("test-tenant".to_string())
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load test data
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     let orders = TestDataLoader::generate_orders(2000);
     data_loader.load_orders_distributed(orders).await.unwrap();
 
@@ -198,15 +192,15 @@ async fn test_parallel_stage_execution_e2e() {
 #[tokio::test]
 async fn test_exchange_with_runtime_limits() {
     // Create a test cluster with limits enabled
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load a moderate amount of data
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     let orders = TestDataLoader::generate_orders(1000);
     data_loader.load_orders_distributed(orders).await.unwrap();
 
@@ -235,15 +229,15 @@ async fn test_exchange_with_runtime_limits() {
 #[tokio::test]
 async fn test_query_cancellation_during_exchange() {
     // Create a test cluster
-    let cluster = TestCluster::builder()
+    let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
         .build()
         .await
-        .expect("Failed to create test cluster");
+        .expect("Failed to create test cluster"));
 
     // Load test data
-    let data_loader = TestDataLoader::new(Arc::new(cluster.clone()));
+    let data_loader = TestDataLoader::new(cluster.clone());
     let orders = TestDataLoader::generate_orders(5000); // Larger dataset for longer running query
     data_loader.load_orders_distributed(orders).await.unwrap();
 

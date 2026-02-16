@@ -9,9 +9,10 @@
 //! - Converting between internal and wire formats
 
 use crate::ldp::types::{
-    Distribution, Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId,
-    StageInput, StageLimits, StageOutput, WorkerId,
+    Distribution, Exchange, ExchangeEdge, LdpPlan, Stage, StageId, StageInput, StageLimits,
+    StageOutput,
 };
+use crate::sql::logical_plan::ColumnRef;
 use prost::Message;
 use worker_proto::proto::ldp as proto;
 
@@ -41,6 +42,28 @@ pub enum ConversionError {
 pub type ConversionResult<T> = Result<T, ConversionError>;
 
 // ============================================================================
+// ColumnRef Conversion Helpers
+// ============================================================================
+
+fn column_refs_to_proto(refs: &[ColumnRef]) -> Vec<proto::ColumnRef> {
+    refs.iter()
+        .map(|cr| proto::ColumnRef {
+            table: cr.table.clone(),
+            column: cr.column.clone(),
+        })
+        .collect()
+}
+
+fn proto_to_column_refs(refs: &[proto::ColumnRef]) -> Vec<ColumnRef> {
+    refs.iter()
+        .map(|cr| ColumnRef {
+            table: cr.table.clone(),
+            column: cr.column.clone(),
+        })
+        .collect()
+}
+
+// ============================================================================
 // Distribution Conversion
 // ============================================================================
 
@@ -52,10 +75,10 @@ impl From<&Distribution> for proto::Distribution {
                     worker_id: worker.clone(),
                 })
             }
-            Distribution::HashPartitioned { field_refs, workers } => {
+            Distribution::HashPartitioned { column_refs, workers } => {
                 proto::distribution::DistributionType::HashPartitioned(
                     proto::HashPartitionedDistribution {
-                        field_refs: field_refs.clone(),
+                        column_refs: column_refs_to_proto(column_refs),
                         worker_ids: workers.clone(),
                     },
                 )
@@ -92,7 +115,7 @@ impl TryFrom<&proto::Distribution> for Distribution {
             }
             Some(proto::distribution::DistributionType::HashPartitioned(h)) => {
                 Ok(Distribution::HashPartitioned {
-                    field_refs: h.field_refs.clone(),
+                    column_refs: proto_to_column_refs(&h.column_refs),
                     workers: h.worker_ids.clone(),
                 })
             }
@@ -129,10 +152,10 @@ impl From<&Exchange> for proto::Exchange {
                 })
             }
             Exchange::HashPartition {
-                field_refs,
+                column_refs,
                 partitions,
             } => proto::exchange::ExchangeType::HashPartition(proto::HashPartitionExchange {
-                field_refs: field_refs.clone(),
+                column_refs: column_refs_to_proto(column_refs),
                 partitions: *partitions,
             }),
         };
@@ -155,7 +178,7 @@ impl TryFrom<&proto::Exchange> for Exchange {
                 targets: b.target_worker_ids.clone(),
             }),
             Some(proto::exchange::ExchangeType::HashPartition(h)) => Ok(Exchange::HashPartition {
-                field_refs: h.field_refs.clone(),
+                column_refs: proto_to_column_refs(&h.column_refs),
                 partitions: h.partitions,
             }),
             None => Err(ConversionError::MissingField("exchange_type")),
@@ -213,10 +236,10 @@ impl From<&StageOutput> for proto::StageOutput {
             StageOutput::Stream => {
                 proto::stage_output::OutputType::Stream(proto::StreamOutput {})
             }
-            StageOutput::Partitioned { partitions, field_refs } => {
+            StageOutput::Partitioned { partitions, column_refs } => {
                 proto::stage_output::OutputType::Partitioned(proto::PartitionedOutput {
                     partitions: *partitions,
-                    field_refs: field_refs.clone(),
+                    column_refs: column_refs_to_proto(column_refs),
                 })
             }
         };
@@ -236,7 +259,7 @@ impl TryFrom<&proto::StageOutput> for StageOutput {
             Some(proto::stage_output::OutputType::Partitioned(p)) => {
                 Ok(StageOutput::Partitioned {
                     partitions: p.partitions,
-                    field_refs: p.field_refs.clone(),
+                    column_refs: proto_to_column_refs(&p.column_refs),
                 })
             }
             None => Err(ConversionError::MissingField("output_type")),
@@ -281,7 +304,7 @@ impl From<&Stage> for proto::Stage {
             target_worker_ids: stage.target_workers.clone(),
             inputs: stage.inputs.iter().map(proto::StageInput::from).collect(),
             output: Some(proto::StageOutput::from(&stage.output)),
-            substrait_plan: stage.substrait_plan.clone(),
+            stage_sql: stage.stage_sql.clone(),
             limits: Some(proto::StageLimits::from(&stage.limits)),
         }
     }
@@ -315,7 +338,7 @@ impl TryFrom<&proto::Stage> for Stage {
             target_workers: proto.target_worker_ids.clone(),
             inputs: inputs?,
             output,
-            substrait_plan: proto.substrait_plan.clone(),
+            stage_sql: proto.stage_sql.clone(),
             limits,
         })
     }
@@ -419,7 +442,7 @@ pub fn serialize_submit_stage_request(
     tenant_id: &str,
     query_id: &str,
     stage_id: StageId,
-    substrait_plan: &[u8],
+    stage_sql: &str,
     limits: &StageLimits,
     exchange_inputs: &std::collections::HashMap<String, Vec<arrow::record_batch::RecordBatch>>,
 ) -> ConversionResult<Vec<u8>> {
@@ -472,7 +495,7 @@ pub fn serialize_submit_stage_request(
         tenant_id: tenant_id.to_string(),
         query_id: query_id.to_string(),
         stage_id,
-        substrait_plan: substrait_plan.to_vec(),
+        stage_sql: stage_sql.to_string(),
         limits: Some(proto::StageLimits::from(limits)),
         exchange_inputs: serialized_inputs,
     };
@@ -575,7 +598,10 @@ mod tests {
                 worker: "w1".to_string(),
             },
             Distribution::HashPartitioned {
-                field_refs: vec![0, 1],
+                column_refs: vec![
+                    ColumnRef::unqualified("col0"),
+                    ColumnRef::unqualified("col1"),
+                ],
                 workers: vec!["w1".to_string(), "w2".to_string()],
             },
             Distribution::EpochPartitioned {
@@ -603,7 +629,7 @@ mod tests {
                 targets: vec!["w1".to_string(), "w2".to_string()],
             },
             Exchange::HashPartition {
-                field_refs: vec![0],
+                column_refs: vec![ColumnRef::unqualified("col0")],
                 partitions: 16,
             },
         ];
@@ -638,7 +664,10 @@ mod tests {
             StageOutput::Stream,
             StageOutput::Partitioned {
                 partitions: 8,
-                field_refs: vec![0, 1],
+                column_refs: vec![
+                    ColumnRef::unqualified("col0"),
+                    ColumnRef::unqualified("col1"),
+                ],
             },
         ];
 
@@ -677,9 +706,9 @@ mod tests {
             ],
             output: StageOutput::Partitioned {
                 partitions: 4,
-                field_refs: vec![0],
+                column_refs: vec![ColumnRef::unqualified("col0")],
             },
-            substrait_plan: vec![1, 2, 3, 4],
+            stage_sql: "SELECT col0 FROM __exchange_0".to_string(),
             limits: StageLimits::default(),
         };
 
@@ -690,14 +719,14 @@ mod tests {
         assert_eq!(stage.target_workers, roundtrip.target_workers);
         assert_eq!(stage.inputs, roundtrip.inputs);
         assert_eq!(stage.output, roundtrip.output);
-        assert_eq!(stage.substrait_plan, roundtrip.substrait_plan);
+        assert_eq!(stage.stage_sql, roundtrip.stage_sql);
     }
 
     #[test]
     fn test_ldp_plan_roundtrip() {
         let mut plan = LdpPlan::new("query-123".to_string(), "coordinator".to_string());
-        plan.stages.push(Stage::new(0, vec![1, 2, 3]));
-        plan.stages.push(Stage::new(1, vec![4, 5, 6]));
+        plan.stages.push(Stage::new(0, "SELECT * FROM t1".to_string()));
+        plan.stages.push(Stage::new(1, "SELECT * FROM __exchange_0".to_string()));
         plan.edges.push(ExchangeEdge {
             exchange_id: 0,
             kind: Exchange::Gather {
@@ -741,7 +770,7 @@ mod tests {
             "tenant-1",
             "query-123",
             5,
-            &[1, 2, 3, 4],
+            "SELECT * FROM table1",
             &limits,
             &exchange_inputs,
         )
@@ -751,7 +780,7 @@ mod tests {
         assert_eq!(request.tenant_id, "tenant-1");
         assert_eq!(request.query_id, "query-123");
         assert_eq!(request.stage_id, 5);
-        assert_eq!(request.substrait_plan, vec![1, 2, 3, 4]);
+        assert_eq!(request.stage_sql, "SELECT * FROM table1");
         assert_eq!(request.exchange_inputs.len(), 1);
     }
 

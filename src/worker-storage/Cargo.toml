@@ -27,13 +27,13 @@ tokio-stream = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tonic = "0.13.1"
+dashmap = { workspace = true }
 
 # LDP proto types
 worker-proto = { path = "../worker-proto" }
 
-# Substrait for distributed query planning
-substrait = "0.57"
-prost = "0.13"  # Must match substrait's prost version
+# Protobuf encoding for LDP proto types
+prost = { workspace = true }
 
 # SQL dependencies
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono"] }

@@ -60,23 +60,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use duckdb::Connection;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{RwLock, mpsc};
+use tracing::{debug, info, warn};
 
-use crate::ldp::executor::stage::{StageExecutor, StageTickets};
+use crate::engine::duckdb::SharedDatabase;
+use crate::ldp::executor::stage::{StageExecutor, StageTickets, RecordBatchStream, StageExecutionError};
 use crate::ldp::executor::{
     DistributedExchangeRuntime, ExchangeRuntime, ExecutionError, FlightStageExecutor,
     LocalStageExecutor, WorkerConnectionPool,
 };
-use crate::ldp::executor::monitor::{StageExecutionMonitor, SharedStageExecutionMonitor};
+use crate::ldp::executor::monitor::SharedStageExecutionMonitor;
 use crate::ldp::planner::metadata::{InMemoryMetadata, Metadata};
 use crate::ldp::planner::pipeline::{plan_ldp, PipelineError};
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::storage_metadata::ClusterMetadata;
-use crate::ldp::{Exchange, LdpPlan, Stage, StageId, WorkerId};
+use crate::ldp::{Exchange, ExchangeId, LdpPlan, Stage, StageId, WorkerId};
 use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Schema};
 
 // ============================================================================
 // Coordinator Error
@@ -151,6 +153,12 @@ impl From<PipelineError> for CoordinatorError {
 impl From<ExecutionError> for CoordinatorError {
     fn from(err: ExecutionError) -> Self {
         CoordinatorError::ExecutionFailed(err)
+    }
+}
+
+impl From<StageExecutionError> for CoordinatorError {
+    fn from(err: StageExecutionError) -> Self {
+        CoordinatorError::ExecutionFailed(ExecutionError::ExchangeFailed(err.to_string()))
     }
 }
 
@@ -248,6 +256,12 @@ impl CoordinatorConfig {
         self.planner_policy = policy;
         self
     }
+
+    /// Set maximum stage retries.
+    pub fn with_retries(mut self, max_retries: u32) -> Self {
+        self.max_stage_retries = max_retries;
+        self
+    }
 }
 
 // ============================================================================
@@ -290,6 +304,8 @@ pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
     stage_status: RwLock<HashMap<(String, StageId), StageStatus>>,
     /// Active stage monitors for cancellation.
     stage_monitors: RwLock<HashMap<(String, StageId), SharedStageExecutionMonitor>>,
+    /// Worker-local DuckDB databases used by local execution in tests.
+    worker_databases: DashMap<WorkerId, Arc<SharedDatabase>>,
 }
 
 impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
@@ -306,6 +322,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             connection_pool: Arc::new(WorkerConnectionPool::new()),
             stage_status: RwLock::new(HashMap::new()),
             stage_monitors: RwLock::new(HashMap::new()),
+            worker_databases: DashMap::new(),
         })
     }
 
@@ -323,6 +340,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             connection_pool: Arc::new(WorkerConnectionPool::new()),
             stage_status: RwLock::new(HashMap::new()),
             stage_monitors: RwLock::new(HashMap::new()),
+            worker_databases: DashMap::new(),
         }
     }
 
@@ -375,11 +393,9 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         );
         
         conn.execute_batch(&macro_sql)
-            .map_err(|e| CoordinatorError::PlanningFailed(
-                PipelineError::SubstraitConversion(format!(
-                    "Failed to register schema for dataset '{}': {}", dataset_id, e
-                ))
-            ))?;
+            .map_err(|e| CoordinatorError::ConnectionFailed(format!(
+                "Failed to register schema for dataset '{}': {}", dataset_id, e
+            )))?;
         
         Ok(())
     }
@@ -389,6 +405,16 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         self.connection_pool
             .register_worker(worker_id.to_string(), endpoint.to_string())
             .await;
+    }
+
+    /// Register a worker's shared DuckDB database for local test execution.
+    pub fn register_worker_database(&self, worker_id: WorkerId, database: Arc<SharedDatabase>) {
+        self.worker_databases.insert(worker_id, database);
+    }
+
+    /// Get the metadata provider.
+    pub fn metadata(&self) -> &Arc<M> {
+        &self.metadata
     }
 
     /// Get the worker connection pool.
@@ -555,10 +581,8 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
     /// Plan a SQL query into an LDP plan.
     async fn plan_query(&self, sql: &str, query_id: &str) -> Result<LdpPlan, CoordinatorError> {
-        let conn = self.conn.read().await;
         let plan = plan_ldp(
             sql,
-            &*conn,
             self.metadata.as_ref(),
             &self.config.planner_policy,
             query_id,
@@ -581,6 +605,30 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         plan: &LdpPlan,
         query_id: &str,
     ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
+        // Check if streaming pipeline is enabled
+        if self.config.planner_policy.enable_streaming_pipeline {
+            // Try streaming execution with fallback to batch
+            match self.execute_pipelined(plan, query_id).await {
+                Ok((batches, workers)) => {
+                    info!(
+                        query_id = %query_id,
+                        stages = plan.stages.len(),
+                        "Streaming pipeline execution succeeded"
+                    );
+                    return Ok((batches, workers));
+                }
+                Err(e) => {
+                    warn!(
+                        query_id = %query_id,
+                        error = %e,
+                        "Streaming pipeline failed, falling back to batch execution"
+                    );
+                    // Fall through to batch execution
+                }
+            }
+        }
+
+        // Batch execution (original path)
         if self.config.distributed {
             self.execute_distributed(plan, query_id).await
         } else {
@@ -593,7 +641,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// This groups stages by dependency levels, allowing stages at the same level
     /// to be executed in parallel since they don't depend on each other.
     fn compute_execution_levels(&self, plan: &LdpPlan) -> Vec<Vec<StageId>> {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use std::collections::{HashMap, VecDeque};
         
         // Calculate in-degrees for each stage (number of dependencies)
         let mut in_degree: HashMap<StageId, usize> = HashMap::new();
@@ -621,19 +669,19 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         while !queue.is_empty() {
             let current_level_size = queue.len();
             let mut current_level = Vec::new();
-            
+
             // Process all stages at the current level
             for _ in 0..current_level_size {
                 if let Some(stage_id) = queue.pop_front() {
                     current_level.push(stage_id);
-                    
+
                     // Reduce in-degree of dependent stages
                     for edge in &plan.edges {
                         if edge.from_stage == stage_id {
                             let dependent_stage = edge.to_stage;
                             if let Some(degree) = in_degree.get_mut(&dependent_stage) {
                                 *degree -= 1;
-                                
+
                                 // If in-degree becomes 0, this stage can be processed in the next level
                                 if *degree == 0 {
                                     queue.push_back(dependent_stage);
@@ -643,7 +691,16 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                     }
                 }
             }
-            
+
+            // Defensive check: if we have stages remaining but couldn't process any this round,
+            // there's a cycle in the DAG (should never happen in valid plans)
+            if current_level.is_empty() && !queue.is_empty() {
+                panic!(
+                    "Cycle detected in stage dependencies. Remaining stages: {:?}",
+                    queue.iter().collect::<Vec<_>>()
+                );
+            }
+
             levels.push(current_level);
         }
         
@@ -651,12 +708,21 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     }
 
     /// Execute plan locally (single-node).
+    ///
+    /// For stages with exchange inputs, resolves inputs **per-worker** so that
+    /// each worker receives the correct subset of data (important for hash
+    /// partition exchanges where each worker must see different partitions).
     async fn execute_local(
         &self,
         plan: &LdpPlan,
         query_id: &str,
     ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
-        let executor = Arc::new(LocalStageExecutor::new());
+        let databases: HashMap<WorkerId, Arc<SharedDatabase>> = self
+            .worker_databases
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let executor = Arc::new(LocalStageExecutor::with_databases(databases));
         let exchange_runtime = Arc::new(ExchangeRuntime::new(executor.clone()));
 
         let mut stage_outputs: HashMap<StageId, StageTickets> = HashMap::new();
@@ -666,70 +732,118 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         let execution_levels = self.compute_execution_levels(plan);
 
         for level_stages in execution_levels {
-            // Execute all stages at this level in parallel
-            let mut level_results = Vec::new();
-            for &stage_id in &level_stages {
+            // Execute all stages at this level concurrently
+            let level_futures = level_stages.iter().map(|&stage_id| {
                 let executor = executor.clone();
                 let exchange_runtime = exchange_runtime.clone();
                 let plan_clone = plan.clone();
                 let query_id = query_id.to_string();
                 let stage_outputs_clone = stage_outputs.clone();
-                
-                let stage = plan_clone
-                    .get_stage(stage_id)
-                    .ok_or(ExecutionError::StageNotFound(stage_id))?
-                    .clone();
+                async move {
+                    let stage = plan_clone
+                        .get_stage(stage_id)
+                        .ok_or(ExecutionError::StageNotFound(stage_id))?
+                        .clone();
 
-                // Resolve inputs
-                let inputs = exchange_runtime
-                    .resolve_inputs(&plan_clone, stage_id, &stage_outputs_clone)
-                    .await
-                    .map_err(|e: crate::ldp::executor::exchange::ExchangeError| ExecutionError::ExchangeFailed(e.to_string()))?;
+                    // Check if stage has exchange inputs (requires per-worker resolution)
+                    let has_exchange_inputs = stage.inputs.iter().any(|input| {
+                        matches!(input, crate::ldp::StageInput::ExchangeInput { .. })
+                    });
 
-                // Execute stage with retry
-                let result = self
-                    .execute_stage_with_retry(&*executor, &stage, inputs, &query_id)
-                    .await;
-                
-                level_results.push((stage_id, result));
-            }
-            
-            // Process results and update stage_outputs
-            for (stage_id, stage_result) in level_results {
-                match stage_result {
-                    Ok(tickets) => {
-                        // Track workers
-                        for ticket in tickets.all() {
-                            if !workers_used.contains(&ticket.worker_id) {
-                                workers_used.push(ticket.worker_id.clone());
+                    let tickets = if has_exchange_inputs {
+                        // Per-worker input resolution: each worker gets its own
+                        // subset of exchange data (critical for hash partition).
+                        let mut all_tickets = StageTickets::new();
+                        for worker_id in &stage.target_workers {
+                            let worker_inputs = exchange_runtime
+                                .resolve_inputs_for_worker(
+                                    &plan_clone,
+                                    stage_id,
+                                    worker_id,
+                                    &stage_outputs_clone,
+                                )
+                                .await
+                                .map_err(|e: crate::ldp::executor::exchange::ExchangeError| {
+                                    ExecutionError::ExchangeFailed(e.to_string())
+                                })?;
+
+                            // Create a single-worker stage for this worker
+                            let worker_stage = Stage {
+                                stage_id: stage.stage_id,
+                                target_workers: vec![worker_id.clone()],
+                                inputs: stage.inputs.clone(),
+                                output: stage.output.clone(),
+                                stage_sql: stage.stage_sql.clone(),
+                                limits: stage.limits.clone(),
+                            };
+
+                            let worker_tickets = self
+                                .execute_stage_with_retry(
+                                    &*executor,
+                                    &worker_stage,
+                                    worker_inputs,
+                                    &query_id,
+                                )
+                                .await?;
+
+                            for t in worker_tickets.all() {
+                                all_tickets.add(t.clone());
                             }
                         }
+                        all_tickets
+                    } else {
+                        // No exchange inputs: resolve once (LocalCatalog only)
+                        let inputs = exchange_runtime
+                            .resolve_inputs(&plan_clone, stage_id, &stage_outputs_clone)
+                            .await
+                            .map_err(|e: crate::ldp::executor::exchange::ExchangeError| {
+                                ExecutionError::ExchangeFailed(e.to_string())
+                            })?;
 
-                        self.set_stage_status(
-                            &query_id,
-                            stage_id,
-                            StageStatus::Completed {
-                                tickets: tickets.clone(),
-                                duration: Duration::from_secs(0), // TODO: track actual duration
-                            },
-                        )
-                        .await;
+                        self.execute_stage_with_retry(&*executor, &stage, inputs, &query_id)
+                            .await?
+                    };
 
-                        stage_outputs.insert(stage_id, tickets);
-                    }
+                    Ok::<(StageId, StageTickets), CoordinatorError>((stage_id, tickets))
+                }
+            });
+
+            let level_results = futures_util::future::join_all(level_futures).await;
+
+            // Process results and update stage_outputs
+            for stage_result in level_results {
+                let (stage_id, tickets) = match stage_result {
+                    Ok(value) => value,
                     Err(e) => {
-                        self.set_stage_status(
-                            &query_id,
-                            stage_id,
-                            StageStatus::Failed {
-                                error: e.to_string(),
-                                retries: self.config.max_stage_retries,
-                            },
-                        )
-                        .await;
-                        return Err(e.into());
+                        // Stage failed - cancel all stages in this query to prevent orphaned tasks
+                        warn!(
+                            query_id = %query_id,
+                            error = %e,
+                            "Stage failed during parallel execution, cancelling query"
+                        );
+                        // Best effort cleanup - ignore cancellation errors
+                        let _ = self.cancel_query(query_id).await;
+                        return Err(e);
+                    }
+                };
+
+                for ticket in tickets.all() {
+                    if !workers_used.contains(&ticket.worker_id) {
+                        workers_used.push(ticket.worker_id.clone());
                     }
                 }
+
+                self.set_stage_status(
+                    query_id,
+                    stage_id,
+                    StageStatus::Completed {
+                        tickets: tickets.clone(),
+                        duration: Duration::from_secs(0),
+                    },
+                )
+                .await;
+
+                stage_outputs.insert(stage_id, tickets);
             }
         }
 
@@ -760,92 +874,133 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             self.config.tenant_id.clone(),
             self.connection_pool.clone(),
         ));
-        let exchange_runtime = DistributedExchangeRuntime::new(
+        let exchange_runtime = Arc::new(DistributedExchangeRuntime::new(
             self.config.tenant_id.clone(),
             self.connection_pool.clone(),
-        );
+        ));
 
         let mut stage_outputs: HashMap<StageId, StageTickets> = HashMap::new();
         let mut workers_used: Vec<WorkerId> = Vec::new();
 
-        // Execute stages in topological order
-        let execution_order = plan.topological_order();
+        // Execute stages in parallel levels
+        let execution_levels = self.compute_execution_levels(plan);
 
-        for stage_id in execution_order {
-            let stage = plan
-                .get_stage(stage_id)
-                .ok_or(ExecutionError::StageNotFound(stage_id))?;
+        for level_stages in execution_levels {
+            let level_futures = level_stages.iter().map(|&stage_id| {
+                let plan_clone = plan.clone();
+                let query_id = query_id.to_string();
+                let executor = executor.clone();
+                let exchange_runtime = exchange_runtime.clone();
+                let stage_outputs_clone = stage_outputs.clone();
 
-            self.set_stage_status(query_id, stage_id, StageStatus::Running {
-                started_at: Instant::now(),
-            })
-            .await;
+                async move {
+                    let stage = plan_clone
+                        .get_stage(stage_id)
+                        .ok_or(ExecutionError::StageNotFound(stage_id))?
+                        .clone();
 
-            info!(
-                query_id = %query_id,
-                stage_id = stage_id,
-                target_workers = ?stage.target_workers,
-                "Executing stage on workers"
-            );
-
-            // Submit to each target worker with worker-specific inputs
-            let mut all_tickets = StageTickets::new();
-
-            for target_worker in &stage.target_workers {
-                // Resolve inputs specifically for this worker
-                let inputs = self
-                    .resolve_distributed_inputs_for_worker(
-                        plan,
+                    self.set_stage_status(
+                        &query_id,
                         stage_id,
-                        target_worker,
-                        &stage_outputs,
-                        &exchange_runtime,
+                        StageStatus::Running {
+                            started_at: Instant::now(),
+                        },
                     )
-                    .await?;
+                    .await;
 
-                debug!(
-                    query_id = %query_id,
-                    stage_id = stage_id,
-                    worker = %target_worker,
-                    input_tables = inputs.len(),
-                    "Resolved inputs for worker"
-                );
+                    info!(
+                        query_id = %query_id,
+                        stage_id = stage_id,
+                        target_workers = ?stage.target_workers,
+                        "Executing stage on workers"
+                    );
 
-                // Create a modified stage with single worker
-                let worker_stage = Stage {
-                    stage_id: stage.stage_id,
-                    target_workers: vec![target_worker.clone()],
-                    inputs: stage.inputs.clone(),
-                    output: stage.output.clone(),
-                    substrait_plan: stage.substrait_plan.clone(),
-                    limits: stage.limits.clone(),
+                    let mut all_tickets = StageTickets::new();
+                    let mut stage_workers = Vec::new();
+
+                    for target_worker in &stage.target_workers {
+                        let inputs = self
+                            .resolve_distributed_inputs_for_worker(
+                                &plan_clone,
+                                stage_id,
+                                target_worker,
+                                &stage_outputs_clone,
+                                exchange_runtime.as_ref(),
+                            )
+                            .await?;
+
+                        debug!(
+                            query_id = %query_id,
+                            stage_id = stage_id,
+                            worker = %target_worker,
+                            input_tables = inputs.len(),
+                            "Resolved inputs for worker"
+                        );
+
+                        let worker_stage = Stage {
+                            stage_id: stage.stage_id,
+                            target_workers: vec![target_worker.clone()],
+                            inputs: stage.inputs.clone(),
+                            output: stage.output.clone(),
+                            stage_sql: stage.stage_sql.clone(),
+                            limits: stage.limits.clone(),
+                        };
+
+                        let tickets = self
+                            .execute_stage_with_retry(&*executor, &worker_stage, inputs, &query_id)
+                            .await?;
+
+                        for ticket in tickets.all() {
+                            all_tickets.add(ticket.clone());
+                            if !stage_workers.contains(&ticket.worker_id) {
+                                stage_workers.push(ticket.worker_id.clone());
+                            }
+                        }
+                    }
+
+                    Ok::<(StageId, StageTickets, Vec<WorkerId>), CoordinatorError>((
+                        stage_id,
+                        all_tickets,
+                        stage_workers,
+                    ))
+                }
+            });
+
+            let level_results = futures_util::future::join_all(level_futures).await;
+
+            for stage_result in level_results {
+                let (stage_id, all_tickets, stage_workers) = match stage_result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        // Stage failed - cancel query to prevent orphaned tasks
+                        warn!(
+                            query_id = %query_id,
+                            error = %e,
+                            "Distributed stage failed during parallel execution, cancelling query"
+                        );
+                        let _ = self.cancel_query(query_id).await;
+                        return Err(e);
+                    }
                 };
 
-                // Submit to this specific worker with its inputs
-                let tickets = self
-                    .execute_stage_with_retry(&*executor, &worker_stage, inputs, query_id)
-                    .await?;
-
-                // Collect tickets
-                for ticket in tickets.all() {
-                    all_tickets.add(ticket.clone());
-                    if !workers_used.contains(&ticket.worker_id) {
-                        workers_used.push(ticket.worker_id.clone());
+                for worker_id in stage_workers {
+                    if !workers_used.contains(&worker_id) {
+                        workers_used.push(worker_id);
                     }
                 }
+
+                self.set_stage_status(
+                    query_id,
+                    stage_id,
+                    StageStatus::Completed {
+                        tickets: all_tickets.clone(),
+                        duration: Duration::from_secs(0),
+                    },
+                )
+                .await;
+
+                stage_outputs.insert(stage_id, all_tickets);
             }
-
-            self.set_stage_status(
-                query_id,
-                stage_id,
-                StageStatus::Completed {
-                    tickets: all_tickets.clone(),
-                    duration: Duration::from_secs(0),
-                },
-            )
-            .await;
-
-            stage_outputs.insert(stage_id, all_tickets);
         }
 
         // Fetch final output via Flight
@@ -863,6 +1018,278 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         }
 
         Ok((final_batches, workers_used))
+    }
+
+    /// Execute plan with streaming pipeline for concurrent stage execution.
+    ///
+    /// Stages are spawned concurrently and connected via memory-bounded channels,
+    /// enabling data streaming between stages with automatic backpressure.
+    ///
+    /// Benefits:
+    /// - Reduced latency: Downstream stages start as soon as first batch arrives
+    /// - Lower memory: No need to buffer full stage outputs
+    /// - Better utilization: Workers process data concurrently
+    async fn execute_pipelined(
+        &self,
+        plan: &LdpPlan,
+        query_id: &str,
+    ) -> Result<(Vec<RecordBatch>, Vec<WorkerId>), CoordinatorError> {
+        info!(
+            query_id = %query_id,
+            stages = plan.stages.len(),
+            "Starting streaming pipelined execution"
+        );
+
+        // Only local execution is currently supported for streaming
+        if self.config.distributed {
+            return Err(CoordinatorError::InvalidConfig(
+                "Streaming pipeline not yet supported for distributed execution".to_string()
+            ));
+        }
+
+        let databases: HashMap<WorkerId, Arc<SharedDatabase>> = self
+            .worker_databases
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        let executor = Arc::new(LocalStageExecutor::with_databases(databases));
+        let mut workers_used: Vec<WorkerId> = Vec::new();
+
+        // Create inter-stage channels with memory-bounded buffers
+        let mut stage_channels: HashMap<ExchangeId, (
+            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
+            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
+        )> = HashMap::new();
+
+        for edge in &plan.edges {
+            let buffer_capacity = self.compute_buffer_capacity(
+                self.config.planner_policy.pipeline_buffer_bytes
+            );
+            let (tx, rx) = mpsc::channel(buffer_capacity);
+            stage_channels.insert(edge.exchange_id, (tx, rx));
+        }
+
+        // Create a special channel for the root stage output
+        let buffer_capacity = self.compute_buffer_capacity(
+            self.config.planner_policy.pipeline_buffer_bytes
+        );
+        let (root_tx, mut root_rx) = mpsc::channel(buffer_capacity);
+
+        // Track stage outputs for collecting workers used
+        let mut stage_workers: HashMap<StageId, Vec<WorkerId>> = HashMap::new();
+
+        // Spawn all stages concurrently
+        let mut stage_handles = Vec::new();
+
+        for stage in &plan.stages {
+            // Resolve input streams from upstream stages
+            let input_streams = self.resolve_input_streams(
+                stage,
+                &mut stage_channels,
+            )?;
+
+            // Clone executor for this stage
+            let executor_clone = executor.clone();
+            let stage_clone = stage.clone();
+            let query_id_clone = query_id.to_string();
+
+            // Get output channels for this stage
+            let mut output_txs = self.get_output_channels(
+                stage.stage_id,
+                &plan.edges,
+                &stage_channels,
+            )?;
+
+            // If this is the root stage, add the root output channel
+            if stage.stage_id == plan.root_stage {
+                output_txs.push(root_tx.clone());
+            }
+
+            // Track workers for this stage
+            let workers = stage.target_workers.clone();
+            stage_workers.insert(stage.stage_id, workers.clone());
+
+            // Spawn stage execution
+            let handle = tokio::spawn(async move {
+                debug!(
+                    query_id = %query_id_clone,
+                    stage_id = stage_clone.stage_id,
+                    "Starting streaming stage execution"
+                );
+
+                // Execute stage with streaming inputs
+                let mut output_stream = executor_clone
+                    .submit_stage_streaming(&query_id_clone, &stage_clone, input_streams)
+                    .await
+                    .map_err(|e| CoordinatorError::ExecutionFailed(
+                        ExecutionError::StageFailed(stage_clone.stage_id, e.to_string())
+                    ))?;
+
+                // Fan out to all downstream stages
+                let mut batch_count = 0;
+                while let Some(batch_result) = output_stream.next().await {
+                    let batch = batch_result.map_err(|e| CoordinatorError::ExecutionFailed(
+                        ExecutionError::StageFailed(stage_clone.stage_id, e.to_string())
+                    ))?;
+
+                    batch_count += 1;
+
+                    // Send to all downstream stages
+                    for tx in &output_txs {
+                        tx.send(Ok(batch.clone())).await
+                            .map_err(|_| CoordinatorError::ExecutionFailed(
+                                ExecutionError::StageFailed(
+                                    stage_clone.stage_id,
+                                    "Downstream stage closed".into()
+                                )
+                            ))?;
+                    }
+                }
+
+                debug!(
+                    query_id = %query_id_clone,
+                    stage_id = stage_clone.stage_id,
+                    batches_produced = batch_count,
+                    "Streaming stage execution completed"
+                );
+
+                Ok::<(), CoordinatorError>(())
+            });
+
+            stage_handles.push((stage.stage_id, handle));
+        }
+
+        // Collect results from root stage in the background while stages run
+        let query_id_clone = query_id.to_string();
+        let collection_handle = tokio::spawn(async move {
+            let mut results = Vec::new();
+            let mut batch_count = 0;
+
+            while let Some(batch_result) = root_rx.recv().await {
+                let batch = batch_result?;
+                batch_count += 1;
+                results.push(batch);
+            }
+
+            debug!(
+                query_id = %query_id_clone,
+                batches = batch_count,
+                "Collected results from root stage"
+            );
+
+            Ok::<Vec<RecordBatch>, CoordinatorError>(results)
+        });
+
+        // Wait for all stages to complete
+        for (stage_id, handle) in stage_handles {
+            handle.await
+                .map_err(|e| CoordinatorError::ExecutionFailed(
+                    ExecutionError::StageFailed(stage_id, e.to_string())
+                ))??;
+        }
+
+        // All stages completed - drop the root_tx to signal EOF to collection task
+        drop(root_tx);
+
+        // Wait for result collection to complete
+        let results = collection_handle.await
+            .map_err(|e| CoordinatorError::ExecutionFailed(
+                ExecutionError::ExchangeFailed(format!("Result collection failed: {}", e))
+            ))??;
+
+        // Collect workers used
+        for worker_list in stage_workers.values() {
+            for worker in worker_list {
+                if !workers_used.contains(worker) {
+                    workers_used.push(worker.clone());
+                }
+            }
+        }
+
+        info!(
+            query_id = %query_id,
+            stages = plan.stages.len(),
+            result_batches = results.len(),
+            "Streaming pipelined execution completed successfully"
+        );
+
+        Ok((results, workers_used))
+    }
+
+    /// Compute buffer capacity based on target buffer bytes.
+    fn compute_buffer_capacity(&self, target_buffer_bytes: u64) -> usize {
+        // Estimate batch size (default: 4MB per batch)
+        const DEFAULT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+        // Compute capacity in number of batches
+        let capacity = (target_buffer_bytes / DEFAULT_BATCH_BYTES)
+            .max(2)   // Minimum 2 batches
+            .min(64)  // Maximum 64 batches
+            as usize;
+
+        capacity
+    }
+
+    /// Resolve input streams for a stage from inter-stage channels.
+    fn resolve_input_streams(
+        &self,
+        stage: &Stage,
+        stage_channels: &mut HashMap<ExchangeId, (
+            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
+            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
+        )>,
+    ) -> Result<HashMap<String, RecordBatchStream>, CoordinatorError> {
+        let mut input_streams = HashMap::new();
+
+        for input in &stage.inputs {
+            match input {
+                crate::ldp::StageInput::ExchangeInput { exchange_id, table_name } => {
+                    // Remove the receiver from the map (it will be consumed by this stage)
+                    if let Some((_, rx)) = stage_channels.remove(exchange_id) {
+                        // Wrap receiver in RecordBatchStream
+                        // TODO: Get actual schema from plan metadata
+                        let schema = Arc::new(Schema::empty());
+                        let stream = RecordBatchStream::new(rx, schema);
+                        input_streams.insert(table_name.clone(), stream);
+                    } else {
+                        return Err(CoordinatorError::ExecutionFailed(
+                            ExecutionError::ExchangeFailed(
+                                format!("Exchange {} not found in stage channels", exchange_id)
+                            )
+                        ));
+                    }
+                }
+                crate::ldp::StageInput::LocalCatalog => {
+                    // Local catalog scans don't need input streams - they read from storage
+                }
+            }
+        }
+
+        Ok(input_streams)
+    }
+
+    /// Get output channel senders for a stage based on its downstream edges.
+    fn get_output_channels(
+        &self,
+        stage_id: StageId,
+        edges: &[crate::ldp::ExchangeEdge],
+        stage_channels: &HashMap<ExchangeId, (
+            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
+            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
+        )>,
+    ) -> Result<Vec<mpsc::Sender<Result<RecordBatch, StageExecutionError>>>, CoordinatorError> {
+        let mut output_txs = Vec::new();
+
+        // Find all edges where this stage is the source
+        for edge in edges {
+            if edge.from_stage == stage_id {
+                if let Some((tx, _)) = stage_channels.get(&edge.exchange_id) {
+                    output_txs.push(tx.clone());
+                }
+            }
+        }
+
+        Ok(output_txs)
     }
 
     /// Execute a stage with retry logic.
@@ -1013,7 +1440,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 }
                             }
                             Exchange::HashPartition {
-                                field_refs,
+                                column_refs,
                                 partitions,
                             } => {
                                 // Each worker receives only its assigned partitions
@@ -1030,7 +1457,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                         &plan.query_id,
                                         upstream_stage,
                                         &source_workers,
-                                        field_refs,
+                                        column_refs,
                                         *partitions,
                                         &edge.partition_to_worker,
                                         target_worker,

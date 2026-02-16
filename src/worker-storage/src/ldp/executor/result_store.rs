@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use tokio::sync::{RwLock, Mutex};
-use tracing::{debug, error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error};
 
 
 

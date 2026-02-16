@@ -13,7 +13,7 @@ use arrow_flight::{Action, Ticket};
 use futures_util::TryStreamExt;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::ldp::executor::stage::{
     StageExecutionError, StageExecutor, StageTicket, StageTickets,
@@ -21,7 +21,7 @@ use crate::ldp::executor::stage::{
 use crate::ldp::proto_convert::{
     deserialize_submit_stage_response, serialize_submit_stage_request,
 };
-use crate::ldp::{Stage, StageLimits, StageOutput, WorkerId};
+use crate::ldp::{Stage, StageOutput, WorkerId};
 
 // ============================================================================
 // Worker Connection Pool
@@ -210,7 +210,7 @@ impl FlightStageExecutor {
             &self.tenant_id,
             query_id,
             stage.stage_id,
-            &stage.substrait_plan,
+            &stage.stage_sql,
             &stage.limits,
             inputs,
         )
@@ -319,6 +319,19 @@ impl StageExecutor for FlightStageExecutor {
         }
 
         Ok(tickets)
+    }
+
+    async fn submit_stage_streaming(
+        &self,
+        _query_id: &str,
+        _stage: &Stage,
+        _input_streams: HashMap<String, crate::ldp::executor::stage::RecordBatchStream>,
+    ) -> Result<crate::ldp::executor::stage::RecordBatchStream, StageExecutionError> {
+        // TODO: Implement streaming execution for Flight-based distributed execution
+        // For now, return an error indicating it's not yet implemented
+        Err(StageExecutionError::ExecutionFailed(
+            "Streaming execution not yet implemented for Flight executor".into()
+        ))
     }
 
     async fn fetch_output(
@@ -495,7 +508,7 @@ impl LdpFlightClient {
         &mut self,
         query_id: &str,
         stage_id: u32,
-        substrait_plan: &[u8],
+        stage_sql: &str,
         limits: &crate::ldp::StageLimits,
     ) -> Result<Vec<u8>, StageExecutionError> {
         // Clone tenant_id before mutable borrow
@@ -506,7 +519,7 @@ impl LdpFlightClient {
             &tenant_id,
             query_id,
             stage_id,
-            substrait_plan,
+            stage_sql,
             limits,
             &HashMap::new(),
         )

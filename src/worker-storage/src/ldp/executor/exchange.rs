@@ -12,10 +12,12 @@
 use crate::ldp::executor::flight::{LdpFlightClient, WorkerConnectionPool};
 use crate::ldp::executor::metrics::ExchangeMetricsRegistry;
 use crate::ldp::executor::skew::SkewHandler;
-use crate::ldp::executor::stage::{StageExecutionError, StageExecutor, StageTicket, StageTickets};
-use crate::ldp::{Exchange, ExchangeEdge, ExchangeId, LdpPlan, StageLimits, StageId, WorkerId};
+use crate::ldp::executor::stage::{StageExecutor, StageTickets};
+use crate::ldp::{Exchange, ExchangeEdge, ExchangeId, LdpPlan, StageId, WorkerId};
+use crate::sql::logical_plan::ColumnRef;
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::concat_batches;
+use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -109,32 +111,32 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
                 self.execute_broadcast(upstream_tickets, targets).await
             }
             Exchange::HashPartition {
-                field_refs,
+                column_refs,
                 partitions,
             } => {
-                self.execute_hash_partition(
+                // Legacy path: return ALL partitions (used by resolve_inputs
+                // which doesn't distinguish per-worker).
+                // The per-worker path is execute_hash_partition_for_worker.
+                self.execute_hash_partition_all(
                     upstream_tickets,
-                    field_refs,
+                    column_refs,
                     *partitions,
-                    &edge.partition_to_worker,
-                    target_workers,
                 )
                 .await
             }
         }
     }
 
-    /// Execute a Gather exchange.
-    ///
-    /// Collects all upstream outputs and concatenates them.
-    async fn execute_gather(
+    /// Execute a hash partition exchange and return ALL partitions (not filtered
+    /// by target worker). This is the legacy fallback for `resolve_inputs`.
+    async fn execute_hash_partition_all(
         &self,
         upstream_tickets: &StageTickets,
-        _target: &WorkerId,
+        column_refs: &[ColumnRef],
+        num_partitions: u32,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         let mut all_batches = Vec::new();
 
-        // Fetch from all upstream tickets
         for ticket in upstream_tickets.all() {
             let batches = self.executor.fetch_output(ticket).await.map_err(|e| {
                 ExchangeError::FetchFailed(format!("Failed to fetch {}: {}", ticket.ticket_id, e))
@@ -142,8 +144,64 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
             all_batches.extend(batches);
         }
 
-        // Optionally concatenate all batches into fewer batches
-        // For now, just return all batches
+        if all_batches.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let schema = all_batches[0].schema();
+        let field_refs = resolve_column_indices(column_refs, &schema)?;
+
+        let mut result = Vec::new();
+        for batch in &all_batches {
+            let partitions = hash_partition_batch(batch, &field_refs, num_partitions)?;
+            for partition_batch in partitions {
+                if partition_batch.num_rows() > 0 {
+                    result.push(partition_batch);
+                }
+            }
+        }
+
+        if result.is_empty() {
+            return Ok(vec![RecordBatch::new_empty(schema)]);
+        }
+
+        Ok(result)
+    }
+
+    /// Execute a Gather exchange.
+    ///
+    /// Collects all upstream outputs and concatenates them.
+    /// If all upstream workers produced zero rows, returns an empty batch
+    /// with the correct schema so that downstream SQL can still reference columns.
+    async fn execute_gather(
+        &self,
+        upstream_tickets: &StageTickets,
+        _target: &WorkerId,
+    ) -> Result<Vec<RecordBatch>, ExchangeError> {
+        let mut all_batches = Vec::new();
+        let mut last_schema: Option<SchemaRef> = None;
+
+        // Fetch from all upstream tickets
+        for ticket in upstream_tickets.all() {
+            let batches = self.executor.fetch_output(ticket).await.map_err(|e| {
+                ExchangeError::FetchFailed(format!("Failed to fetch {}: {}", ticket.ticket_id, e))
+            })?;
+            for batch in &batches {
+                if batch.num_columns() > 0 {
+                    last_schema = Some(batch.schema());
+                }
+            }
+            all_batches.extend(batches);
+        }
+
+        // If all batches are empty but we have a schema, return one empty batch
+        // so the downstream stage gets the correct column definitions.
+        if all_batches.is_empty() {
+            if let Some(schema) = last_schema {
+                return Ok(vec![RecordBatch::new_empty(schema)]);
+            }
+        }
+
         Ok(all_batches)
     }
 
@@ -169,18 +227,17 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         Ok(all_batches)
     }
 
-    /// Execute a HashPartition exchange.
+    /// Execute a HashPartition exchange for a specific target worker.
     ///
-    /// Redistributes data by hash of key columns.
-    /// For local execution, we still partition the data but return only
-    /// the partitions for the "local" worker to simulate distributed behavior.
-    async fn execute_hash_partition(
+    /// Redistributes data by hash of key columns and returns only the
+    /// partitions assigned to `target_worker_id`.
+    async fn execute_hash_partition_for_worker(
         &self,
         upstream_tickets: &StageTickets,
-        field_refs: &[u32],
+        column_refs: &[ColumnRef],
         num_partitions: u32,
         partition_to_worker: &[WorkerId],
-        target_workers: &[WorkerId],
+        target_worker_id: &WorkerId,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         // Collect all upstream data
         let mut all_batches = Vec::new();
@@ -196,17 +253,16 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
             return Ok(vec![]);
         }
 
-        // For local execution, we assume we're the "first" target worker
-        // In a real distributed system, this would be determined by the actual worker ID
-        let default_worker = "local".to_string();
-        let local_worker = target_workers.first().unwrap_or(&default_worker);
+        // Resolve column references to indices using the first batch's schema
+        let schema = all_batches[0].schema();
+        let field_refs = resolve_column_indices(column_refs, &schema)?;
 
         // Find which partitions belong to this worker
         let local_partitions: Vec<u32> = partition_to_worker
             .iter()
             .enumerate()
             .filter_map(|(partition_id, worker_id)| {
-                if worker_id == local_worker {
+                if worker_id == target_worker_id {
                     Some(partition_id as u32)
                 } else {
                     None
@@ -215,15 +271,15 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
             .collect();
 
         if local_partitions.is_empty() {
-            // No partitions for this worker
-            return Ok(vec![]);
+            // No partitions for this worker — return empty batch with correct schema
+            return Ok(vec![RecordBatch::new_empty(schema)]);
         }
 
         // Hash partition all batches
         let mut partitioned_batches: Vec<Vec<RecordBatch>> = vec![vec![]; num_partitions as usize];
         
-        for batch in all_batches {
-            let partitions = hash_partition_batch(&batch, field_refs, num_partitions)?;
+        for batch in &all_batches {
+            let partitions = hash_partition_batch(batch, &field_refs, num_partitions)?;
             for (partition_id, partition_batch) in partitions.into_iter().enumerate() {
                 if partition_batch.num_rows() > 0 {
                     partitioned_batches[partition_id].push(partition_batch);
@@ -233,11 +289,100 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
 
         // Return only the partitions for this worker
         let mut result = Vec::new();
-        for partition_id in local_partitions {
-            result.extend(partitioned_batches[partition_id as usize].drain(..));
+        for partition_id in &local_partitions {
+            result.extend(partitioned_batches[*partition_id as usize].drain(..));
+        }
+
+        // If all local partitions were empty, return an empty batch with correct schema
+        if result.is_empty() {
+            return Ok(vec![RecordBatch::new_empty(schema)]);
         }
 
         Ok(result)
+    }
+
+    /// Resolve inputs for a specific target worker.
+    ///
+    /// Unlike `resolve_inputs` which resolves for the first target worker only,
+    /// this method takes a specific worker ID and returns the correct subset of
+    /// exchange data for that worker. This is essential for correct hash partition
+    /// exchanges where each worker must receive different data.
+    pub async fn resolve_inputs_for_worker(
+        &self,
+        plan: &LdpPlan,
+        stage_id: StageId,
+        target_worker_id: &WorkerId,
+        stage_outputs: &HashMap<StageId, StageTickets>,
+    ) -> Result<HashMap<String, Vec<RecordBatch>>, ExchangeError> {
+        let mut inputs = HashMap::new();
+
+        // Find the stage
+        let stage = plan
+            .get_stage(stage_id)
+            .ok_or(ExchangeError::StageNotFound(stage_id))?;
+
+        // Process each input
+        for input in &stage.inputs {
+            match input {
+                crate::ldp::StageInput::LocalCatalog => {
+                    continue;
+                }
+                crate::ldp::StageInput::ExchangeInput {
+                    exchange_id,
+                    table_name,
+                } => {
+                    let edge = plan
+                        .edges
+                        .iter()
+                        .find(|e| e.exchange_id == *exchange_id)
+                        .ok_or(ExchangeError::ExchangeNotFound(*exchange_id))?;
+
+                    let upstream_tickets = stage_outputs
+                        .get(&edge.from_stage)
+                        .ok_or(ExchangeError::UpstreamNotReady(edge.from_stage))?;
+
+                    let batches = self
+                        .execute_exchange_for_worker(edge, upstream_tickets, target_worker_id)
+                        .await?;
+
+                    inputs.insert(table_name.clone(), batches);
+                }
+            }
+        }
+
+        Ok(inputs)
+    }
+
+    /// Execute an exchange operation for a specific target worker.
+    async fn execute_exchange_for_worker(
+        &self,
+        edge: &ExchangeEdge,
+        upstream_tickets: &StageTickets,
+        target_worker_id: &WorkerId,
+    ) -> Result<Vec<RecordBatch>, ExchangeError> {
+        match &edge.kind {
+            Exchange::Gather { target } => {
+                // Gather: all data goes to the target
+                self.execute_gather(upstream_tickets, target).await
+            }
+            Exchange::Broadcast { .. } => {
+                // Broadcast: all targets get the same data
+                self.execute_broadcast(upstream_tickets, &[target_worker_id.clone()]).await
+            }
+            Exchange::HashPartition {
+                column_refs,
+                partitions,
+            } => {
+                self.execute_hash_partition_for_worker(
+                    upstream_tickets,
+                    column_refs,
+                    *partitions,
+                    &edge.partition_to_worker,
+                    target_worker_id,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -291,9 +436,9 @@ fn hash_partition_batch_traditional(
     field_refs: &[u32],
     num_partitions: u32,
 ) -> Result<Vec<RecordBatch>, ExchangeError> {
-    use arrow::array::{Array, UInt32Array};
-    use arrow::compute::{filter_record_batch, take};
-    use std::hash::{Hash, Hasher};
+    use arrow::array::UInt32Array;
+    use arrow::compute::filter_record_batch;
+    use std::hash::Hasher;
 
     if batch.num_rows() == 0 {
         return Ok(vec![batch.clone(); num_partitions as usize]);
@@ -341,6 +486,87 @@ fn hash_partition_batch_traditional(
     }
 
     Ok(results)
+}
+
+/// Resolve column references to field indices in an Arrow schema.
+///
+/// This function maps `ColumnRef` (table.column names) to column indices
+/// for use in hash partitioning and other operations.
+///
+/// At exchange boundaries, table qualifiers are stripped since the upstream
+/// table context is lost. The function tries multiple resolution strategies:
+/// 1. Exact match with table qualifier (if provided)
+/// 2. Match by column name only (unqualified)
+/// 3. Case-insensitive match
+///
+/// # Arguments
+/// * `column_refs` - Column references to resolve (e.g., `[{table: "sales", column: "region"}]`)
+/// * `schema` - Arrow schema of the data
+///
+/// # Returns
+/// * `Ok(Vec<u32>)` - Field indices corresponding to each column reference
+/// * `Err(ExchangeError::ColumnNotFound)` - One or more columns not found
+///
+/// # Example
+/// ```ignore
+/// let refs = vec![
+///     ColumnRef::qualified("sales", "region"),
+///     ColumnRef::unqualified("country"),
+/// ];
+/// let indices = resolve_column_indices(&refs, &batch.schema())?;
+/// // indices might be [2, 5] if those are the positions in the schema
+/// ```
+pub fn resolve_column_indices(
+    column_refs: &[ColumnRef],
+    schema: &SchemaRef,
+) -> Result<Vec<u32>, ExchangeError> {
+    let mut indices = Vec::with_capacity(column_refs.len());
+
+    for col_ref in column_refs {
+        let idx = find_column_index(col_ref, schema)?;
+        indices.push(idx);
+    }
+
+    Ok(indices)
+}
+
+/// Find the index of a single column in the schema.
+fn find_column_index(col_ref: &ColumnRef, schema: &SchemaRef) -> Result<u32, ExchangeError> {
+    let fields = schema.fields();
+
+    // Strategy 1: Try exact match with table qualifier (if present)
+    if let Some(table) = &col_ref.table {
+        // Look for fully qualified name: "table.column"
+        let qualified_name = format!("{}.{}", table, col_ref.column);
+        if let Some((idx, _)) = fields.find(&qualified_name) {
+            return Ok(idx as u32);
+        }
+    }
+
+    // Strategy 2: Match by column name only (most common at exchange boundaries)
+    if let Some((idx, _)) = fields.find(&col_ref.column) {
+        return Ok(idx as u32);
+    }
+
+    // Strategy 3: Case-insensitive match
+    let col_lower = col_ref.column.to_lowercase();
+    for (idx, field) in fields.iter().enumerate() {
+        if field.name().to_lowercase() == col_lower {
+            return Ok(idx as u32);
+        }
+    }
+
+    // Column not found - provide helpful error message
+    let available_columns: Vec<_> = fields.iter().map(|f| f.name().as_str()).collect();
+    Err(ExchangeError::ColumnNotFound(format!(
+        "Column '{}' not found in schema. Available columns: [{}]",
+        if let Some(table) = &col_ref.table {
+            format!("{}.{}", table, col_ref.column)
+        } else {
+            col_ref.column.clone()
+        },
+        available_columns.join(", ")
+    )))
 }
 
 /// Hash a single value from a column at the given row index.
@@ -535,6 +761,8 @@ pub enum ExchangeError {
     NoBatches,
     /// Failed to concatenate batches.
     ConcatFailed(String),
+    /// Column not found during resolution.
+    ColumnNotFound(String),
 }
 
 impl std::fmt::Display for ExchangeError {
@@ -547,6 +775,7 @@ impl std::fmt::Display for ExchangeError {
             ExchangeError::PartitionFailed(msg) => write!(f, "Partition failed: {}", msg),
             ExchangeError::NoBatches => write!(f, "No batches to process"),
             ExchangeError::ConcatFailed(msg) => write!(f, "Concat failed: {}", msg),
+            ExchangeError::ColumnNotFound(msg) => write!(f, "Column not found: {}", msg),
         }
     }
 }
@@ -878,7 +1107,7 @@ impl DistributedExchangeRuntime {
     /// * `query_id` - Query identifier
     /// * `stage_id` - Upstream stage that produced the data
     /// * `source_workers` - Workers that have data to redistribute
-    /// * `field_refs` - Column indices to hash for partitioning
+    /// * `column_refs` - Column references to hash for partitioning
     /// * `num_partitions` - Number of partitions to create
     /// * `partition_to_worker` - Mapping from partition ID to target worker
     /// * `local_worker` - The worker requesting its partition of data
@@ -890,7 +1119,7 @@ impl DistributedExchangeRuntime {
         query_id: &str,
         stage_id: u32,
         source_workers: &[WorkerId],
-        field_refs: &[u32],
+        column_refs: &[ColumnRef],
         num_partitions: u32,
         partition_to_worker: &[WorkerId],
         local_worker: &WorkerId,
@@ -913,6 +1142,10 @@ impl DistributedExchangeRuntime {
             return Ok(vec![]);
         }
 
+        // Resolve column references to indices using the first batch's schema
+        let schema = all_batches[0].schema();
+        let field_refs = resolve_column_indices(column_refs, &schema)?;
+
         // Find which partitions belong to this local worker
         let local_partitions: Vec<u32> = partition_to_worker
             .iter()
@@ -933,7 +1166,7 @@ impl DistributedExchangeRuntime {
         let mut local_batches = Vec::new();
 
         for batch in all_batches {
-            let partitioned = hash_partition_batch(&batch, field_refs, num_partitions)?;
+            let partitioned = hash_partition_batch(&batch, &field_refs, num_partitions)?;
 
             for p in &local_partitions {
                 let partition_batch = &partitioned[*p as usize];
@@ -981,14 +1214,14 @@ impl DistributedExchangeRuntime {
                     .await
             }
             Exchange::HashPartition {
-                field_refs,
+                column_refs,
                 partitions,
             } => {
                 self.execute_hash_partition(
                     query_id,
                     edge.from_stage,
                     source_workers,
-                    field_refs,
+                    column_refs,
                     *partitions,
                     &edge.partition_to_worker,
                     local_worker,
@@ -1138,5 +1371,113 @@ mod tests {
 
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 8);
+    }
+
+    // ========================================================================
+    // Column Resolution Tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_column_indices_unqualified() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, false),
+        ]));
+
+        let refs = vec![
+            ColumnRef::unqualified("id"),
+            ColumnRef::unqualified("name"),
+            ColumnRef::unqualified("age"),
+        ];
+
+        let indices = resolve_column_indices(&refs, &schema).unwrap();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_resolve_column_indices_qualified() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("orders.id", DataType::Int64, false),
+            Field::new("orders.customer_id", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+
+        let refs = vec![
+            ColumnRef::qualified("orders", "id"),
+            ColumnRef::qualified("orders", "customer_id"),
+        ];
+
+        let indices = resolve_column_indices(&refs, &schema).unwrap();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_resolve_column_indices_strips_qualifier() {
+        // Schema has unqualified column names (common at exchange boundaries)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        // But ColumnRef still has table qualifier from upstream
+        let refs = vec![
+            ColumnRef::qualified("sales", "id"),
+            ColumnRef::qualified("sales", "region"),
+        ];
+
+        // Should still resolve by column name alone
+        let indices = resolve_column_indices(&refs, &schema).unwrap();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_resolve_column_indices_case_insensitive() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("CustomerID", DataType::Int64, false),
+            Field::new("OrderDate", DataType::Utf8, false),
+        ]));
+
+        let refs = vec![
+            ColumnRef::unqualified("customerid"),  // lowercase
+            ColumnRef::unqualified("ORDERDATE"),   // uppercase
+        ];
+
+        let indices = resolve_column_indices(&refs, &schema).unwrap();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_resolve_column_indices_not_found() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let refs = vec![
+            ColumnRef::unqualified("id"),
+            ColumnRef::unqualified("nonexistent"),  // This doesn't exist
+        ];
+
+        let result = resolve_column_indices(&refs, &schema);
+        assert!(result.is_err());
+        
+        if let Err(ExchangeError::ColumnNotFound(msg)) = result {
+            assert!(msg.contains("nonexistent"));
+            assert!(msg.contains("Available columns"));
+        } else {
+            panic!("Expected ColumnNotFound error");
+        }
+    }
+
+    #[test]
+    fn test_resolve_column_indices_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let refs: Vec<crate::sql::logical_plan::ColumnRef> = vec![];
+        let indices = resolve_column_indices(&refs, &schema).unwrap();
+        assert_eq!(indices, Vec::<u32>::new());
     }
 }
