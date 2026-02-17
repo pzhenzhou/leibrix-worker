@@ -60,11 +60,15 @@
 //!   are not extracted; wide scan is used instead
 //! - Dynamic SQL (table names in variables) is not supported
 
+mod admission;
 mod analyzer;
 mod boolean_analyzer;
 mod discovery;
 mod error;
 mod interval;
+pub mod logical_plan;
+pub mod plan_builder;
+pub mod stage_sql_gen;
 mod parser;
 mod transformer;
 mod types;
@@ -76,13 +80,20 @@ pub(crate) fn extract_join_constraint(op: &JoinOperator) -> Option<&JoinConstrai
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
         | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
         | JoinOperator::RightOuter(c)
         | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
         | JoinOperator::LeftSemi(c)
         | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
         | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c) => Some(c),
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => Some(c),
+        JoinOperator::AsOf { constraint, .. } => Some(constraint),
         _ => None,
     }
 }
@@ -92,13 +103,20 @@ pub(crate) fn extract_join_constraint_mut(op: &mut JoinOperator) -> Option<&mut 
     match op {
         JoinOperator::Join(c)
         | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
         | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
         | JoinOperator::RightOuter(c)
         | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
         | JoinOperator::LeftSemi(c)
         | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
         | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c) => Some(c),
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => Some(c),
+        JoinOperator::AsOf { constraint, .. } => Some(constraint),
         _ => None,
     }
 }
@@ -120,7 +138,8 @@ pub(crate) fn extract_join_on_expr_mut(op: &mut JoinOperator) -> Option<&mut Exp
 }
 
 // Re-export public types
-pub use error::SqlTransformError;
+pub use admission::{AdmissionController, AdmissionError, AdmissionResult};
+pub use error::{SqlTransformError, TransformError};
 pub use interval::Interval;
 pub use transformer::SqlTransformer;
 pub use types::{
@@ -133,3 +152,8 @@ pub use parser::{parse_sql, to_sql};
 
 // Re-export new interval algebra for testing
 pub use boolean_analyzer::BooleanExprAnalyzer;
+
+// Re-export logical plan types for LDP pipeline
+pub use logical_plan::{ColumnRef, LogicalPlan, PlanBuildError, PlanContext};
+pub use plan_builder::{build_logical_plan, collect_referenced_columns, BuildResult};
+pub use stage_sql_gen::{generate_stage_sql, generate_stage_sql_no_context};

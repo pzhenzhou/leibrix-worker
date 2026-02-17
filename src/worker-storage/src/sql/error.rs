@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use super::admission::AdmissionError;
+
 /// Errors that can occur during SQL transformation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SqlTransformError {
@@ -34,4 +36,19 @@ impl From<sqlparser::parser::ParserError> for SqlTransformError {
     fn from(err: sqlparser::parser::ParserError) -> Self {
         SqlTransformError::ParseError(err.to_string())
     }
+}
+
+/// Combined error for admission and transformation.
+///
+/// Used by `admit_and_transform` to report either admission rejection
+/// or transformation failure.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TransformError {
+    /// Query rejected by admission control.
+    #[error("Admission rejected: {0}")]
+    Admission(#[from] AdmissionError),
+
+    /// Query failed during transformation.
+    #[error("Transform failed: {0}")]
+    Transform(#[from] SqlTransformError),
 }

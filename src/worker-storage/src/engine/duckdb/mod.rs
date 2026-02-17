@@ -4,7 +4,9 @@ use duckdb::{Connection, DuckdbConnectionManager};
 use r2d2::{Pool, PooledConnection};
 use anyhow::Context;
 
+pub mod arrow_utils;
 mod helper;
+pub mod pool;
 pub mod storage_engine_impl;
 mod memory_duckdb_runtime;
 pub mod query_engine_impl;

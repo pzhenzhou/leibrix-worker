@@ -1,0 +1,218 @@
+syntax = "proto3";
+
+package ldp;
+option optimize_for = SPEED;
+
+// ============================================================================
+// Distribution Types
+// ============================================================================
+
+// Describes how data is distributed across workers.
+message Distribution {
+  oneof distribution_type {
+    SingletonDistribution singleton = 1;
+    HashPartitionedDistribution hash_partitioned = 2;
+    EpochPartitionedDistribution epoch_partitioned = 3;
+    ReplicatedDistribution replicated = 4;
+  }
+}
+
+message SingletonDistribution {
+  string worker_id = 1;
+}
+
+message HashPartitionedDistribution {
+  // Column references for partition keys
+  repeated ColumnRef column_refs = 1;
+  repeated string worker_ids = 2;
+}
+
+message EpochPartitionedDistribution {
+  repeated string worker_ids = 1;
+}
+
+message ReplicatedDistribution {
+  repeated string worker_ids = 1;
+}
+
+// Reference to a column (qualified or unqualified).
+message ColumnRef {
+  // Optional table qualifier (e.g., "orders", "o")
+  optional string table = 1;
+  // Column name (e.g., "id", "order_id")
+  string column = 2;
+}
+
+// Defines how data moves between stages.
+message Exchange {
+  oneof exchange_type {
+    GatherExchange gather = 1;
+    BroadcastExchange broadcast = 2;
+    HashPartitionExchange hash_partition = 3;
+  }
+}
+
+message GatherExchange {
+  string target_worker_id = 1;
+}
+
+message BroadcastExchange {
+  repeated string target_worker_ids = 1;
+}
+
+message HashPartitionExchange {
+  repeated ColumnRef column_refs = 1;
+  uint32 partitions = 2;
+}
+
+
+// Describes how a stage receives its input data.
+message StageInput {
+  oneof input_type {
+    LocalCatalogInput local_catalog = 1;
+    ExchangeInput exchange = 2;
+  }
+}
+
+message LocalCatalogInput {
+  // Empty - indicates reading from local DuckDB catalog
+}
+
+message ExchangeInput {
+  uint32 exchange_id = 1;
+  // Table name to register the exchange data as (e.g., "__exchange_0")
+  string table_name = 2;
+}
+
+// Describes the output format of a stage.
+message StageOutput {
+  oneof output_type {
+    StreamOutput stream = 1;
+    PartitionedOutput partitioned = 2;
+  }
+}
+
+message StreamOutput {
+  // Empty - single Arrow stream
+}
+
+message PartitionedOutput {
+  uint32 partitions = 1;
+  repeated ColumnRef column_refs = 2;  // Hash keys for partitioning
+}
+
+// Resource limits for stage execution.
+message StageLimits {
+  uint64 max_bytes_output = 1;
+  uint64 max_rows_output = 2;
+  uint64 timeout_ms = 3;
+  uint64 memory_bytes = 4;
+}
+
+// A single execution stage in the LDP plan.
+message Stage {
+  uint32 stage_id = 1;
+  repeated string target_worker_ids = 2;
+  repeated StageInput inputs = 3;
+  StageOutput output = 4;
+  // SQL fragment for this stage (executable SELECT statement)
+  string stage_sql = 5;
+  StageLimits limits = 6;
+}
+
+// ============================================================================
+// Exchange Edge
+// ============================================================================
+
+// Represents data flow between two stages via an exchange.
+message ExchangeEdge {
+  uint32 exchange_id = 1;
+  Exchange kind = 2;
+  uint32 from_stage_id = 3;
+  uint32 to_stage_id = 4;
+  // For HashPartition: partition index -> worker ID
+  repeated string partition_to_worker = 5;
+}
+
+// ============================================================================
+// LDP Plan
+// ============================================================================
+
+// The complete Leibrix Distributed Plan for a query.
+message LdpPlan {
+  string query_id = 1;
+  string coordinator_worker_id = 2;
+  repeated Stage stages = 3;
+  repeated ExchangeEdge edges = 4;
+}
+
+// ============================================================================
+// Stage Execution Messages (for Arrow Flight DoAction)
+// ============================================================================
+
+// Request to execute a stage on a worker.
+message SubmitStageRequest {
+  string tenant_id = 1;
+  string query_id = 2;
+  uint32 stage_id = 3;
+  // The SQL fragment to execute (SELECT statement)
+  string stage_sql = 4;
+  StageLimits limits = 5;
+  // Exchange inputs to register before execution
+  repeated ExchangeInputRegistration exchange_inputs = 6;
+}
+
+// Information about an exchange input that needs to be registered.
+message ExchangeInputRegistration {
+  // Table name to register as (e.g., "__exchange_0")
+  string table_name = 1;
+  // Arrow IPC stream containing the batches
+  bytes arrow_ipc_stream = 2;
+}
+
+// Response from stage execution.
+message SubmitStageResponse {
+  bool success = 1;
+  string error_message = 2;
+  // Ticket to retrieve results via DoGet
+  bytes result_ticket = 3;
+  // Execution statistics
+  StageExecutionStats stats = 4;
+}
+
+// Execution statistics for a stage.
+message StageExecutionStats {
+  uint64 rows_produced = 1;
+  uint64 bytes_produced = 2;
+  uint64 execution_time_ms = 3;
+}
+
+// ============================================================================
+// Planner Policy
+// ============================================================================
+
+// Configuration for the LDP planner's cost-based decisions.
+message PlannerPolicy {
+  // Max bytes for broadcast exchange (default: 256MB)
+  uint64 broadcast_bytes_max = 1;
+  // Max bytes for shuffle exchange (default: 2GB)
+  uint64 shuffle_bytes_max = 2;
+  // Max rows to gather (default: 50M)
+  uint64 gather_rows_max = 3;
+  // Max bytes to gather (default: 5GB)
+  uint64 gather_bytes_max = 4;
+  // Default number of hash partitions (default: 16)
+  uint32 default_partitions = 5;
+}
+
+// ============================================================================
+// Epoch Statistics
+// ============================================================================
+
+// Statistics for an epoch, used for cost estimation.
+message EpochStats {
+  uint64 rows = 1;
+  uint64 bytes = 2;
+  // Column name -> estimated NDV (number of distinct values)
+  map<string, uint64> ndv = 3;
+}

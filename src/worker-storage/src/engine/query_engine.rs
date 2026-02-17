@@ -2,6 +2,7 @@ use crate::engine::storage_engine::TableMetadata;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use futures_core::Stream;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;

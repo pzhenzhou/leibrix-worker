@@ -6,6 +6,7 @@ mod adbc_client;
 pub mod backend;
 mod jdbc_client;
 
+#[allow(unused_imports)]
 pub use backend::StarRocksBackend;
 
 pub fn select_text(source: Arc<DataSource>, schema: Arc<Schema>) -> String {

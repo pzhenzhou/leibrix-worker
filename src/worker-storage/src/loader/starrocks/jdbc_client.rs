@@ -11,7 +11,7 @@ use arrow_array::{
     },
 };
 
-use futures_util::stream::{StreamExt, TryStreamExt};
+use futures_util::stream::StreamExt;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;

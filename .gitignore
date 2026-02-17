@@ -3,8 +3,10 @@
 Cargo.lock
 # profile
 *.heap
+.cursorrules
 # Visual Studio Code
 .vscode/
+.qoder/
 .devcontainer/
 #*.json
 *.log
