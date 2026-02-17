@@ -271,8 +271,8 @@ impl Metadata for ClusterMetadata {
         end_epoch: Option<&str>,
     ) -> Vec<(String, WorkerId)> {
         // Parse time range from epoch IDs if they're timestamps
-        let start_ms = start_epoch.and_then(|s| parse_epoch_timestamp(s));
-        let end_ms = end_epoch.and_then(|s| parse_epoch_timestamp(s));
+        let start_ms = start_epoch.and_then(parse_epoch_timestamp);
+        let end_ms = end_epoch.and_then(parse_epoch_timestamp);
 
         self.epochs_for(table_name, start_ms, end_ms)
     }

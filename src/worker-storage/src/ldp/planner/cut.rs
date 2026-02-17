@@ -121,10 +121,11 @@ fn extract_all_columns_from_expr(expr: &Expr, columns: &mut Vec<Expr>) {
             // Extract columns from function arguments
             if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
                 for arg in &arg_list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(arg_expr) = arg {
-                        if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg_expr {
-                            extract_all_columns_from_expr(e, columns);
-                        }
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        extract_all_columns_from_expr(e, columns);
                     }
                 }
             }
@@ -376,11 +377,11 @@ impl CutContext {
     }
 
     fn alloc_stage_id(&mut self) -> StageId {
-        self.next_stage_id.next()
+        self.next_stage_id.alloc_next()
     }
 
     fn alloc_exchange_id(&mut self) -> ExchangeId {
-        self.next_exchange_id.next()
+        self.next_exchange_id.alloc_next()
     }
 }
 
@@ -463,7 +464,7 @@ fn cut_recursive(
             // walk the annotated tree and modify the `.plan` of any descendant that
             // has `exchange_before` set.
             let mut child_to_process = child.clone();
-            if needs_order_by_columns && has_exchange_in_descendants(&child) {
+            if needs_order_by_columns && has_exchange_in_descendants(child) {
                 add_order_by_columns_to_exchange_children(
                     &mut child_to_process,
                     &sort_order_by_columns,
@@ -690,8 +691,8 @@ fn reconstruct_plan_with_children(
             left: _,
             right: _,
         } => SetOp {
-            op: op.clone(),
-            set_quantifier: set_quantifier.clone(),
+            op: *op,
+            set_quantifier: *set_quantifier,
             left: Box::new(new_children[0].clone()),
             right: Box::new(new_children[1].clone()),
         },
@@ -910,7 +911,7 @@ fn determine_stage_output(annotated: &AnnotatedPlan) -> StageOutput {
                     None
                 }
             })
-            .unwrap_or_else(|| policy_default_partitions());
+            .unwrap_or_else(policy_default_partitions);
 
         return StageOutput::Partitioned {
             partitions,
@@ -920,18 +921,16 @@ fn determine_stage_output(annotated: &AnnotatedPlan) -> StageOutput {
 
     // If this annotated node has an exchange_before, it will produce partitioned output
     // for hash partition exchanges
-    if let Some(exchange) = &annotated.exchange_before {
-        if let Exchange::HashPartition {
+    if let Some(Exchange::HashPartition {
             partitions,
             column_refs,
             ..
-        } = exchange
-        {
-            return StageOutput::Partitioned {
-                partitions: *partitions,
-                column_refs: column_refs.clone(),
-            };
-        }
+        }) = &annotated.exchange_before
+    {
+        return StageOutput::Partitioned {
+            partitions: *partitions,
+            column_refs: column_refs.clone(),
+        };
     }
 
     // Default to stream output

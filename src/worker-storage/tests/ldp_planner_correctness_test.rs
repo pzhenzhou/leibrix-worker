@@ -24,7 +24,7 @@ use worker_storage::sql::logical_plan::{ColumnRef, LogicalPlan};
 
 use sqlparser::ast::{
     Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
-    OrderByExpr, TableFactor,
+    TableFactor,
 };
 
 // ============================================================================
@@ -287,7 +287,7 @@ fn test_grouped_aggregate_inserts_hash_partition() {
 
 #[test]
 fn test_join_exact_small_stats_uses_broadcast() {
-    let mut metadata = multi_worker_metadata("orders");
+    let metadata = multi_worker_metadata("orders");
     metadata.register_table_stats(
         "customers",
         vec!["w1".into()],
@@ -325,7 +325,7 @@ fn test_join_exact_small_stats_uses_broadcast() {
 
 #[test]
 fn test_join_estimated_stats_uses_shuffle() {
-    let mut metadata = multi_worker_metadata("orders");
+    let metadata = multi_worker_metadata("orders");
     metadata.register_table_stats(
         "customers",
         vec!["w1".into()],
@@ -363,7 +363,7 @@ fn test_join_estimated_stats_uses_shuffle() {
 
 #[test]
 fn test_join_co_partitioned_no_exchange() {
-    let mut metadata = InMemoryMetadata::new();
+    let metadata = InMemoryMetadata::new();
     metadata.register_table_stats(
         "orders",
         vec!["w1".into(), "w2".into(), "w3".into()],
@@ -416,7 +416,7 @@ fn test_join_co_partitioned_no_exchange() {
 
 #[test]
 fn test_join_replicated_build_side_no_exchange() {
-    let mut metadata = InMemoryMetadata::new();
+    let metadata = InMemoryMetadata::new();
     metadata.register_table_stats(
         "orders",
         vec!["w1".into(), "w2".into()],

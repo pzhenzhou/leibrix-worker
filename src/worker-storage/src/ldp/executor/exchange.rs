@@ -101,7 +101,7 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         &self,
         edge: &ExchangeEdge,
         upstream_tickets: &StageTickets,
-        target_workers: &[WorkerId],
+        _target_workers: &[WorkerId],
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         match &edge.kind {
             Exchange::Gather { target } => {
@@ -290,7 +290,7 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         // Return only the partitions for this worker
         let mut result = Vec::new();
         for partition_id in &local_partitions {
-            result.extend(partitioned_batches[*partition_id as usize].drain(..));
+            result.append(&mut partitioned_batches[*partition_id as usize]);
         }
 
         // If all local partitions were empty, return an empty batch with correct schema
@@ -367,7 +367,11 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
             }
             Exchange::Broadcast { .. } => {
                 // Broadcast: all targets get the same data
-                self.execute_broadcast(upstream_tickets, &[target_worker_id.clone()]).await
+                self.execute_broadcast(
+                    upstream_tickets,
+                    std::slice::from_ref(target_worker_id),
+                )
+                .await
             }
             Exchange::HashPartition {
                 column_refs,
@@ -456,7 +460,7 @@ fn hash_partition_batch_traditional(
     let mut partition_ids = vec![0u32; num_rows];
 
     // Simple hash computation (production would use better hashing)
-    for row in 0..num_rows {
+    for (row, partition_id) in partition_ids.iter_mut().enumerate().take(num_rows) {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
         for &col_idx in field_refs {
@@ -465,7 +469,7 @@ fn hash_partition_batch_traditional(
             hash_column_value(col.as_ref(), row, &mut hasher)?;
         }
 
-        partition_ids[row] = (hasher.finish() % num_partitions as u64) as u32;
+        *partition_id = (hasher.finish() % num_partitions as u64) as u32;
     }
 
     // Create output batches by filtering
@@ -745,42 +749,33 @@ pub fn concat_record_batches(batches: &[RecordBatch]) -> Result<RecordBatch, Exc
 }
 
 /// Error during exchange execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ExchangeError {
     /// Stage not found.
+    #[error("Stage {0} not found")]
     StageNotFound(StageId),
     /// Exchange not found.
+    #[error("Exchange {0} not found")]
     ExchangeNotFound(ExchangeId),
     /// Upstream stage output not ready.
+    #[error("Upstream stage {0} not ready")]
     UpstreamNotReady(StageId),
     /// Failed to fetch data.
+    #[error("Fetch failed: {0}")]
     FetchFailed(String),
     /// Failed to partition data.
+    #[error("Partition failed: {0}")]
     PartitionFailed(String),
     /// No batches to process.
+    #[error("No batches to process")]
     NoBatches,
     /// Failed to concatenate batches.
+    #[error("Concat failed: {0}")]
     ConcatFailed(String),
     /// Column not found during resolution.
+    #[error("Column not found: {0}")]
     ColumnNotFound(String),
 }
-
-impl std::fmt::Display for ExchangeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExchangeError::StageNotFound(id) => write!(f, "Stage {} not found", id),
-            ExchangeError::ExchangeNotFound(id) => write!(f, "Exchange {} not found", id),
-            ExchangeError::UpstreamNotReady(id) => write!(f, "Upstream stage {} not ready", id),
-            ExchangeError::FetchFailed(msg) => write!(f, "Fetch failed: {}", msg),
-            ExchangeError::PartitionFailed(msg) => write!(f, "Partition failed: {}", msg),
-            ExchangeError::NoBatches => write!(f, "No batches to process"),
-            ExchangeError::ConcatFailed(msg) => write!(f, "Concat failed: {}", msg),
-            ExchangeError::ColumnNotFound(msg) => write!(f, "Column not found: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ExchangeError {}
 
 // ============================================================================
 // Distributed Exchange Runtime

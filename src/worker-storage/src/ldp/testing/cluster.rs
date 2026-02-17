@@ -232,7 +232,7 @@ impl TestCluster {
                 result.push(batch);
             }
             Ok(result)
-        }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error + Send + Sync>)??;
+        }).await.map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)??;
         
         Ok(batches)
     }
@@ -292,6 +292,12 @@ impl TestCluster {
 /// Builder for TestCluster.
 pub struct TestClusterBuilder {
     config: TestClusterConfig,
+}
+
+impl Default for TestClusterBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestClusterBuilder {

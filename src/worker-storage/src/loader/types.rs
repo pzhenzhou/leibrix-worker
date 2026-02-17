@@ -72,21 +72,21 @@ pub enum PartitionSpec {
     /// - In the future, the DataLoader may:
     ///   - For each shard `s` in `shards`, create an internal task whose
     ///     effective predicate is something like:
-    ///         `(<base_filter>) AND (<s>)`
+    ///     `(<base_filter>) AND (<s>)`
     ///   - Run multiple shards in parallel, while treating them as one
     ///     logical epoch load at the API level.
     ///
     /// Example (conceptual):
     /// - Base `filter`:
-    ///       "dt >= '2025-01-01' AND dt < '2025-02-01'"
+    ///   "dt >= '2025-01-01' AND dt < '2025-02-01'"
     /// - `shards`:
-    ///       [
-    ///         "bucket_id BETWEEN 0 AND 127",
-    ///         "bucket_id BETWEEN 128 AND 255",
-    ///       ]
+    ///   [
+    ///   "bucket_id BETWEEN 0 AND 127",
+    ///   "bucket_id BETWEEN 128 AND 255",
+    ///   ]
     /// - Future DataLoader behavior:
-    ///       Task 1: WHERE <filter> AND bucket_id BETWEEN 0 AND 127
-    ///       Task 2: WHERE <filter> AND bucket_id BETWEEN 128 AND 255
+    ///   Task 1: WHERE <filter> AND bucket_id BETWEEN 0 AND 127
+    ///   Task 2: WHERE <filter> AND bucket_id BETWEEN 128 AND 255
     Shards(Vec<String>),
 }
 

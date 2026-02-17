@@ -244,7 +244,7 @@ async fn load_batch_to_engine(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create table if not exists
     let create_sql = generate_create_table_from_batch(table_name, batch);
-    engine.execute_query(&create_sql, None, None).await?;
+    let _ = engine.execute_query(&create_sql, None, None).await?;
 
     // Insert data row by row (simple approach for test)
     for row_idx in 0..batch.num_rows() {
@@ -258,7 +258,7 @@ async fn load_batch_to_engine(
 
         let values_str = values.join(", ");
         let sql = format!("INSERT INTO {} VALUES ({})", table_name, values_str);
-        engine.execute_query(&sql, None, None).await?;
+        let _ = engine.execute_query(&sql, None, None).await?;
     }
 
     Ok(())

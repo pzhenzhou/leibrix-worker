@@ -18,19 +18,19 @@ use crate::sql::logical_plan::ColumnRef;
 // ============================================================================
 
 /// Unique identifier for a query execution.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct QueryId(pub String);
 
 /// Identifier for a stage within an LDP plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct StageId(pub u32);
 
 /// Identifier for an exchange between stages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct ExchangeId(pub u32);
 
 /// Identifier for a worker node.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct WorkerId(pub String);
 
 /// Identifier for an epoch (time-partitioned data segment).
@@ -92,24 +92,6 @@ impl AsRef<str> for WorkerId {
     fn as_ref(&self) -> &str { &self.0 }
 }
 
-// --- Default: StageId(0) and ExchangeId(0) for common initialization ---
-
-impl Default for StageId {
-    fn default() -> Self { StageId(0) }
-}
-
-impl Default for ExchangeId {
-    fn default() -> Self { ExchangeId(0) }
-}
-
-impl Default for WorkerId {
-    fn default() -> Self { WorkerId(String::new()) }
-}
-
-impl Default for QueryId {
-    fn default() -> Self { QueryId(String::new()) }
-}
-
 // --- PartialEq<str>: allows `worker_id == "w1"` without wrapping ---
 
 impl PartialEq<str> for WorkerId {
@@ -132,7 +114,7 @@ impl PartialEq<&str> for QueryId {
 
 impl StageId {
     /// Increment and return the next stage ID. Used by stage allocation.
-    pub fn next(&mut self) -> StageId {
+    pub fn alloc_next(&mut self) -> StageId {
         let current = *self;
         self.0 += 1;
         current
@@ -141,7 +123,7 @@ impl StageId {
 
 impl ExchangeId {
     /// Increment and return the next exchange ID.
-    pub fn next(&mut self) -> ExchangeId {
+    pub fn alloc_next(&mut self) -> ExchangeId {
         let current = *self;
         self.0 += 1;
         current
@@ -399,19 +381,14 @@ pub enum StageInput {
 }
 
 /// Describes the output format of a stage.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum StageOutput {
     /// Single Arrow stream output.
+    #[default]
     Stream,
 
     /// Multiple partitioned streams (for HashPartition exchange).
     Partitioned { partitions: u32, column_refs: Vec<ColumnRef> },
-}
-
-impl Default for StageOutput {
-    fn default() -> Self {
-        StageOutput::Stream
-    }
 }
 
 /// Resource limits for stage execution.

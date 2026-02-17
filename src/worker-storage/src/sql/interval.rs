@@ -22,26 +22,25 @@ pub enum DateBound {
 
 impl PartialOrd for DateBound {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // First compare by variant (Literal < Parameter for deterministic ordering)
-        match (self, other) {
-            (DateBound::Literal(a), DateBound::Literal(b)) => {
-                // Compare literals by parsed date value
-                match (NaiveDate::parse_from_str(a, "%Y-%m-%d"), NaiveDate::parse_from_str(b, "%Y-%m-%d")) {
-                    (Ok(date_a), Ok(date_b)) => Some(date_a.cmp(&date_b)),
-                    _ => Some(a.cmp(b)), // Fallback to string comparison for invalid dates
-                }
-            }
-            (DateBound::Literal(_), DateBound::Parameter(_)) => Some(Ordering::Less),
-            (DateBound::Parameter(_), DateBound::Literal(_)) => Some(Ordering::Greater),
-            (DateBound::Parameter(a), DateBound::Parameter(b)) => Some(a.cmp(b)),
-        }
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for DateBound {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Safe to unwrap because partial_cmp always returns Some
-        self.partial_cmp(other).unwrap()
+        // First compare by variant (Literal < Parameter for deterministic ordering)
+        match (self, other) {
+            (DateBound::Literal(a), DateBound::Literal(b)) => {
+                // Compare literals by parsed date value
+                match (NaiveDate::parse_from_str(a, "%Y-%m-%d"), NaiveDate::parse_from_str(b, "%Y-%m-%d")) {
+                    (Ok(date_a), Ok(date_b)) => date_a.cmp(&date_b),
+                    _ => a.cmp(b), // Fallback to string comparison for invalid dates
+                }
+            }
+            (DateBound::Literal(_), DateBound::Parameter(_)) => Ordering::Less,
+            (DateBound::Parameter(_), DateBound::Literal(_)) => Ordering::Greater,
+            (DateBound::Parameter(a), DateBound::Parameter(b)) => a.cmp(b),
+        }
     }
 }
 

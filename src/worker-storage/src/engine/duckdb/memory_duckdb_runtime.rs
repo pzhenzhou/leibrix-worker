@@ -375,7 +375,7 @@ fn on_memory_stats(state: &mut EngineState) -> MemoryStats {
         .map(|(key, (view, metadata))| {
             let parts: Vec<&str> = key.split("__").collect();
             EpochMemoryStats {
-                dataset_id: parts.get(0).unwrap_or(&"").to_string(),
+                dataset_id: parts.first().unwrap_or(&"").to_string(),
                 epoch_id: view.epoch_id.clone(),
                 rows_count: metadata.total_rows,
                 approx_bytes: metadata.total_bytes,

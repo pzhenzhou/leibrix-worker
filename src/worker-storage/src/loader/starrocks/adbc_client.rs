@@ -230,7 +230,7 @@ impl StarRocksAdbcClient {
                         }
                     })? {
                         // Send batch to channel
-                        if let Err(_) = tx.send(Ok(batch_result)).await {
+                        if tx.send(Ok(batch_result)).await.is_err() {
                             // Channel closed, receiver dropped
                             return Err(SourceError::Internal {
                                 catalog: catalog.clone(),

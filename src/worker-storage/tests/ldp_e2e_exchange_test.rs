@@ -258,7 +258,7 @@ async fn test_query_cancellation_during_exchange() {
     assert!(!result.is_empty(), "Query should return results");
     
     // Verify the coordinator has cancellation capability
-    let query_id = "test_query_for_cancellation"; // This would be auto-generated in real usage
+    let _query_id = "test_query_for_cancellation"; // This would be auto-generated in real usage
     // Note: We can't actually test cancellation here without a more complex async setup
     // But the infrastructure is in place as verified by our implementation
 }

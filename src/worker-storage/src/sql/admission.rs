@@ -467,7 +467,9 @@ impl AdmissionController {
 
             // Compound identifier like table.column
             Expr::CompoundIdentifier(parts) => {
-                parts.last().map_or(false, |p| p.value.eq_ignore_ascii_case(column_name))
+                parts
+                    .last()
+                    .is_some_and(|p| p.value.eq_ignore_ascii_case(column_name))
             }
 
             // Binary comparison (col = x, col > x, etc.)

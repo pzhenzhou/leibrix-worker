@@ -195,7 +195,7 @@ fn arrow_type_to_duckdb_type(arrow_type: &DataType) -> &'static str {
             // Note: This creates a string that needs to be handled carefully
             // For simplicity, we'll use VARCHAR as fallback if needed
             // In production, you'd want to format this properly
-            return "DECIMAL(38, 10)"; // Default precision/scale
+            "DECIMAL(38, 10)" // Default precision/scale
         }
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "JSON",
         DataType::Struct(_) => "STRUCT",

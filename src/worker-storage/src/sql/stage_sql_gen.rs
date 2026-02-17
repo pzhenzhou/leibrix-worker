@@ -111,7 +111,7 @@ fn dequalify_expr(expr: &Expr) -> Expr {
             right: Box::new(dequalify_expr(right)),
         },
         Expr::UnaryOp { op, expr } => Expr::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(dequalify_expr(expr)),
         },
         Expr::Nested(inner) => Expr::Nested(Box::new(dequalify_expr(inner))),
@@ -307,7 +307,7 @@ fn generate_from_fragment(plan: &LogicalPlan, sql: &mut String) {
 
         // SubqueryScan in FROM position.
         LogicalPlan::SubqueryScan { input, alias } => {
-            sql.push_str("(");
+            sql.push('(');
             generate_sql(input, sql);
             // TableAlias::Display already includes "AS " when explicit.
             write!(sql, ") {}", alias).unwrap();
@@ -315,7 +315,7 @@ fn generate_from_fragment(plan: &LogicalPlan, sql: &mut String) {
 
         // Other nodes in FROM position: wrap as subquery.
         other => {
-            sql.push_str("(");
+            sql.push('(');
             generate_sql(other, sql);
             sql.push_str(") AS __subquery");
         }

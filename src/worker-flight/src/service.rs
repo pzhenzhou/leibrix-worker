@@ -406,7 +406,6 @@ where
         body: &[u8],
     ) -> Result<Response<BoxStream<'static, Result<arrow_flight::Result, Status>>>, Status> {
         use serde_json;
-        use std::collections::HashMap;
 
         // Parse the cancel query request
         #[derive(serde::Deserialize)]

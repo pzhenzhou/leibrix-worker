@@ -90,7 +90,7 @@ impl TpchDataGenerator {
 
         // Generate data in batches of 1024 rows
         const BATCH_SIZE: usize = 1024;
-        let num_batches = (row_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let num_batches = row_count.div_ceil(BATCH_SIZE);
 
         let mut batches = Vec::with_capacity(num_batches);
         let mut remaining = row_count;
@@ -250,7 +250,7 @@ impl TpchDataGenerator {
         }
 
         const BATCH_SIZE: usize = 1024;
-        let num_batches = (row_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let num_batches = row_count.div_ceil(BATCH_SIZE);
 
         let mut batches = Vec::with_capacity(num_batches);
         let mut remaining = row_count;
@@ -337,7 +337,7 @@ impl TpchDataGenerator {
         }
 
         const BATCH_SIZE: usize = 1024;
-        let num_batches = (row_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let num_batches = row_count.div_ceil(BATCH_SIZE);
 
         let mut batches = Vec::with_capacity(num_batches);
         let mut remaining = row_count;
@@ -421,7 +421,7 @@ impl TpchDataGenerator {
         }
 
         const BATCH_SIZE: usize = 1024;
-        let num_batches = (row_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let num_batches = row_count.div_ceil(BATCH_SIZE);
 
         let mut batches = Vec::with_capacity(num_batches);
         let mut remaining = row_count;
@@ -523,7 +523,7 @@ impl TpchDataGenerator {
         }
 
         const BATCH_SIZE: usize = 1024;
-        let num_batches = (row_count + BATCH_SIZE - 1) / BATCH_SIZE;
+        let num_batches = row_count.div_ceil(BATCH_SIZE);
 
         let mut batches = Vec::with_capacity(num_batches);
         let mut remaining = row_count;
