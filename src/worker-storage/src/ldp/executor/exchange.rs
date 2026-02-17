@@ -856,8 +856,8 @@ impl DistributedExchangeRuntime {
     pub async fn register_ticket(
         &self,
         query_id: &str,
-        stage_id: u32,
-        worker_id: &str,
+        stage_id: StageId,
+        worker_id: &WorkerId,
         ticket_bytes: Vec<u8>,
     ) {
         let key = format!("{}:{}:{}", query_id, stage_id, worker_id);
@@ -868,8 +868,8 @@ impl DistributedExchangeRuntime {
     pub async fn get_ticket(
         &self,
         query_id: &str,
-        stage_id: u32,
-        worker_id: &str,
+        stage_id: StageId,
+        worker_id: &WorkerId,
     ) -> Option<Vec<u8>> {
         let key = format!("{}:{}:{}", query_id, stage_id, worker_id);
         self.remote_tickets.read().await.get(&key).cloned()
@@ -895,13 +895,13 @@ impl DistributedExchangeRuntime {
     pub async fn execute_gather(
         &self,
         query_id: &str,
-        stage_id: u32,
+        stage_id: StageId,
         source_workers: &[WorkerId],
         _target_worker: &WorkerId,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             sources = ?source_workers,
             "Executing distributed gather"
         );
@@ -925,7 +925,7 @@ impl DistributedExchangeRuntime {
                 Ok(batches) => {
                     debug!(
                         query_id = query_id,
-                        stage_id = stage_id,
+                        stage_id = %stage_id,
                         worker_id = %worker_id,
                         batches = batches.len(),
                         "Gathered data from worker"
@@ -935,7 +935,7 @@ impl DistributedExchangeRuntime {
                 Err(e) => {
                     error!(
                         query_id = query_id,
-                        stage_id = stage_id,
+                        stage_id = %stage_id,
                         worker_id = %worker_id,
                         error = %e,
                         "Failed to gather from worker"
@@ -952,7 +952,7 @@ impl DistributedExchangeRuntime {
         if !errors.is_empty() {
             warn!(
                 query_id = query_id,
-                stage_id = stage_id,
+                stage_id = %stage_id,
                 "Partial gather success: {} batches collected, {} workers failed",
                 all_batches.len(),
                 errors.len()
@@ -961,7 +961,7 @@ impl DistributedExchangeRuntime {
 
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             total_batches = all_batches.len(),
             total_rows = all_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
             "Gather complete"
@@ -974,8 +974,8 @@ impl DistributedExchangeRuntime {
     async fn fetch_from_worker(
         &self,
         query_id: &str,
-        stage_id: u32,
-        worker_id: &str,
+        stage_id: StageId,
+        worker_id: &WorkerId,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         // Get the ticket for this worker's output
         let ticket_bytes = self
@@ -1001,7 +1001,7 @@ impl DistributedExchangeRuntime {
     }
 
     /// Get the endpoint URL for a worker.
-    async fn get_worker_endpoint(&self, worker_id: &str) -> Result<String, ExchangeError> {
+    async fn get_worker_endpoint(&self, worker_id: &WorkerId) -> Result<String, ExchangeError> {
         self.connection_pool
             .get_endpoint(worker_id)
             .await
@@ -1031,13 +1031,13 @@ impl DistributedExchangeRuntime {
     pub async fn execute_broadcast(
         &self,
         query_id: &str,
-        stage_id: u32,
+        stage_id: StageId,
         source_worker: &WorkerId,
         target_workers: &[WorkerId],
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             source = %source_worker,
             targets = ?target_workers,
             "Executing distributed broadcast"
@@ -1045,7 +1045,7 @@ impl DistributedExchangeRuntime {
 
         // Create broadcast metrics
         let mut metrics = crate::ldp::executor::metrics::BroadcastExchangeMetrics::new(
-            stage_id, // Using stage_id as exchange_id for this context
+            ExchangeId(stage_id.0), // Using stage_id as exchange_id for this context
             query_id.to_string(),
             source_worker.clone(),
             target_workers.to_vec(),
@@ -1067,7 +1067,7 @@ impl DistributedExchangeRuntime {
 
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             rows = total_rows,
             bytes = total_bytes,
             targets = target_workers.len(),
@@ -1117,7 +1117,7 @@ impl DistributedExchangeRuntime {
     pub async fn execute_hash_partition(
         &self,
         query_id: &str,
-        stage_id: u32,
+        stage_id: StageId,
         source_workers: &[WorkerId],
         column_refs: &[ColumnRef],
         num_partitions: u32,
@@ -1126,7 +1126,7 @@ impl DistributedExchangeRuntime {
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             sources = ?source_workers,
             partitions = num_partitions,
             local_worker = %local_worker,
@@ -1156,7 +1156,7 @@ impl DistributedExchangeRuntime {
 
         debug!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             local_worker = %local_worker,
             local_partitions = ?local_partitions,
             "Filtering to local partitions"
@@ -1178,7 +1178,7 @@ impl DistributedExchangeRuntime {
 
         info!(
             query_id = query_id,
-            stage_id = stage_id,
+            stage_id = %stage_id,
             local_worker = %local_worker,
             batches = local_batches.len(),
             rows = local_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
@@ -1303,15 +1303,15 @@ mod tests {
 
         // Register a ticket
         runtime
-            .register_ticket("q1", 1, "worker-1", vec![1, 2, 3])
+            .register_ticket("q1", StageId(1), &WorkerId::from("worker-1"), vec![1, 2, 3])
             .await;
 
         // Retrieve it
-        let ticket = runtime.get_ticket("q1", 1, "worker-1").await;
+        let ticket = runtime.get_ticket("q1", StageId(1), &WorkerId::from("worker-1")).await;
         assert_eq!(ticket, Some(vec![1, 2, 3]));
 
         // Non-existent ticket returns None
-        let missing = runtime.get_ticket("q1", 2, "worker-1").await;
+        let missing = runtime.get_ticket("q1", StageId(2), &WorkerId::from("worker-1")).await;
         assert_eq!(missing, None);
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
     async fn test_distributed_exchange_get_worker_endpoint_missing() {
         let runtime = DistributedExchangeRuntime::with_new_pool("test-tenant".to_string());
 
-        let result = runtime.get_worker_endpoint("unknown-worker").await;
+        let result = runtime.get_worker_endpoint(&WorkerId::from("unknown-worker")).await;
         assert!(result.is_err());
     }
 
@@ -1330,17 +1330,17 @@ mod tests {
         // Register a worker
         runtime
             .connection_pool()
-            .register_worker("w1".to_string(), "http://localhost:50051".to_string())
+            .register_worker(WorkerId::from("w1"), "http://localhost:50051".to_string())
             .await;
 
-        let result = runtime.get_worker_endpoint("w1").await;
+        let result = runtime.get_worker_endpoint(&WorkerId::from("w1")).await;
         assert_eq!(result.unwrap(), "http://localhost:50051");
     }
 
     #[test]
     fn test_remote_ticket_creation() {
         let ticket = RemoteTicket {
-            worker_id: "worker-1".to_string(),
+            worker_id: WorkerId::from("worker-1"),
             ticket_bytes: vec![1, 2, 3, 4],
         };
 

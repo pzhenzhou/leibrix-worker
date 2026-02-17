@@ -17,7 +17,7 @@
 use crate::ldp::planner::annotate::AnnotatedPlan;
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::types::{
-    Exchange, LdpPlan, QueryId, Stage, StageId, StageInput, StageOutput,
+    Exchange, ExchangeId, LdpPlan, QueryId, Stage, StageId, StageInput, StageOutput,
 };
 use crate::sql::logical_plan::{LogicalPlan, PlanContext};
 use crate::sql::stage_sql_gen::{generate_stage_sql, generate_stage_sql_no_context};
@@ -342,7 +342,7 @@ pub fn cut_into_stages(
         coordinator: policy.coordinator.clone(),
         stages: Vec::new(),
         edges: Vec::new(),
-        root_stage: 0, // Updated below after cutting
+        root_stage: StageId(0), // Updated below after cutting
     };
 
     // Recursively cut the plan – the returned stage_id is the root
@@ -358,7 +358,7 @@ pub fn cut_into_stages(
 /// Context for tracking stage/exchange IDs during cutting.
 struct CutContext {
     next_stage_id: StageId,
-    next_exchange_id: u32,
+    next_exchange_id: ExchangeId,
     /// Map stage IDs to their distribution annotations for worker assignment
     stage_annotations: HashMap<StageId, crate::ldp::DistributionAnnotation>,
     /// CTE definitions from the original query, prepended to each stage SQL.
@@ -368,23 +368,19 @@ struct CutContext {
 impl CutContext {
     fn new(plan_context: PlanContext) -> Self {
         Self {
-            next_stage_id: 0,
-            next_exchange_id: 0,
+            next_stage_id: StageId(0),
+            next_exchange_id: ExchangeId(0),
             stage_annotations: HashMap::new(),
             plan_context,
         }
     }
 
     fn alloc_stage_id(&mut self) -> StageId {
-        let id = self.next_stage_id;
-        self.next_stage_id += 1;
-        id
+        self.next_stage_id.next()
     }
 
-    fn alloc_exchange_id(&mut self) -> u32 {
-        let id = self.next_exchange_id;
-        self.next_exchange_id += 1;
-        id
+    fn alloc_exchange_id(&mut self) -> ExchangeId {
+        self.next_exchange_id.next()
     }
 }
 
@@ -409,7 +405,7 @@ fn cut_recursive(
 
     // Collect pending edges: (exchange_id, from_stage, Exchange kind).
     // Edges are deferred because we don't know this node's stage_id yet.
-    let mut pending_edges: Vec<(u32, StageId, Exchange)> = Vec::new();
+    let mut pending_edges: Vec<(ExchangeId, StageId, Exchange)> = Vec::new();
 
     // If this node is a Sort (or Limit wrapping Sort), extract ORDER BY columns to add to exchange outputs
     let sort_order_by_columns = match &annotated.plan {
@@ -448,7 +444,7 @@ fn cut_recursive(
             // Replace child with ExchangeRead placeholder
             let exchange_table_name = format!("__exchange_{}", exchange_id);
             let exchange_read = LogicalPlan::ExchangeRead {
-                exchange_id,
+                exchange_id: exchange_id.0,
                 alias: exchange_table_name,
             };
             if let Some(relation_alias) = derive_relation_alias(&child.plan) {
@@ -514,7 +510,7 @@ fn cut_recursive(
     let mut inputs: Vec<StageInput> = collect_exchange_reads(&stage_plan)
         .into_iter()
         .map(|(exchange_id, alias)| StageInput::ExchangeInput {
-            exchange_id,
+            exchange_id: ExchangeId(exchange_id),
             table_name: alias,
         })
         .collect();
@@ -577,13 +573,13 @@ fn extract_stage_plan(
     plan: &mut LdpPlan,
     ctx: &mut CutContext,
     policy: &PlannerPolicy,
-) -> (LogicalPlan, Vec<(u32, StageId, Exchange)>) {
+) -> (LogicalPlan, Vec<(ExchangeId, StageId, Exchange)>) {
     if annotated.children.is_empty() {
         return (annotated.plan.clone(), vec![]);
     }
 
     let mut new_children = Vec::new();
-    let mut pending_edges: Vec<(u32, StageId, Exchange)> = Vec::new();
+    let mut pending_edges: Vec<(ExchangeId, StageId, Exchange)> = Vec::new();
 
     for child in &annotated.children {
         if child.exchange_before.is_some() {
@@ -597,7 +593,7 @@ fn extract_stage_plan(
             // Create placeholder
             let exchange_table_name = format!("__exchange_{}", exchange_id);
             let placeholder = LogicalPlan::ExchangeRead {
-                exchange_id,
+                exchange_id: exchange_id.0,
                 alias: exchange_table_name,
             };
             if let Some(relation_alias) = derive_relation_alias(&child.plan) {
@@ -1055,7 +1051,7 @@ mod tests {
                 index_hints: vec![],
             },
         };
-        let workers: Vec<WorkerId> = workers.into_iter().map(String::from).collect();
+        let workers: Vec<WorkerId> = workers.into_iter().map(WorkerId::from).collect();
         let dist = if workers.len() == 1 {
             Distribution::Singleton {
                 worker: workers[0].clone(),
@@ -1095,7 +1091,7 @@ mod tests {
         // Should be 1 stage, no exchanges
         assert_eq!(plan.stages.len(), 1);
         assert!(plan.edges.is_empty());
-        assert_eq!(plan.stages[0].stage_id, 0);
+        assert_eq!(plan.stages[0].stage_id, StageId(0));
     }
 
     #[test]
@@ -1143,8 +1139,8 @@ mod tests {
         // Verify exchange edge
         let edge = &plan.edges[0];
         assert!(matches!(edge.kind, Exchange::Gather { .. }));
-        assert_eq!(edge.from_stage, 0);
-        assert_eq!(edge.to_stage, 1);
+        assert_eq!(edge.from_stage, StageId(0));
+        assert_eq!(edge.to_stage, StageId(1));
     }
 
     #[test]
@@ -1197,7 +1193,7 @@ mod tests {
         let stage = plan
             .stages
             .iter()
-            .find(|s| s.stage_id == 0)
+            .find(|s| s.stage_id == StageId(0))
             .expect("stage 0 exists");
 
         match &stage.output {

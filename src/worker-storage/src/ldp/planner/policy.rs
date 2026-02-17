@@ -7,6 +7,8 @@
 //! - **Stats enable optimization**: Broadcast only when stats are exact and small
 //! - **Conservative admission**: Apply safety factor when stats are uncertain
 
+use crate::ldp::types::WorkerId;
+
 /// Configuration for the LDP planner's cost-based decisions.
 ///
 /// These bounds determine when the planner will:
@@ -47,7 +49,7 @@ pub struct PlannerPolicy {
     /// Coordinator worker ID (where gather operations send data).
     /// This is typically set at runtime based on which worker
     /// receives the query.
-    pub coordinator: String,
+    pub coordinator: WorkerId,
 
     /// Safety factor applied to estimated stats when confidence is low.
     /// Used for conservative admission control.
@@ -74,7 +76,7 @@ impl Default for PlannerPolicy {
             gather_rows_max: 50_000_000,                  // 50M rows
             gather_bytes_max: 5 * 1024 * 1024 * 1024,     // 5GB
             default_partitions: 16,
-            coordinator: String::new(),
+            coordinator: WorkerId::default(),
             safety_factor: 2.0,                           // 2x for uncertain stats
             enable_streaming_pipeline: false,
             pipeline_buffer_bytes: 32 * 1024 * 1024,
@@ -91,7 +93,7 @@ impl PlannerPolicy {
             gather_rows_max: u64::MAX,
             gather_bytes_max: u64::MAX,
             default_partitions: 16,
-            coordinator: String::new(),
+            coordinator: WorkerId::default(),
             safety_factor: 3.0,
             enable_streaming_pipeline: false,
             pipeline_buffer_bytes: 32 * 1024 * 1024,
@@ -106,7 +108,7 @@ impl PlannerPolicy {
             gather_rows_max: 100_000_000,
             gather_bytes_max: 10 * 1024 * 1024 * 1024,
             default_partitions: 32,
-            coordinator: String::new(),
+            coordinator: WorkerId::default(),
             safety_factor: 1.1,
             enable_streaming_pipeline: false,
             pipeline_buffer_bytes: 32 * 1024 * 1024,
@@ -121,7 +123,7 @@ impl PlannerPolicy {
     }
 
     /// Create a new policy with the given coordinator.
-    pub fn with_coordinator(coordinator: impl Into<String>) -> Self {
+    pub fn with_coordinator(coordinator: impl Into<WorkerId>) -> Self {
         Self {
             coordinator: coordinator.into(),
             ..Default::default()
@@ -274,7 +276,7 @@ mod tests {
             .broadcast_bytes_max(128 * 1024 * 1024)
             .default_partitions(32);
 
-        assert_eq!(policy.coordinator, "worker-1");
+        assert_eq!(policy.coordinator, WorkerId::from("worker-1"));
         assert_eq!(policy.broadcast_bytes_max, 128 * 1024 * 1024);
         assert_eq!(policy.default_partitions, 32);
     }

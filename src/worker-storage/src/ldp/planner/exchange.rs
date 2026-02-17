@@ -161,7 +161,7 @@ fn determine_gather_exchange(
 fn determine_hash_or_broadcast_exchange(
     actual: &Distribution,
     annotation: &DistributionAnnotation,
-    required_column_refs: &[crate::sql::logical_plan::ColumnRef],
+    required_column_refs: &[ColumnRef],
     policy: &PlannerPolicy,
     is_join_context: bool,
     target_workers: &[WorkerId],
@@ -285,46 +285,65 @@ pub fn determine_join_exchanges(
     let right_exact = right_annotation.stats_source.is_exact();
 
     // === Broadcast Strategy Selection ===
-    // Prefer broadcasting the smaller side if it meets criteria
+    // Prefer broadcasting the smaller side if it meets criteria.
+    //
+    // Broadcast targets: when broadcasting side X to side Y, the targets are
+    // Y's workers (where the non-broadcast data resides). If `target_workers`
+    // was provided externally we honour it; otherwise fall back to the other
+    // side's worker set so the annotator sees the correct post-exchange
+    // distribution and stage cutting assigns the right target workers.
     let left_can_broadcast = policy.can_optimize_to_broadcast(left_bytes, left_exact, true);
     let right_can_broadcast = policy.can_optimize_to_broadcast(right_bytes, right_exact, true);
+
+    // Resolve broadcast targets: prefer explicit target_workers; fall back to
+    // the other join side's workers.
+    let broadcast_targets_for_left = if !target_workers.is_empty() {
+        target_workers.to_vec()
+    } else {
+        right_actual.workers().to_vec()
+    };
+    let broadcast_targets_for_right = if !target_workers.is_empty() {
+        target_workers.to_vec()
+    } else {
+        left_actual.workers().to_vec()
+    };
 
     match (left_can_broadcast, right_can_broadcast) {
         // Both can broadcast - pick smaller
         (true, true) => {
             if left_bytes <= right_bytes {
-                // Broadcast left
+                // Broadcast left to right's workers
                 let left_exchange = if left_satisfied {
                     ExchangeDecision::None
                 } else {
-                    ExchangeDecision::Insert(Exchange::broadcast(target_workers.to_vec()))
+                    ExchangeDecision::Insert(Exchange::broadcast(broadcast_targets_for_left))
                 };
                 (left_exchange, ExchangeDecision::None)
             } else {
-                // Broadcast right
+                // Broadcast right to left's workers
                 let right_exchange = if right_satisfied {
                     ExchangeDecision::None
                 } else {
-                    ExchangeDecision::Insert(Exchange::broadcast(target_workers.to_vec()))
+                    ExchangeDecision::Insert(Exchange::broadcast(broadcast_targets_for_right))
                 };
                 (ExchangeDecision::None, right_exchange)
             }
         }
-        // Only left can broadcast
+        // Only left can broadcast → broadcast left to right's workers
         (true, false) => {
             let left_exchange = if left_satisfied {
                 ExchangeDecision::None
             } else {
-                ExchangeDecision::Insert(Exchange::broadcast(target_workers.to_vec()))
+                ExchangeDecision::Insert(Exchange::broadcast(broadcast_targets_for_left))
             };
             (left_exchange, ExchangeDecision::None)
         }
-        // Only right can broadcast
+        // Only right can broadcast → broadcast right to left's workers
         (false, true) => {
             let right_exchange = if right_satisfied {
                 ExchangeDecision::None
             } else {
-                ExchangeDecision::Insert(Exchange::broadcast(target_workers.to_vec()))
+                ExchangeDecision::Insert(Exchange::broadcast(broadcast_targets_for_right))
             };
             (ExchangeDecision::None, right_exchange)
         }

@@ -383,3 +383,31 @@ The `worker-cp` crate contains minimal control plane communication logic. The `t
 - Arrow Flight: `src/worker-flight/README.md`
 - E2E test status: `docs/E2E_TEST_FINAL_STATUS.md`
 - Control plane repository: git@github.com:pzhenzhou/leibrix.git
+
+## Design Principles
+
+All code changes in this repository follow principles from **Effective Rust** and **A Philosophy of Software Design**. These are not aspirational — they are enforced during review.
+
+### Type Safety (Effective Rust)
+
+- **Newtype Pattern**: Wrap primitive types (`String`, `u32`) in newtypes (`WorkerId`, `StageId`, `ExchangeId`, `QueryId`) so the compiler prevents mixing semantically different values. A `WorkerId` can never be passed where a `QueryId` is expected.
+- **Express Invariants in Types**: Encode domain constraints into types rather than runtime checks. Prefer struct variants (e.g., `WorkerUnavailable { worker_id: WorkerId, detail: String }`) over stringly-typed errors.
+- **Implement Standard Traits Thoughtfully**: Newtypes derive `Clone`, `Copy` (for integer-based), `Hash`, `Eq`, `PartialEq`, `Debug`, and implement `Display`, `From`, `AsRef`. Make them ergonomic without leaking inner representation.
+- **Respect Sealed Trait Boundaries**: When a trait is sealed (e.g., `tracing::Value`), use the idiomatic workaround (`%` Display formatting) instead of fighting the type system.
+- **Flexible API Boundaries**: Use `impl AsRef<str>` / `impl Into<T>` for functions that should accept both the newtype and its underlying type.
+
+### Complexity Management (A Philosophy of Software Design)
+
+- **Deep Modules, Shallow Interfaces**: Each abstraction presents a minimal public interface while hiding internal representation. Callers don't need to know whether `StageId` wraps `u32` or `u64`.
+- **Define Errors Out of Existence**: Structure error types so misuse is impossible. Don't allow an error message where an ID belongs.
+- **Information Hiding / Leakage Prevention**: Confine conversion logic (e.g., proto ↔ domain) to a single file. No other module needs to know the inner representation for serialization.
+- **Strategic vs. Tactical Programming**: Fix the design, not the symptoms. Change type signatures at the source and let the compiler reveal every site that needs updating, rather than patching call sites with ad-hoc conversions.
+- **Single Point of Truth**: One canonical definition for each type, struct, or algorithm. No parallel copies that can drift.
+- **Fight Complexity Continually**: Each shortcut (e.g., `type WorkerId = String`) seems harmless individually but collectively allows silent bugs. Targeted refactoring reduces this accumulated complexity.
+- **Consistency Across the Codebase**: All similar types follow the same pattern — same derives, same trait impls, same conventions. Understanding one means understanding all.
+
+### Architectural Principles
+
+- **Baseline-First Correctness**: Propagate changes file-by-file with compiler verification at each step. No speculative refactoring.
+- **Proto Boundary as Conversion Firewall**: Newtypes don't cross the protobuf boundary. Conversion happens exactly once in each direction, in one file (`proto_convert.rs`).
+- **Test Infrastructure Follows Production Code**: Test helpers use the same type-safe APIs as production code, ensuring tests exercise real interfaces.

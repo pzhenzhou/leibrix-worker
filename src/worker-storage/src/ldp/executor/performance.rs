@@ -499,7 +499,7 @@ mod tests {
                 OptimizationRecommendation {
                     query_id: "test_query".to_string(),
                     suggestions: vec![OptimizationSuggestion::SlowStageExecution {
-                        stage_id: 1,
+                        stage_id: StageId(1),
                         duration_ms: 6000,
                         threshold_ms: 5000,
                     }],

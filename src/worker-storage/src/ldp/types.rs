@@ -6,29 +6,149 @@
 //! - Stage and LdpPlan for the execution plan structure
 
 use std::collections::HashMap;
+use std::fmt;
 use crate::sql::logical_plan::ColumnRef;
 
 // ============================================================================
-// Identifiers
+// Identifiers — Newtypes for compile-time safety (Effective Rust Item 6)
+//
+// These prevent accidental mix-ups: a WorkerId cannot be silently passed
+// where a QueryId is expected, nor a StageId where an ExchangeId is needed.
+// Inner fields are `pub` for ergonomic access when crossing FFI/proto boundaries.
 // ============================================================================
 
 /// Unique identifier for a query execution.
-pub type QueryId = String;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueryId(pub String);
 
 /// Identifier for a stage within an LDP plan.
-pub type StageId = u32;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StageId(pub u32);
 
 /// Identifier for an exchange between stages.
-pub type ExchangeId = u32;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExchangeId(pub u32);
 
 /// Identifier for a worker node.
-pub type WorkerId = String;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkerId(pub String);
 
 /// Identifier for an epoch (time-partitioned data segment).
 pub type EpochId = String;
 
-// ============================================================================
-// Statistics Confidence
+// --- Display: renders the inner value directly so format!() just works ---
+
+impl fmt::Display for QueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for StageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for ExchangeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// --- From conversions: ergonomic construction from literals ---
+
+impl From<&str> for QueryId {
+    fn from(s: &str) -> Self { QueryId(s.to_string()) }
+}
+impl From<String> for QueryId {
+    fn from(s: String) -> Self { QueryId(s) }
+}
+impl AsRef<str> for QueryId {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+
+impl From<u32> for StageId {
+    fn from(v: u32) -> Self { StageId(v) }
+}
+
+impl From<u32> for ExchangeId {
+    fn from(v: u32) -> Self { ExchangeId(v) }
+}
+
+impl From<&str> for WorkerId {
+    fn from(s: &str) -> Self { WorkerId(s.to_string()) }
+}
+impl From<String> for WorkerId {
+    fn from(s: String) -> Self { WorkerId(s) }
+}
+impl AsRef<str> for WorkerId {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+
+// --- Default: StageId(0) and ExchangeId(0) for common initialization ---
+
+impl Default for StageId {
+    fn default() -> Self { StageId(0) }
+}
+
+impl Default for ExchangeId {
+    fn default() -> Self { ExchangeId(0) }
+}
+
+impl Default for WorkerId {
+    fn default() -> Self { WorkerId(String::new()) }
+}
+
+impl Default for QueryId {
+    fn default() -> Self { QueryId(String::new()) }
+}
+
+// --- PartialEq<str>: allows `worker_id == "w1"` without wrapping ---
+
+impl PartialEq<str> for WorkerId {
+    fn eq(&self, other: &str) -> bool { self.0 == other }
+}
+
+impl PartialEq<&str> for WorkerId {
+    fn eq(&self, other: &&str) -> bool { self.0 == *other }
+}
+
+impl PartialEq<str> for QueryId {
+    fn eq(&self, other: &str) -> bool { self.0 == other }
+}
+
+impl PartialEq<&str> for QueryId {
+    fn eq(&self, other: &&str) -> bool { self.0 == *other }
+}
+
+// --- StageId counter support for planner (cut.rs alloc_stage_id) ---
+
+impl StageId {
+    /// Increment and return the next stage ID. Used by stage allocation.
+    pub fn next(&mut self) -> StageId {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+}
+
+impl ExchangeId {
+    /// Increment and return the next exchange ID.
+    pub fn next(&mut self) -> ExchangeId {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+}
+
+// ============================================================================\n// Statistics Confidence
 // ============================================================================
 
 /// Indicates the confidence level of statistics.
@@ -419,7 +539,7 @@ impl LdpPlan {
             coordinator,
             stages: Vec::new(),
             edges: Vec::new(),
-            root_stage: 0,
+            root_stage: StageId(0),
         }
     }
 
@@ -565,13 +685,13 @@ mod tests {
     #[test]
     fn test_distribution_workers() {
         let singleton = Distribution::Singleton {
-            worker: "w1".to_string(),
+            worker: WorkerId::from("w1"),
         };
-        assert_eq!(singleton.workers(), &["w1"]);
+        assert_eq!(singleton.workers(), &[WorkerId::from("w1")]);
         assert!(singleton.is_singleton());
 
         let partitioned = Distribution::EpochPartitioned {
-            workers: vec!["w1".to_string(), "w2".to_string()],
+            workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
         };
         assert_eq!(partitioned.workers().len(), 2);
         assert!(!partitioned.is_singleton());
@@ -580,7 +700,7 @@ mod tests {
     #[test]
     fn test_required_distribution_satisfaction() {
         let singleton = Distribution::Singleton {
-            worker: "w1".to_string(),
+            worker: WorkerId::from("w1"),
         };
 
         assert!(RequiredDistribution::Any.is_satisfied_by(&singleton));
@@ -597,7 +717,7 @@ mod tests {
                 ColumnRef::unqualified("col0"),
                 ColumnRef::unqualified("col1"),
             ],
-            workers: vec!["w1".to_string(), "w2".to_string()],
+            workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
         };
 
         assert!(
@@ -619,14 +739,14 @@ mod tests {
 
     #[test]
     fn test_stage_has_exchange_inputs() {
-        let mut stage = Stage::new(0, String::new());
+        let mut stage = Stage::new(StageId(0), String::new());
         assert!(!stage.has_exchange_inputs());
 
         stage.inputs.push(StageInput::LocalCatalog);
         assert!(!stage.has_exchange_inputs());
 
         stage.inputs.push(StageInput::ExchangeInput {
-            exchange_id: 0,
+            exchange_id: ExchangeId(0),
             table_name: "__exchange_0".to_string(),
         });
         assert!(stage.has_exchange_inputs());
@@ -634,24 +754,24 @@ mod tests {
 
     #[test]
     fn test_ldp_plan_navigation() {
-        let mut plan = LdpPlan::new("q1".to_string(), "coordinator".to_string());
+        let mut plan = LdpPlan::new(QueryId::from("q1"), WorkerId::from("coordinator"));
 
-        plan.stages.push(Stage::new(0, String::new()));
-        plan.stages.push(Stage::new(1, String::new()));
+        plan.stages.push(Stage::new(StageId(0), String::new()));
+        plan.stages.push(Stage::new(StageId(1), String::new()));
 
         plan.edges.push(ExchangeEdge {
-            exchange_id: 0,
+            exchange_id: ExchangeId(0),
             kind: Exchange::Gather {
-                target: "coordinator".to_string(),
+                target: WorkerId::from("coordinator"),
             },
-            from_stage: 0,
-            to_stage: 1,
+            from_stage: StageId(0),
+            to_stage: StageId(1),
             partition_to_worker: vec![],
         });
 
-        assert_eq!(plan.downstream_stages(0), vec![1]);
-        assert_eq!(plan.upstream_stages(1), vec![0]);
-        assert!(plan.upstream_stages(0).is_empty());
-        assert!(plan.downstream_stages(1).is_empty());
+        assert_eq!(plan.downstream_stages(StageId(0)), vec![StageId(1)]);
+        assert_eq!(plan.upstream_stages(StageId(1)), vec![StageId(0)]);
+        assert!(plan.upstream_stages(StageId(0)).is_empty());
+        assert!(plan.downstream_stages(StageId(1)).is_empty());
     }
 }

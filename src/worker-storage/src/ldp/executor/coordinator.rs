@@ -403,7 +403,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// Register a remote worker for distributed execution.
     pub async fn register_worker(&self, worker_id: &str, endpoint: &str) {
         self.connection_pool
-            .register_worker(worker_id.to_string(), endpoint.to_string())
+            .register_worker(WorkerId::from(worker_id), endpoint.to_string())
             .await;
     }
 
@@ -910,7 +910,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
                     info!(
                         query_id = %query_id,
-                        stage_id = stage_id,
+                        stage_id = %stage_id,
                         target_workers = ?stage.target_workers,
                         "Executing stage on workers"
                     );
@@ -931,7 +931,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
                         debug!(
                             query_id = %query_id,
-                            stage_id = stage_id,
+                            stage_id = %stage_id,
                             worker = %target_worker,
                             input_tables = inputs.len(),
                             "Resolved inputs for worker"
@@ -1113,7 +1113,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             let handle = tokio::spawn(async move {
                 debug!(
                     query_id = %query_id_clone,
-                    stage_id = stage_clone.stage_id,
+                    stage_id = %stage_clone.stage_id,
                     "Starting streaming stage execution"
                 );
 
@@ -1148,7 +1148,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
                 debug!(
                     query_id = %query_id_clone,
-                    stage_id = stage_clone.stage_id,
+                    stage_id = %stage_clone.stage_id,
                     batches_produced = batch_count,
                     "Streaming stage execution completed"
                 );
@@ -1310,7 +1310,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                     retries += 1;
                     warn!(
                         query_id = %query_id,
-                        stage_id = stage.stage_id,
+                        stage_id = %stage.stage_id,
                         retry = retries,
                         error = %e,
                         "Stage execution failed, retrying"
@@ -1377,7 +1377,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 if target_worker != target {
                                     warn!(
                                         query_id = %plan.query_id,
-                                        stage_id = stage_id,
+                                        stage_id = %stage_id,
                                         worker = %target_worker,
                                         target = %target,
                                         "Worker is not the gather target, skipping"
@@ -1386,14 +1386,14 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 } else {
                                     debug!(
                                         query_id = %plan.query_id,
-                                        stage_id = stage_id,
+                                        stage_id = %stage_id,
                                         worker = %target_worker,
                                         sources = ?source_workers,
                                         "Executing gather exchange"
                                     );
                                     exchange_runtime
                                         .execute_gather(
-                                            &plan.query_id,
+                                            plan.query_id.as_ref(),
                                             upstream_stage,
                                             &source_workers,
                                             target,
@@ -1407,7 +1407,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 if !targets.contains(target_worker) {
                                     warn!(
                                         query_id = %plan.query_id,
-                                        stage_id = stage_id,
+                                        stage_id = %stage_id,
                                         worker = %target_worker,
                                         targets = ?targets,
                                         "Worker not in broadcast targets, skipping"
@@ -1416,7 +1416,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 } else {
                                     debug!(
                                         query_id = %plan.query_id,
-                                        stage_id = stage_id,
+                                        stage_id = %stage_id,
                                         worker = %target_worker,
                                         sources = ?source_workers,
                                         "Executing broadcast exchange"
@@ -1430,7 +1430,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
                                     exchange_runtime
                                         .execute_broadcast(
-                                            &plan.query_id,
+                                            plan.query_id.as_ref(),
                                             upstream_stage,
                                             source,
                                             targets,
@@ -1446,7 +1446,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 // Each worker receives only its assigned partitions
                                 debug!(
                                     query_id = %plan.query_id,
-                                    stage_id = stage_id,
+                                    stage_id = %stage_id,
                                     worker = %target_worker,
                                     sources = ?source_workers,
                                     partitions = partitions,
@@ -1454,7 +1454,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                 );
                                 exchange_runtime
                                     .execute_hash_partition(
-                                        &plan.query_id,
+                                        plan.query_id.as_ref(),
                                         upstream_stage,
                                         &source_workers,
                                         column_refs,
@@ -1541,7 +1541,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             // In a real implementation, this would send a cancel action to workers
             warn!(
                 query_id = %query_id,
-                stage_id = stage_id,
+                stage_id = %stage_id,
                 "Distributed stage cancellation not fully implemented"
             );
         } else {
@@ -1553,13 +1553,13 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                 monitor.cancel();
                 debug!(
                     query_id = %query_id,
-                    stage_id = stage_id,
+                    stage_id = %stage_id,
                     "Cancelled local stage via monitor"
                 );
             } else {
                 warn!(
                     query_id = %query_id,
-                    stage_id = stage_id,
+                    stage_id = %stage_id,
                     "No monitor found for stage, cannot cancel"
                 );
             }

@@ -338,6 +338,7 @@ async fn test_four_way_join() {
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
     
     let row_count = TestVerifier::count_total_rows(&result);
+    assert!(row_count > 0, "Four-way join should produce rows (matching data exists across tables)");
     assert!(row_count <= 15, "Should respect LIMIT 15");
     
     println!("✓ Four-way join executed successfully: {} rows", row_count);

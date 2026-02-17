@@ -111,7 +111,7 @@ impl<E: StageExecutor> LdpExecutor<E> {
             // Submit stage for execution with query_id
             let tickets = self
                 .stage_executor
-                .submit_stage(&plan.query_id, stage, inputs)
+                .submit_stage(plan.query_id.as_ref(), stage, inputs)
                 .await
                 .map_err(|e| ExecutionError::StageFailed(stage_id, format!("{}", e)))?;
 
@@ -135,12 +135,12 @@ impl<E: StageExecutor> LdpExecutor<E> {
 
         // Perform performance analysis after execution completes
         self.performance_optimizer
-            .analyze_query_performance(&plan.query_id)
+            .analyze_query_performance(plan.query_id.as_ref())
             .await;
 
         // Log performance insights
         self.performance_optimizer
-            .log_performance_insights(&plan.query_id)
+            .log_performance_insights(plan.query_id.as_ref())
             .await;
 
         Ok(final_batches)
@@ -158,7 +158,7 @@ impl<E: StageExecutor> LdpExecutor<E> {
             .ok_or(ExecutionError::StageNotFound(stage_id))?;
 
         self.stage_executor
-            .submit_stage(&plan.query_id, stage, inputs)
+            .submit_stage(plan.query_id.as_ref(), stage, inputs)
             .await
             .map_err(|e| ExecutionError::StageFailed(stage_id, format!("{}", e)))
     }

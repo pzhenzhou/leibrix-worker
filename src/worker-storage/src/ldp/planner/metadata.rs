@@ -227,7 +227,7 @@ impl InMemoryMetadata {
     pub fn register_table_stats(
         &self,
         table_name: &str,
-        workers: Vec<String>,
+        workers: Vec<WorkerId>,
         distribution: Distribution,
         row_count: u64,
         byte_size: u64,

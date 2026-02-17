@@ -81,10 +81,10 @@ impl StageTickets {
     }
 
     /// Get tickets for a specific worker.
-    pub fn for_worker(&self, worker_id: &str) -> Vec<&StageTicket> {
+    pub fn for_worker(&self, worker_id: &WorkerId) -> Vec<&StageTicket> {
         self.tickets
             .iter()
-            .filter(|t| t.worker_id == worker_id)
+            .filter(|t| &t.worker_id == worker_id)
             .collect()
     }
 
@@ -168,8 +168,11 @@ impl RecordBatchStream {
 pub enum StageExecutionError {
     /// Stage not found in plan.
     StageNotFound(StageId),
-    /// Worker not available.
-    WorkerUnavailable(WorkerId),
+    /// Worker not available or unreachable.
+    WorkerUnavailable {
+        worker_id: WorkerId,
+        detail: String,
+    },
     /// SQL/stage execution failed.
     ExecutionFailed(String),
     /// Output limits exceeded.
@@ -186,7 +189,9 @@ impl std::fmt::Display for StageExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StageExecutionError::StageNotFound(id) => write!(f, "Stage {} not found", id),
-            StageExecutionError::WorkerUnavailable(w) => write!(f, "Worker {} unavailable", w),
+            StageExecutionError::WorkerUnavailable { worker_id, detail } => {
+                write!(f, "Worker {} unavailable: {}", worker_id, detail)
+            }
             StageExecutionError::ExecutionFailed(msg) => write!(f, "Execution failed: {}", msg),
             StageExecutionError::LimitsExceeded {
                 limit_type,
@@ -294,7 +299,7 @@ impl LocalStageExecutor {
     /// 5. Collects and returns output batches
     async fn execute_sql_with_monitor(
         &self,
-        worker_id: &str,
+        worker_id: &WorkerId,
         stage_sql: &str,
         inputs: &HashMap<String, Vec<RecordBatch>>,
         requires_local_catalog: bool,
@@ -723,68 +728,18 @@ impl LocalStageExecutor {
     }
 }
 
-/// Topologically sort stages for execution order.
-///
-/// Returns stages in order such that all dependencies are executed first.
-pub fn topological_sort(plan: &LdpPlan) -> Vec<StageId> {
-    use std::collections::VecDeque;
-
-    let mut in_degree: HashMap<StageId, usize> = HashMap::new();
-    let mut adjacency: HashMap<StageId, Vec<StageId>> = HashMap::new();
-
-    // Initialize all stages
-    for stage in &plan.stages {
-        in_degree.entry(stage.stage_id).or_insert(0);
-        adjacency.entry(stage.stage_id).or_default();
-    }
-
-    // Build graph from edges
-    for edge in &plan.edges {
-        adjacency
-            .entry(edge.from_stage)
-            .or_default()
-            .push(edge.to_stage);
-        *in_degree.entry(edge.to_stage).or_insert(0) += 1;
-    }
-
-    // Kahn's algorithm
-    let mut queue: VecDeque<StageId> = in_degree
-        .iter()
-        .filter(|(_, deg)| **deg == 0)
-        .map(|(id, _)| *id)
-        .collect();
-
-    let mut sorted = Vec::new();
-
-    while let Some(stage_id) = queue.pop_front() {
-        sorted.push(stage_id);
-
-        if let Some(neighbors) = adjacency.get(&stage_id) {
-            for &neighbor in neighbors {
-                if let Some(deg) = in_degree.get_mut(&neighbor) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(neighbor);
-                    }
-                }
-            }
-        }
-    }
-
-    sorted
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ldp::{Exchange, ExchangeEdge, LdpPlan, Stage, StageInput, StageLimits};
+    use crate::ldp::{Exchange, ExchangeEdge, ExchangeId, LdpPlan, Stage, StageInput, StageLimits};
 
     fn create_test_plan() -> LdpPlan {
         let mut plan = LdpPlan::new("test_query".into(), "coordinator".into());
 
         // Stage 0: Leaf scan
         plan.stages.push(Stage {
-            stage_id: 0,
+            stage_id: StageId(0),
             target_workers: vec!["w1".into(), "w2".into()],
             inputs: vec![StageInput::LocalCatalog],
             output: StageOutput::Stream,
@@ -794,10 +749,10 @@ mod tests {
 
         // Stage 1: Final aggregation
         plan.stages.push(Stage {
-            stage_id: 1,
+            stage_id: StageId(1),
             target_workers: vec!["coordinator".into()],
             inputs: vec![StageInput::ExchangeInput {
-                exchange_id: 0,
+                exchange_id: ExchangeId(0),
                 table_name: "__exchange_0".into(),
             }],
             output: StageOutput::Stream,
@@ -807,12 +762,12 @@ mod tests {
 
         // Exchange: Gather from Stage 0 to Stage 1
         plan.edges.push(ExchangeEdge {
-            exchange_id: 0,
+            exchange_id: ExchangeId(0),
             kind: Exchange::Gather {
                 target: "coordinator".into(),
             },
-            from_stage: 0,
-            to_stage: 1,
+            from_stage: StageId(0),
+            to_stage: StageId(1),
             partition_to_worker: vec![],
         });
 
@@ -822,23 +777,23 @@ mod tests {
     #[test]
     fn test_topological_sort() {
         let plan = create_test_plan();
-        let sorted = topological_sort(&plan);
+        let sorted = plan.topological_order();
 
         // Stage 0 should come before Stage 1
-        assert_eq!(sorted, vec![0, 1]);
+        assert_eq!(sorted, vec![StageId(0), StageId(1)]);
     }
 
     #[test]
     fn test_stage_tickets() {
         let mut tickets = StageTickets::new();
 
-        tickets.add(StageTicket::new("test_query".to_string(), 0, "w1".into()));
-        tickets.add(StageTicket::new("test_query".to_string(), 0, "w2".into()));
-        tickets.add(StageTicket::partitioned("test_query".to_string(), 1, "coordinator".into(), 0));
-        tickets.add(StageTicket::partitioned("test_query".to_string(), 1, "coordinator".into(), 1));
+        tickets.add(StageTicket::new("test_query".to_string(), StageId(0), "w1".into()));
+        tickets.add(StageTicket::new("test_query".to_string(), StageId(0), "w2".into()));
+        tickets.add(StageTicket::partitioned("test_query".to_string(), StageId(1), "coordinator".into(), 0));
+        tickets.add(StageTicket::partitioned("test_query".to_string(), StageId(1), "coordinator".into(), 1));
 
         assert_eq!(tickets.all().len(), 4);
-        assert_eq!(tickets.for_worker("w1").len(), 1);
+        assert_eq!(tickets.for_worker(&WorkerId::from("w1")).len(), 1);
         assert_eq!(tickets.for_partition(0).len(), 1);
     }
 
@@ -847,7 +802,7 @@ mod tests {
         let executor = LocalStageExecutor::new();
 
         let stage = Stage {
-            stage_id: 0,
+            stage_id: StageId(0),
             target_workers: vec!["local".into()],
             inputs: vec![StageInput::LocalCatalog],
             output: StageOutput::Stream,

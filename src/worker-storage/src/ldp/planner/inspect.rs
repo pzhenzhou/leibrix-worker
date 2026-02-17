@@ -66,43 +66,43 @@ impl<'a> PlanInspector<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ldp::{ExchangeEdge, LdpPlan, Stage};
+    use crate::ldp::{ExchangeEdge, ExchangeId, LdpPlan, Stage, StageId};
     use crate::sql::logical_plan::ColumnRef;
 
     #[test]
     fn test_plan_inspector_counts_exchanges() {
-        let mut plan = LdpPlan::with_root("q1".into(), "w1".into(), 2);
-        plan.stages.push(Stage::new(0, String::new()));
-        plan.stages.push(Stage::new(1, String::new()));
-        plan.stages.push(Stage::new(2, String::new()));
+        let mut plan = LdpPlan::with_root("q1".into(), "w1".into(), StageId(2));
+        plan.stages.push(Stage::new(StageId(0), String::new()));
+        plan.stages.push(Stage::new(StageId(1), String::new()));
+        plan.stages.push(Stage::new(StageId(2), String::new()));
 
         plan.edges.push(ExchangeEdge {
-            exchange_id: 1,
+            exchange_id: ExchangeId(1),
             kind: Exchange::Broadcast {
                 targets: vec!["w1".into(), "w2".into()],
             },
-            from_stage: 0,
-            to_stage: 2,
+            from_stage: StageId(0),
+            to_stage: StageId(2),
             partition_to_worker: vec![],
         });
         plan.edges.push(ExchangeEdge {
-            exchange_id: 2,
+            exchange_id: ExchangeId(2),
             kind: Exchange::HashPartition {
                 column_refs: vec![ColumnRef::unqualified("col0")],
                 partitions: 16,
             },
-            from_stage: 1,
-            to_stage: 2,
+            from_stage: StageId(1),
+            to_stage: StageId(2),
             partition_to_worker: vec![],
         });
         plan.edges.push(ExchangeEdge {
-            exchange_id: 3,
+            exchange_id: ExchangeId(3),
             kind: Exchange::HashPartition {
                 column_refs: vec![ColumnRef::unqualified("col1")],
                 partitions: 16,
             },
-            from_stage: 0,
-            to_stage: 1,
+            from_stage: StageId(0),
+            to_stage: StageId(1),
             partition_to_worker: vec![],
         });
 

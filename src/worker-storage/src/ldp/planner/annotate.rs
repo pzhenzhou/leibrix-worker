@@ -747,7 +747,7 @@ mod tests {
 
         match dist {
             Distribution::HashPartitioned { workers, .. } => {
-                assert_eq!(workers, vec!["w1".to_string(), "w2".to_string()]);
+                assert_eq!(workers, vec![WorkerId::from("w1"), WorkerId::from("w2")]);
             }
             _ => panic!("expected hash partitioned distribution"),
         }

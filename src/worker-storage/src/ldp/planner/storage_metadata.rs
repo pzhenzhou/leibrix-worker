@@ -109,7 +109,7 @@ impl ClusterMetadata {
         let placement = EpochPlacement {
             epoch_id: view.epoch_id.clone(),
             dataset_id: dataset_id.to_string(),
-            worker_id: worker_id.to_string(),
+            worker_id: WorkerId::from(worker_id),
             time_range: view.time_range,
             stats: EpochStats::exact(rows, bytes),
         };
@@ -209,7 +209,7 @@ impl ClusterMetadata {
         epoch_views: &HashMap<String, (EpochView, u64, u64)>, // key -> (view, rows, bytes)
         worker_id: &str,
     ) -> Self {
-        let mut metadata = Self::with_local_worker(worker_id.to_string());
+        let mut metadata = Self::with_local_worker(WorkerId::from(worker_id));
 
         for stat in &memory_stats.epochs {
             let key = format!("{}__{}", stat.dataset_id, stat.epoch_id);
@@ -226,7 +226,7 @@ impl ClusterMetadata {
                 let placement = EpochPlacement {
                     epoch_id: stat.epoch_id.clone(),
                     dataset_id: stat.dataset_id.clone(),
-                    worker_id: worker_id.to_string(),
+                    worker_id: WorkerId::from(worker_id),
                     time_range: (0, u64::MAX), // Unknown time range
                     stats: EpochStats::exact(stat.rows_count, stat.approx_bytes),
                 };
@@ -318,7 +318,7 @@ impl<E: StorageEngine + Send + Sync> StorageEngineMetadata<E> {
         }
 
         // Get epoch views for all datasets (includes time_range)
-        let mut epoch_views_map = std::collections::HashMap::new();
+        let mut epoch_views_map = HashMap::new();
         for dataset_id in datasets_to_refresh {
             match self.engine.list_epochs(dataset_id.clone()).await {
                 Ok(views) => {
@@ -487,7 +487,7 @@ mod tests {
         EpochPlacement {
             epoch_id: epoch_id.to_string(),
             dataset_id: dataset_id.to_string(),
-            worker_id: worker_id.to_string(),
+            worker_id: WorkerId::from(worker_id),
             time_range: (start_ms, end_ms),
             stats: EpochStats::exact(rows, bytes),
         }
@@ -563,8 +563,8 @@ mod tests {
             "sales", "e2", "w2", 2000, 3000, 200, 2000,
         ));
 
-        assert_eq!(metadata.worker_for("sales", "e1"), Some("w1".to_string()));
-        assert_eq!(metadata.worker_for("sales", "e2"), Some("w2".to_string()));
+        assert_eq!(metadata.worker_for("sales", "e1"), Some(WorkerId::from("w1")));
+        assert_eq!(metadata.worker_for("sales", "e2"), Some(WorkerId::from("w2")));
         assert_eq!(metadata.worker_for("sales", "e3"), None);
     }
 
@@ -598,8 +598,8 @@ mod tests {
 
         let workers = metadata.workers_for_dataset("sales");
         assert_eq!(workers.len(), 2);
-        assert!(workers.contains(&"w1".to_string()));
-        assert!(workers.contains(&"w2".to_string()));
+        assert!(workers.contains(&WorkerId::from("w1")));
+        assert!(workers.contains(&WorkerId::from("w2")));
     }
 
     #[test]

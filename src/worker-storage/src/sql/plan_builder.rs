@@ -366,6 +366,19 @@ fn build_table_factor(tf: &TableFactor, cte_map: &CteMap<'_>) -> Result<LogicalP
                 None => Ok(plan),
             }
         }
+        TableFactor::Function {
+            name, alias, ..
+        } => {
+            // Table-valued function, e.g., scan_orders(DATE '2024-02-01', DATE '9999-12-31') AS o.
+            // Extract just the function name so metadata lookup works correctly
+            // (the metadata module resolves `scan_X` → base table `X`).
+            let table_name = object_name_to_string(name);
+            Ok(LogicalPlan::Scan {
+                table_name,
+                alias: alias.clone(),
+                table_factor: tf.clone(),
+            })
+        }
         other => {
             // TableFactor variants like UNNEST, Pivot, etc.
             // Treat as an opaque scan — the original TableFactor is preserved

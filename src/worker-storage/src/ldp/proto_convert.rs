@@ -9,8 +9,8 @@
 //! - Converting between internal and wire formats
 
 use crate::ldp::types::{
-    Distribution, Exchange, ExchangeEdge, LdpPlan, Stage, StageId, StageInput, StageLimits,
-    StageOutput,
+    Distribution, Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId,
+    StageInput, StageLimits, StageOutput, WorkerId,
 };
 use crate::sql::logical_plan::ColumnRef;
 use prost::Message;
@@ -72,27 +72,27 @@ impl From<&Distribution> for proto::Distribution {
         let distribution_type = match dist {
             Distribution::Singleton { worker } => {
                 proto::distribution::DistributionType::Singleton(proto::SingletonDistribution {
-                    worker_id: worker.clone(),
+                    worker_id: worker.0.clone(),
                 })
             }
             Distribution::HashPartitioned { column_refs, workers } => {
                 proto::distribution::DistributionType::HashPartitioned(
                     proto::HashPartitionedDistribution {
                         column_refs: column_refs_to_proto(column_refs),
-                        worker_ids: workers.clone(),
+                        worker_ids: workers.iter().map(|w| w.0.clone()).collect(),
                     },
                 )
             }
             Distribution::EpochPartitioned { workers } => {
                 proto::distribution::DistributionType::EpochPartitioned(
                     proto::EpochPartitionedDistribution {
-                        worker_ids: workers.clone(),
+                        worker_ids: workers.iter().map(|w| w.0.clone()).collect(),
                     },
                 )
             }
             Distribution::Replicated { workers } => {
                 proto::distribution::DistributionType::Replicated(proto::ReplicatedDistribution {
-                    worker_ids: workers.clone(),
+                    worker_ids: workers.iter().map(|w| w.0.clone()).collect(),
                 })
             }
         };
@@ -110,23 +110,23 @@ impl TryFrom<&proto::Distribution> for Distribution {
         match &proto.distribution_type {
             Some(proto::distribution::DistributionType::Singleton(s)) => {
                 Ok(Distribution::Singleton {
-                    worker: s.worker_id.clone(),
+                    worker: WorkerId::from(s.worker_id.clone()),
                 })
             }
             Some(proto::distribution::DistributionType::HashPartitioned(h)) => {
                 Ok(Distribution::HashPartitioned {
                     column_refs: proto_to_column_refs(&h.column_refs),
-                    workers: h.worker_ids.clone(),
+                    workers: h.worker_ids.iter().cloned().map(WorkerId::from).collect(),
                 })
             }
             Some(proto::distribution::DistributionType::EpochPartitioned(e)) => {
                 Ok(Distribution::EpochPartitioned {
-                    workers: e.worker_ids.clone(),
+                    workers: e.worker_ids.iter().cloned().map(WorkerId::from).collect(),
                 })
             }
             Some(proto::distribution::DistributionType::Replicated(r)) => {
                 Ok(Distribution::Replicated {
-                    workers: r.worker_ids.clone(),
+                    workers: r.worker_ids.iter().cloned().map(WorkerId::from).collect(),
                 })
             }
             None => Err(ConversionError::MissingField("distribution_type")),
@@ -143,12 +143,12 @@ impl From<&Exchange> for proto::Exchange {
         let exchange_type = match exchange {
             Exchange::Gather { target } => {
                 proto::exchange::ExchangeType::Gather(proto::GatherExchange {
-                    target_worker_id: target.clone(),
+                    target_worker_id: target.0.clone(),
                 })
             }
             Exchange::Broadcast { targets } => {
                 proto::exchange::ExchangeType::Broadcast(proto::BroadcastExchange {
-                    target_worker_ids: targets.clone(),
+                    target_worker_ids: targets.iter().map(|w| w.0.clone()).collect(),
                 })
             }
             Exchange::HashPartition {
@@ -172,10 +172,10 @@ impl TryFrom<&proto::Exchange> for Exchange {
     fn try_from(proto: &proto::Exchange) -> ConversionResult<Self> {
         match &proto.exchange_type {
             Some(proto::exchange::ExchangeType::Gather(g)) => Ok(Exchange::Gather {
-                target: g.target_worker_id.clone(),
+                target: WorkerId::from(g.target_worker_id.clone()),
             }),
             Some(proto::exchange::ExchangeType::Broadcast(b)) => Ok(Exchange::Broadcast {
-                targets: b.target_worker_ids.clone(),
+                targets: b.target_worker_ids.iter().cloned().map(WorkerId::from).collect(),
             }),
             Some(proto::exchange::ExchangeType::HashPartition(h)) => Ok(Exchange::HashPartition {
                 column_refs: proto_to_column_refs(&h.column_refs),
@@ -200,7 +200,7 @@ impl From<&StageInput> for proto::StageInput {
                 exchange_id,
                 table_name,
             } => proto::stage_input::InputType::Exchange(proto::ExchangeInput {
-                exchange_id: *exchange_id,
+                exchange_id: exchange_id.0,
                 table_name: table_name.clone(),
             }),
         };
@@ -218,7 +218,7 @@ impl TryFrom<&proto::StageInput> for StageInput {
         match &proto.input_type {
             Some(proto::stage_input::InputType::LocalCatalog(_)) => Ok(StageInput::LocalCatalog),
             Some(proto::stage_input::InputType::Exchange(e)) => Ok(StageInput::ExchangeInput {
-                exchange_id: e.exchange_id,
+                exchange_id: ExchangeId(e.exchange_id),
                 table_name: e.table_name.clone(),
             }),
             None => Err(ConversionError::MissingField("input_type")),
@@ -300,8 +300,8 @@ impl From<&proto::StageLimits> for StageLimits {
 impl From<&Stage> for proto::Stage {
     fn from(stage: &Stage) -> Self {
         proto::Stage {
-            stage_id: stage.stage_id,
-            target_worker_ids: stage.target_workers.clone(),
+            stage_id: stage.stage_id.0,
+            target_worker_ids: stage.target_workers.iter().map(|w| w.0.clone()).collect(),
             inputs: stage.inputs.iter().map(proto::StageInput::from).collect(),
             output: Some(proto::StageOutput::from(&stage.output)),
             stage_sql: stage.stage_sql.clone(),
@@ -334,8 +334,8 @@ impl TryFrom<&proto::Stage> for Stage {
             .unwrap_or_default();
 
         Ok(Stage {
-            stage_id: proto.stage_id,
-            target_workers: proto.target_worker_ids.clone(),
+            stage_id: StageId(proto.stage_id),
+            target_workers: proto.target_worker_ids.iter().cloned().map(WorkerId::from).collect(),
             inputs: inputs?,
             output,
             stage_sql: proto.stage_sql.clone(),
@@ -351,11 +351,11 @@ impl TryFrom<&proto::Stage> for Stage {
 impl From<&ExchangeEdge> for proto::ExchangeEdge {
     fn from(edge: &ExchangeEdge) -> Self {
         proto::ExchangeEdge {
-            exchange_id: edge.exchange_id,
+            exchange_id: edge.exchange_id.0,
             kind: Some(proto::Exchange::from(&edge.kind)),
-            from_stage_id: edge.from_stage,
-            to_stage_id: edge.to_stage,
-            partition_to_worker: edge.partition_to_worker.clone(),
+            from_stage_id: edge.from_stage.0,
+            to_stage_id: edge.to_stage.0,
+            partition_to_worker: edge.partition_to_worker.iter().map(|w| w.0.clone()).collect(),
         }
     }
 }
@@ -370,11 +370,11 @@ impl TryFrom<&proto::ExchangeEdge> for ExchangeEdge {
             .ok_or(ConversionError::MissingField("kind"))?;
 
         Ok(ExchangeEdge {
-            exchange_id: proto.exchange_id,
+            exchange_id: ExchangeId(proto.exchange_id),
             kind: Exchange::try_from(kind)?,
-            from_stage: proto.from_stage_id,
-            to_stage: proto.to_stage_id,
-            partition_to_worker: proto.partition_to_worker.clone(),
+            from_stage: StageId(proto.from_stage_id),
+            to_stage: StageId(proto.to_stage_id),
+            partition_to_worker: proto.partition_to_worker.iter().cloned().map(WorkerId::from).collect(),
         })
     }
 }
@@ -386,8 +386,8 @@ impl TryFrom<&proto::ExchangeEdge> for ExchangeEdge {
 impl From<&LdpPlan> for proto::LdpPlan {
     fn from(plan: &LdpPlan) -> Self {
         proto::LdpPlan {
-            query_id: plan.query_id.clone(),
-            coordinator_worker_id: plan.coordinator.clone(),
+            query_id: plan.query_id.0.clone(),
+            coordinator_worker_id: plan.coordinator.0.clone(),
             stages: plan.stages.iter().map(proto::Stage::from).collect(),
             edges: plan.edges.iter().map(proto::ExchangeEdge::from).collect(),
         }
@@ -405,11 +405,11 @@ impl TryFrom<&proto::LdpPlan> for LdpPlan {
             proto.edges.iter().map(ExchangeEdge::try_from).collect();
 
         let stages = stages?;
-        let root_stage = stages.last().map(|s| s.stage_id).unwrap_or(0);
+        let root_stage = stages.last().map(|s| s.stage_id).unwrap_or_default();
 
         Ok(LdpPlan {
-            query_id: proto.query_id.clone(),
-            coordinator: proto.coordinator_worker_id.clone(),
+            query_id: QueryId::from(proto.query_id.clone()),
+            coordinator: WorkerId::from(proto.coordinator_worker_id.clone()),
             stages,
             edges: edges?,
             root_stage,
@@ -494,7 +494,7 @@ pub fn serialize_submit_stage_request(
     let request = proto::SubmitStageRequest {
         tenant_id: tenant_id.to_string(),
         query_id: query_id.to_string(),
-        stage_id,
+        stage_id: stage_id.0,
         stage_sql: stage_sql.to_string(),
         limits: Some(proto::StageLimits::from(limits)),
         exchange_inputs: serialized_inputs,
@@ -595,20 +595,20 @@ mod tests {
     fn test_distribution_roundtrip() {
         let distributions = vec![
             Distribution::Singleton {
-                worker: "w1".to_string(),
+                worker: WorkerId::from("w1"),
             },
             Distribution::HashPartitioned {
                 column_refs: vec![
                     ColumnRef::unqualified("col0"),
                     ColumnRef::unqualified("col1"),
                 ],
-                workers: vec!["w1".to_string(), "w2".to_string()],
+                workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
             },
             Distribution::EpochPartitioned {
-                workers: vec!["w1".to_string()],
+                workers: vec![WorkerId::from("w1")],
             },
             Distribution::Replicated {
-                workers: vec!["w1".to_string(), "w2".to_string()],
+                workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
             },
         ];
 
@@ -623,10 +623,10 @@ mod tests {
     fn test_exchange_roundtrip() {
         let exchanges = vec![
             Exchange::Gather {
-                target: "coordinator".to_string(),
+                target: WorkerId::from("coordinator"),
             },
             Exchange::Broadcast {
-                targets: vec!["w1".to_string(), "w2".to_string()],
+                targets: vec![WorkerId::from("w1"), WorkerId::from("w2")],
             },
             Exchange::HashPartition {
                 column_refs: vec![ColumnRef::unqualified("col0")],
@@ -646,7 +646,7 @@ mod tests {
         let inputs = vec![
             StageInput::LocalCatalog,
             StageInput::ExchangeInput {
-                exchange_id: 42,
+                exchange_id: ExchangeId(42),
                 table_name: "__exchange_42".to_string(),
             },
         ];
@@ -695,12 +695,12 @@ mod tests {
     #[test]
     fn test_stage_roundtrip() {
         let stage = Stage {
-            stage_id: 1,
-            target_workers: vec!["w1".to_string(), "w2".to_string()],
+            stage_id: StageId(1),
+            target_workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
             inputs: vec![
                 StageInput::LocalCatalog,
                 StageInput::ExchangeInput {
-                    exchange_id: 0,
+                    exchange_id: ExchangeId(0),
                     table_name: "__exchange_0".to_string(),
                 },
             ],
@@ -724,19 +724,19 @@ mod tests {
 
     #[test]
     fn test_ldp_plan_roundtrip() {
-        let mut plan = LdpPlan::new("query-123".to_string(), "coordinator".to_string());
-        plan.stages.push(Stage::new(0, "SELECT * FROM t1".to_string()));
-        plan.stages.push(Stage::new(1, "SELECT * FROM __exchange_0".to_string()));
+        let mut plan = LdpPlan::new(QueryId::from("query-123"), WorkerId::from("coordinator"));
+        plan.stages.push(Stage::new(StageId(0), "SELECT * FROM t1".to_string()));
+        plan.stages.push(Stage::new(StageId(1), "SELECT * FROM __exchange_0".to_string()));
         plan.edges.push(ExchangeEdge {
-            exchange_id: 0,
+            exchange_id: ExchangeId(0),
             kind: Exchange::Gather {
-                target: "coordinator".to_string(),
+                target: WorkerId::from("coordinator"),
             },
-            from_stage: 0,
-            to_stage: 1,
+            from_stage: StageId(0),
+            to_stage: StageId(1),
             partition_to_worker: vec![],
         });
-        plan.root_stage = 1;
+        plan.root_stage = StageId(1);
 
         let bytes = serialize_ldp_plan(&plan).unwrap();
         let roundtrip = deserialize_ldp_plan(&bytes).unwrap();
@@ -769,7 +769,7 @@ mod tests {
         let bytes = serialize_submit_stage_request(
             "tenant-1",
             "query-123",
-            5,
+            StageId(5),
             "SELECT * FROM table1",
             &limits,
             &exchange_inputs,

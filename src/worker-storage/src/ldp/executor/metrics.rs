@@ -114,7 +114,7 @@ impl BroadcastExchangeMetrics {
     pub fn log_metrics(&self) {
         info!(
             query_id = %self.query_id,
-            exchange_id = self.exchange_id,
+            exchange_id = %self.exchange_id,
             source_worker = %self.source_worker,
             target_workers = self.replication_factor,
             rows = self.rows_broadcasted,
@@ -129,7 +129,7 @@ impl BroadcastExchangeMetrics {
         if self.size_ratio_to_threshold >= 0.9 {
             warn!(
                 query_id = %self.query_id,
-                exchange_id = self.exchange_id,
+                exchange_id = %self.exchange_id,
                 bytes = self.bytes_broadcasted,
                 threshold = self.broadcast_threshold_bytes,
                 ratio = self.size_ratio_to_threshold,
@@ -219,7 +219,7 @@ impl ExchangeMetrics {
     pub fn log_metrics(&self) {
         info!(
             query_id = %self.query_id,
-            exchange_id = self.exchange_id,
+            exchange_id = %self.exchange_id,
             exchange_type = %self.exchange_type,
             source_workers = self.source_workers.len(),
             target_workers = self.target_workers.len(),
@@ -465,7 +465,7 @@ impl StageExecutionMetrics {
         if self.success {
             info!(
                 query_id = %self.query_id,
-                stage_id = self.stage_id,
+                stage_id = %self.stage_id,
                 worker_id = %self.worker_id,
                 input_rows = self.input_rows,
                 output_rows = self.output_rows,
@@ -479,7 +479,7 @@ impl StageExecutionMetrics {
         } else {
             error!(
                 query_id = %self.query_id,
-                stage_id = self.stage_id,
+                stage_id = %self.stage_id,
                 worker_id = %self.worker_id,
                 input_rows = self.input_rows,
                 output_rows = self.output_rows,
@@ -834,7 +834,7 @@ impl LdpMetricsRegistry {
         worker_id: &str,
     ) -> Option<SystemHealthMetrics> {
         let health_map = self.health_metrics.read().await;
-        health_map.get(worker_id).cloned()
+        health_map.get(&WorkerId::from(worker_id)).cloned()
     }
 
     /// Get all stage metrics for a query.
@@ -922,17 +922,17 @@ mod tests {
     #[tokio::test]
     async fn test_broadcast_metrics_creation() {
         let mut metrics = BroadcastExchangeMetrics::new(
-            1,
+            ExchangeId(1),
             "test_query".to_string(),
-            "source_worker".to_string(),
-            vec!["target1".to_string(), "target2".to_string()],
+            WorkerId::from("source_worker"),
+            vec![WorkerId::from("target1"), WorkerId::from("target2")],
             1024 * 1024, // 1MB threshold
         );
 
         metrics.update_data(1000, 512 * 1024); // 512KB
         metrics.finalize();
 
-        assert_eq!(metrics.exchange_id, 1);
+        assert_eq!(metrics.exchange_id, ExchangeId(1));
         assert_eq!(metrics.query_id, "test_query");
         assert_eq!(metrics.rows_broadcasted, 1000);
         assert_eq!(metrics.bytes_broadcasted, 512 * 1024);
@@ -946,25 +946,25 @@ mod tests {
         let registry = ExchangeMetricsRegistry::new();
 
         let exchange_metrics = ExchangeMetrics::new(
-            1,
+            ExchangeId(1),
             "test_query".to_string(),
             "Broadcast".to_string(),
-            vec!["source".to_string()],
-            vec!["target1".to_string(), "target2".to_string()],
+            vec![WorkerId::from("source")],
+            vec![WorkerId::from("target1"), WorkerId::from("target2")],
         );
 
         registry.register_exchange_metrics(exchange_metrics).await;
 
-        let retrieved = registry.get_exchange_metrics("test_query", 1).await;
+        let retrieved = registry.get_exchange_metrics("test_query", ExchangeId(1)).await;
         assert!(retrieved.is_some());
     }
 
     #[tokio::test]
     async fn test_stage_execution_metrics() {
         let mut metrics = StageExecutionMetrics::new(
-            1,
+            StageId(1),
             "test_query".to_string(),
-            "worker1".to_string(),
+            WorkerId::from("worker1"),
         );
 
         metrics.update_input_stats(1000, 10240, 4);
@@ -973,7 +973,7 @@ mod tests {
         metrics.mark_success();
         metrics.finalize();
 
-        assert_eq!(metrics.stage_id, 1);
+        assert_eq!(metrics.stage_id, StageId(1));
         assert_eq!(metrics.query_id, "test_query");
         assert_eq!(metrics.input_rows, 1000);
         assert_eq!(metrics.output_rows, 800);
@@ -986,14 +986,14 @@ mod tests {
         let registry = LdpMetricsRegistry::new();
 
         let stage_metrics = StageExecutionMetrics::new(
-            1,
+            StageId(1),
             "test_query".to_string(),
-            "worker1".to_string(),
+            WorkerId::from("worker1"),
         );
 
         registry.register_stage_metrics(stage_metrics).await;
 
-        let retrieved = registry.get_stage_metrics("test_query", 1).await;
+        let retrieved = registry.get_stage_metrics("test_query", StageId(1)).await;
         assert!(retrieved.is_some());
     }
 }

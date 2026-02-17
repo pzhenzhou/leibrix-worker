@@ -13,6 +13,7 @@ use chrono::{NaiveDate, Datelike};
 use rand::Rng;
 
 use super::cluster::TestCluster;
+use crate::ldp::WorkerId;
 
 /// Distribution specification for loading data across workers.
 #[derive(Debug, Clone)]
@@ -388,7 +389,7 @@ impl TestDataLoader {
                 &epoch.epoch_id,
                 &spec.table_name,
                 EpochStats::exact(epoch.row_count as u64, estimated_bytes),
-                epoch.worker_id.clone(),
+                WorkerId::from(epoch.worker_id.clone()),
                 (start_ms, end_ms),
             );
         }
@@ -603,7 +604,7 @@ impl TestDataLoader {
         worker_id: &str,
         customers: Vec<RecordBatch>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.cluster.worker_ids().contains(&worker_id.to_string()) {
+        if !self.cluster.worker_ids().iter().any(|w| w.as_ref() == worker_id) {
             return Err(format!("Worker {} not found in cluster", worker_id).into());
         }
 
@@ -648,10 +649,11 @@ impl TestDataLoader {
     /// Helper function to insert a batch into a worker's table.
     async fn insert_batch_to_worker(
         &self,
-        worker_id: &str,
+        worker_id: impl AsRef<str>,
         table_name: &str,
         batch: &RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let worker_id = worker_id.as_ref();
         // Convert batch to individual row inserts for simplicity
         // In a real scenario, we'd use bulk insert mechanisms
         for row_idx in 0..batch.num_rows() {
@@ -721,7 +723,7 @@ impl TestDataLoader {
         let worker_ids = self.cluster.worker_ids();
         let first_worker = worker_ids.first()
             .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from("No workers available"))?;
-        self.load_customers_on_worker(first_worker, customers).await?;
+        self.load_customers_on_worker(first_worker.as_ref(), customers).await?;
         println!("Loaded customers data (100 records) on worker {}", first_worker);
         
         Ok(())

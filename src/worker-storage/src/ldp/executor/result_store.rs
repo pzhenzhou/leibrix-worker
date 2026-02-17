@@ -13,6 +13,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
+use super::stage::StageExecutionStats;
 
 
 /// Cached result of a stage execution.
@@ -33,27 +34,6 @@ impl CachedStageResult {
             batches,
             stats,
             created_at: Instant::now(),
-        }
-    }
-}
-
-/// Statistics for cached stage execution.
-#[derive(Debug, Clone)]
-pub struct StageExecutionStats {
-    /// Total rows produced.
-    pub rows_produced: u64,
-    /// Total bytes produced.
-    pub bytes_produced: u64,
-    /// Execution time in milliseconds.
-    pub execution_time_ms: u64,
-}
-
-impl Default for StageExecutionStats {
-    fn default() -> Self {
-        Self {
-            rows_produced: 0,
-            bytes_produced: 0,
-            execution_time_ms: 0,
         }
     }
 }

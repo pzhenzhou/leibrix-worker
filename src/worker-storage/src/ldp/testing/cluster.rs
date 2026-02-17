@@ -12,6 +12,7 @@ use crate::engine::duckdb::arrow_utils::register_arrow_batches_persistent;
 use crate::ldp::executor::coordinator::LdpCoordinator;
 use crate::ldp::executor::stage::LocalStageExecutor;
 use crate::ldp::planner::PlannerPolicy;
+use crate::ldp::WorkerId;
 use crate::engine::duckdb::DuckDBQueryEngine;
 use crate::ldp::testing::macro_helpers::LogicalDatasetManager;
 
@@ -133,8 +134,8 @@ impl TestCluster {
         }
 
         // Ensure coordinator is a concrete worker for deterministic local execution.
-        if config.policy.coordinator.is_empty() {
-            config.policy.coordinator = "w1".to_string();
+        if config.policy.coordinator.as_ref().is_empty() {
+            config.policy.coordinator = WorkerId::from("w1");
         }
 
         // Create dataset manager
@@ -165,7 +166,7 @@ impl TestCluster {
         // Wire worker databases into the coordinator so stage SQL can read local catalogs.
         for (worker_id, worker) in &cluster.workers {
             cluster.coordinator.register_worker_database(
-                worker_id.clone(),
+                WorkerId::from(worker_id.as_str()),
                 worker.query_engine.shared_db.clone(),
             );
         }
@@ -189,8 +190,8 @@ impl TestCluster {
     }
 
     /// Get all worker IDs.
-    pub fn worker_ids(&self) -> Vec<String> {
-        self.workers.keys().cloned().collect()
+    pub fn worker_ids(&self) -> Vec<WorkerId> {
+        self.workers.keys().map(|k| WorkerId::from(k.as_str())).collect()
     }
 
     /// Execute a query using the coordinator.
@@ -207,9 +208,10 @@ impl TestCluster {
     /// Execute a query using a specific worker (for reference comparison).
     pub async fn execute_query_on_worker(
         &self,
-        worker_id: &str,
+        worker_id: impl AsRef<str>,
         sql: &str,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        let worker_id = worker_id.as_ref();
         let worker = self
             .workers
             .get(worker_id)
@@ -238,10 +240,11 @@ impl TestCluster {
     /// Load data to a specific worker.
     pub async fn load_data_to_worker(
         &self,
-        worker_id: &str,
+        worker_id: impl AsRef<str>,
         table_name: &str,
         data: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let worker_id = worker_id.as_ref();
         let worker = self
             .workers
             .get(worker_id)

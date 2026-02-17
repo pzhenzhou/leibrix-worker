@@ -21,7 +21,7 @@ use crate::ldp::executor::stage::{
 use crate::ldp::proto_convert::{
     deserialize_submit_stage_response, serialize_submit_stage_request,
 };
-use crate::ldp::{Stage, StageOutput, WorkerId};
+use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 
 // ============================================================================
 // Worker Connection Pool
@@ -41,18 +41,18 @@ impl WorkerConnection {
     pub async fn connect(worker_id: WorkerId, endpoint: &str) -> Result<Self, StageExecutionError> {
         let channel = Channel::from_shared(endpoint.to_string())
             .map_err(|e| {
-                StageExecutionError::WorkerUnavailable(format!(
-                    "Invalid endpoint '{}': {}",
-                    endpoint, e
-                ))
+                StageExecutionError::WorkerUnavailable {
+                    worker_id: worker_id.clone(),
+                    detail: format!("Invalid endpoint '{}': {}", endpoint, e),
+                }
             })?
             .connect()
             .await
             .map_err(|e| {
-                StageExecutionError::WorkerUnavailable(format!(
-                    "Failed to connect to worker '{}' at '{}': {}",
-                    worker_id, endpoint, e
-                ))
+                StageExecutionError::WorkerUnavailable {
+                    worker_id: worker_id.clone(),
+                    detail: format!("Failed to connect to '{}': {}", endpoint, e),
+                }
             })?;
 
         let client = FlightServiceClient::new(channel);
@@ -85,7 +85,7 @@ impl WorkerConnectionPool {
     /// Get or create a connection to a worker.
     pub async fn get_connection(
         &self,
-        worker_id: &str,
+        worker_id: &WorkerId,
     ) -> Result<WorkerConnection, StageExecutionError> {
         // Check if we already have a connection
         {
@@ -99,32 +99,32 @@ impl WorkerConnectionPool {
         let endpoint = {
             let endpoints = self.endpoints.read().await;
             endpoints.get(worker_id).cloned().ok_or_else(|| {
-                StageExecutionError::WorkerUnavailable(format!(
-                    "No endpoint registered for worker '{}'",
-                    worker_id
-                ))
+                StageExecutionError::WorkerUnavailable {
+                    worker_id: worker_id.clone(),
+                    detail: format!("No endpoint registered for worker '{}'", worker_id),
+                }
             })?
         };
 
         // Create new connection
-        let conn = WorkerConnection::connect(worker_id.to_string(), &endpoint).await?;
+        let conn = WorkerConnection::connect(worker_id.clone(), &endpoint).await?;
 
         // Cache it
         {
             let mut connections = self.connections.write().await;
-            connections.insert(worker_id.to_string(), conn.clone());
+            connections.insert(worker_id.clone(), conn.clone());
         }
 
         Ok(conn)
     }
 
     /// Remove a worker connection (e.g., on failure).
-    pub async fn remove_connection(&self, worker_id: &str) {
+    pub async fn remove_connection(&self, worker_id: &WorkerId) {
         self.connections.write().await.remove(worker_id);
     }
 
     /// Get the endpoint URL for a worker.
-    pub async fn get_endpoint(&self, worker_id: &str) -> Option<String> {
+    pub async fn get_endpoint(&self, worker_id: &WorkerId) -> Option<String> {
         self.endpoints.read().await.get(worker_id).cloned()
     }
 
@@ -181,7 +181,7 @@ impl FlightStageExecutor {
     }
 
     /// Generate a ticket cache key.
-    fn ticket_key(query_id: &str, stage_id: u32, worker_id: &str) -> String {
+    fn ticket_key(query_id: &str, stage_id: StageId, worker_id: &WorkerId) -> String {
         format!("{}:{}:{}", query_id, stage_id, worker_id)
     }
 
@@ -191,14 +191,14 @@ impl FlightStageExecutor {
     async fn submit_to_worker(
         &self,
         stage: &Stage,
-        worker_id: &str,
+        worker_id: &WorkerId,
         query_id: &str,
         inputs: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<StageTicket, StageExecutionError> {
         info!(
             query_id = query_id,
-            stage_id = stage.stage_id,
-            worker_id = worker_id,
+            stage_id = %stage.stage_id,
+            worker_id = %worker_id,
             "Submitting stage to worker"
         );
 
@@ -231,8 +231,8 @@ impl FlightStageExecutor {
             .map_err(|e| {
                 error!(
                     query_id = query_id,
-                    stage_id = stage.stage_id,
-                    worker_id = worker_id,
+                    stage_id = %stage.stage_id,
+                    worker_id = %worker_id,
                     error = %e,
                     "DoAction failed"
                 );
@@ -274,8 +274,8 @@ impl FlightStageExecutor {
         if let Some(stats) = submit_response.stats {
             info!(
                 query_id = query_id,
-                stage_id = stage.stage_id,
-                worker_id = worker_id,
+                stage_id = %stage.stage_id,
+                worker_id = %worker_id,
                 rows = stats.rows_produced,
                 bytes = stats.bytes_produced,
                 time_ms = stats.execution_time_ms,
@@ -284,7 +284,7 @@ impl FlightStageExecutor {
         }
 
         // Create ticket
-        Ok(StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.to_string()))
+        Ok(StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone()))
     }
 }
 
@@ -339,7 +339,7 @@ impl StageExecutor for FlightStageExecutor {
         ticket: &StageTicket,
     ) -> Result<Vec<RecordBatch>, StageExecutionError> {
         debug!(
-            stage_id = ticket.stage_id,
+            stage_id = %ticket.stage_id,
             worker_id = %ticket.worker_id,
             partition = ?ticket.partition,
             "Fetching output from worker"
@@ -379,7 +379,7 @@ impl StageExecutor for FlightStageExecutor {
             .await
             .map_err(|e| {
                 error!(
-                    stage_id = ticket.stage_id,
+                    stage_id = %ticket.stage_id,
                     worker_id = %ticket.worker_id,
                     error = %e,
                     "DoGet failed"
@@ -402,7 +402,7 @@ impl StageExecutor for FlightStageExecutor {
             })?;
 
         info!(
-            stage_id = ticket.stage_id,
+            stage_id = %ticket.stage_id,
             worker_id = %ticket.worker_id,
             batches = batches.len(),
             "Fetched output from worker"
@@ -445,7 +445,7 @@ impl LdpFlightClient {
     pub async fn connect(&mut self) -> Result<(), StageExecutionError> {
         let channel = Channel::from_shared(self.endpoint.clone())
             .map_err(|e| {
-                StageExecutionError::WorkerUnavailable(format!(
+                StageExecutionError::ExecutionFailed(format!(
                     "Invalid endpoint '{}': {}",
                     self.endpoint, e
                 ))
@@ -453,7 +453,7 @@ impl LdpFlightClient {
             .connect()
             .await
             .map_err(|e| {
-                StageExecutionError::WorkerUnavailable(format!(
+                StageExecutionError::ExecutionFailed(format!(
                     "Failed to connect to '{}': {}",
                     self.endpoint, e
                 ))
@@ -475,7 +475,7 @@ impl LdpFlightClient {
         }
         self.client
             .as_mut()
-            .ok_or_else(|| StageExecutionError::WorkerUnavailable("Not connected".into()))
+            .ok_or_else(|| StageExecutionError::ExecutionFailed("Not connected".into()))
     }
 
     /// Perform a health check.
@@ -488,7 +488,7 @@ impl LdpFlightClient {
         };
 
         let response = client.do_action(action).await.map_err(|e| {
-            StageExecutionError::WorkerUnavailable(format!("Health check failed: {}", e))
+            StageExecutionError::ExecutionFailed(format!("Health check failed: {}", e))
         })?;
 
         let mut stream = response.into_inner();
@@ -507,7 +507,7 @@ impl LdpFlightClient {
     pub async fn submit_stage(
         &mut self,
         query_id: &str,
-        stage_id: u32,
+        stage_id: StageId,
         stage_sql: &str,
         limits: &crate::ldp::StageLimits,
     ) -> Result<Vec<u8>, StageExecutionError> {
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_ticket_key_generation() {
-        let key = FlightStageExecutor::ticket_key("q1", 5, "worker-1");
+        let key = FlightStageExecutor::ticket_key("q1", StageId(5), &WorkerId::from("worker-1"));
         assert_eq!(key, "q1:5:worker-1");
     }
 
@@ -612,22 +612,22 @@ mod tests {
     #[tokio::test]
     async fn test_register_worker() {
         let pool = WorkerConnectionPool::new();
-        pool.register_worker("w1".to_string(), "http://localhost:50051".to_string())
+        pool.register_worker(WorkerId::from("w1"), "http://localhost:50051".to_string())
             .await;
 
         let endpoints = pool.endpoints.read().await;
-        assert_eq!(endpoints.get("w1"), Some(&"http://localhost:50051".to_string()));
+        assert_eq!(endpoints.get(&WorkerId::from("w1")), Some(&"http://localhost:50051".to_string()));
     }
 
     #[tokio::test]
     async fn test_get_connection_unknown_worker() {
         let pool = WorkerConnectionPool::new();
-        let result = pool.get_connection("unknown").await;
+        let result = pool.get_connection(&WorkerId::from("unknown")).await;
         assert!(result.is_err());
 
         match result {
-            Err(StageExecutionError::WorkerUnavailable(msg)) => {
-                assert!(msg.contains("No endpoint registered"));
+            Err(StageExecutionError::WorkerUnavailable { detail, .. }) => {
+                assert!(detail.contains("No endpoint registered"));
             }
             _ => panic!("Expected WorkerUnavailable error"),
         }
