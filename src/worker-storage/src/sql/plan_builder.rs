@@ -52,10 +52,9 @@ pub struct BuildResult {
 pub fn build_logical_plan(stmt: &Statement) -> Result<BuildResult, PlanBuildError> {
     match stmt {
         Statement::Query(query) => build_from_query(query),
-        other => Err(PlanBuildError::UnsupportedStatement(format!(
-            "{}",
-            statement_name(other)
-        ))),
+        other => Err(PlanBuildError::UnsupportedStatement(
+            statement_name(other).to_string(),
+        )),
     }
 }
 
@@ -217,7 +216,7 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
     let has_aggregate_functions = select
         .projection
         .iter()
-        .any(|item| select_item_has_aggregate(item));
+        .any(select_item_has_aggregate);
 
     if has_group_by || has_aggregate_functions {
         let group_keys = extract_group_keys(&select.group_by);
@@ -237,7 +236,7 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
     let has_window = select
         .projection
         .iter()
-        .any(|item| select_item_has_window(item));
+        .any(select_item_has_window);
 
     if has_window {
         plan = LogicalPlan::Window {
@@ -446,9 +445,11 @@ fn extract_equi_keys_recursive(
 ) {
     match expr {
         // a.col = b.col
-        Expr::BinaryOp { left, op, right }
-            if matches!(op, sqlparser::ast::BinaryOperator::Eq) =>
-        {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
             if let (Some(l_ref), Some(r_ref)) =
                 (expr_to_column_ref(left), expr_to_column_ref(right))
             {
@@ -470,9 +471,11 @@ fn extract_equi_keys_recursive(
             }
         }
         // expr1 AND expr2
-        Expr::BinaryOp { left, op, right }
-            if matches!(op, sqlparser::ast::BinaryOperator::And) =>
-        {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
             extract_equi_keys_recursive(left, left_tables, right_tables, left_keys, right_keys);
             extract_equi_keys_recursive(right, left_tables, right_tables, left_keys, right_keys);
         }
@@ -533,7 +536,7 @@ fn extract_group_keys(group_by: &GroupByExpr) -> Vec<ColumnRef> {
         }
         GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
-            .filter_map(|expr| expr_to_column_ref(expr))
+            .filter_map(expr_to_column_ref)
             .collect(),
     }
 }
@@ -566,11 +569,11 @@ fn expr_has_window(expr: &Expr) -> bool {
             else_result,
             ..
         } => {
-            operand.as_ref().map_or(false, |e| expr_has_window(e))
+            operand.as_ref().is_some_and(|e| expr_has_window(e))
                 || conditions.iter().any(|c| expr_has_window(&c.condition) || expr_has_window(&c.result))
                 || else_result
                     .as_ref()
-                    .map_or(false, |e| expr_has_window(e))
+                    .is_some_and(|e| expr_has_window(e))
         }
         _ => false,
     }
@@ -610,11 +613,11 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             else_result,
             ..
         } => {
-            operand.as_ref().map_or(false, |e| expr_has_aggregate(e))
+            operand.as_ref().is_some_and(|e| expr_has_aggregate(e))
                 || conditions.iter().any(|c| expr_has_aggregate(&c.condition) || expr_has_aggregate(&c.result))
                 || else_result
                     .as_ref()
-                    .map_or(false, |e| expr_has_aggregate(e))
+                    .is_some_and(|e| expr_has_aggregate(e))
         }
         _ => false,
     }

@@ -17,44 +17,17 @@ use crate::sql::logical_plan::{LogicalPlan, PlanContext};
 use crate::sql::{build_logical_plan, parse_sql, PlanBuildError, SqlTransformError};
 
 /// Error during LDP pipeline execution.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     /// SQL parsing failed.
-    Parse(SqlTransformError),
+    #[error("SQL parse failed: {0}")]
+    Parse(#[from] SqlTransformError),
     /// Logical plan building failed.
-    PlanBuild(PlanBuildError),
+    #[error("Plan build failed: {0}")]
+    PlanBuild(#[from] PlanBuildError),
     /// Planning (annotation/enforcement) failed.
-    Planning(PlanningError),
-}
-
-impl std::fmt::Display for PipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PipelineError::Parse(err) => write!(f, "SQL parse failed: {}", err),
-            PipelineError::PlanBuild(err) => write!(f, "Plan build failed: {}", err),
-            PipelineError::Planning(err) => write!(f, "Planning failed: {}", err),
-        }
-    }
-}
-
-impl std::error::Error for PipelineError {}
-
-impl From<SqlTransformError> for PipelineError {
-    fn from(err: SqlTransformError) -> Self {
-        PipelineError::Parse(err)
-    }
-}
-
-impl From<PlanBuildError> for PipelineError {
-    fn from(err: PlanBuildError) -> Self {
-        PipelineError::PlanBuild(err)
-    }
-}
-
-impl From<PlanningError> for PipelineError {
-    fn from(err: PlanningError) -> Self {
-        PipelineError::Planning(err)
-    }
+    #[error("Planning failed: {0}")]
+    Planning(#[from] PlanningError),
 }
 
 /// Main entry point for LDP planning.

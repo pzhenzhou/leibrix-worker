@@ -3,7 +3,7 @@
 //! This module handles submitting stages to workers and executing them locally.
 
 use crate::engine::duckdb::SharedDatabase;
-use crate::ldp::{LdpPlan, Stage, StageId, StageOutput, WorkerId};
+use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 use crate::ldp::executor::monitor::StageExecutionMonitor;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -164,52 +164,31 @@ impl RecordBatchStream {
 }
 
 /// Error during stage execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum StageExecutionError {
     /// Stage not found in plan.
+    #[error("Stage {0} not found")]
     StageNotFound(StageId),
     /// Worker not available or unreachable.
+    #[error("Worker {worker_id} unavailable: {detail}")]
     WorkerUnavailable {
         worker_id: WorkerId,
         detail: String,
     },
     /// SQL/stage execution failed.
+    #[error("Execution failed: {0}")]
     ExecutionFailed(String),
     /// Output limits exceeded.
+    #[error("{limit_type} limit exceeded: {actual} > {limit}")]
     LimitsExceeded {
         limit_type: String,
         actual: u64,
         limit: u64,
     },
     /// Exchange input not ready.
+    #[error("Input {0} not ready")]
     InputNotReady(String),
 }
-
-impl std::fmt::Display for StageExecutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StageExecutionError::StageNotFound(id) => write!(f, "Stage {} not found", id),
-            StageExecutionError::WorkerUnavailable { worker_id, detail } => {
-                write!(f, "Worker {} unavailable: {}", worker_id, detail)
-            }
-            StageExecutionError::ExecutionFailed(msg) => write!(f, "Execution failed: {}", msg),
-            StageExecutionError::LimitsExceeded {
-                limit_type,
-                actual,
-                limit,
-            } => write!(
-                f,
-                "{} limit exceeded: {} > {}",
-                limit_type, actual, limit
-            ),
-            StageExecutionError::InputNotReady(name) => {
-                write!(f, "Input {} not ready", name)
-            }
-        }
-    }
-}
-
-impl std::error::Error for StageExecutionError {}
 
 /// Trait for stage execution backends.
 ///

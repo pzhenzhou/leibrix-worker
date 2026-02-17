@@ -94,31 +94,20 @@ impl AnnotatedPlan {
 pub type AnnotationResult = Result<AnnotatedPlan, PlanningError>;
 
 /// Error during LDP planning.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum PlanningError {
     /// Query rejected due to data movement limits.
+    #[error("Query rejected: {0}")]
     Rejected(RejectReason),
 
     /// Missing metadata for table.
+    #[error("Missing metadata for table: {0}")]
     MissingMetadata(String),
 
     /// Invalid plan structure.
+    #[error("Invalid plan: {0}")]
     InvalidPlan(String),
 }
-
-impl std::fmt::Display for PlanningError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlanningError::Rejected(reason) => write!(f, "Query rejected: {}", reason),
-            PlanningError::MissingMetadata(table) => {
-                write!(f, "Missing metadata for table: {}", table)
-            }
-            PlanningError::InvalidPlan(msg) => write!(f, "Invalid plan: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for PlanningError {}
 
 /// Main entry point: annotate a LogicalPlan and enforce distribution requirements.
 ///

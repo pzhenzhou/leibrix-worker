@@ -161,7 +161,6 @@ impl SkewHandler {
         // Get top keys contributing to skew
         let mut sorted_keys: Vec<(String, u64)> = key_counts
             .into_iter()
-            .map(|(k, v)| (k, v))
             .collect();
         sorted_keys.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by count descending
         
@@ -209,98 +208,98 @@ impl SkewHandler {
                             if let Some(arr) = column.as_any().downcast_ref::<Int8Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Int16 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Int16Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Int32 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Int32Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Int64 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::UInt8 => {
                             if let Some(arr) = column.as_any().downcast_ref::<UInt8Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::UInt16 => {
                             if let Some(arr) = column.as_any().downcast_ref::<UInt16Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::UInt32 => {
                             if let Some(arr) = column.as_any().downcast_ref::<UInt32Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::UInt64 => {
                             if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Float32 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Float32Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Float64 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Float64Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Utf8 => {
                             if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::LargeUtf8 => {
                             if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Date32 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Date32Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Date64 => {
                             if let Some(arr) = column.as_any().downcast_ref::<Date64Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Timestamp(_, _) => {
@@ -313,49 +312,49 @@ impl SkewHandler {
                             } else if let Some(arr) = column.as_any().downcast_ref::<TimestampSecondArray>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Decimal128(_, _) => {
                             if let Some(arr) = column.as_any().downcast_ref::<Decimal128Array>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Decimal256(_, _) => {
                             if let Some(arr) = column.as_any().downcast_ref::<Decimal256Array>() {
                                 format!("{}", arr.value(row_idx))
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Boolean => {
                             if let Some(arr) = column.as_any().downcast_ref::<BooleanArray>() {
                                 arr.value(row_idx).to_string()
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::Binary => {
                             if let Some(arr) = column.as_any().downcast_ref::<BinaryArray>() {
                                 format!("{:?}", arr.value(row_idx))
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::LargeBinary => {
                             if let Some(arr) = column.as_any().downcast_ref::<LargeBinaryArray>() {
                                 format!("{:?}", arr.value(row_idx))
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         arrow::datatypes::DataType::FixedSizeBinary(_) => {
                             if let Some(arr) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
                                 format!("{:?}", arr.value(row_idx))
                             } else {
-                                format!("unsupported")
+                                "unsupported".to_string()
                             }
                         }
                         _ => "other".to_string(),
@@ -734,8 +733,10 @@ mod tests {
     
     #[test]
     fn test_skew_detection_no_skew() {
-        let mut config = SkewHandlingConfig::default();
-        config.min_rows_for_skew_detection = 1;
+        let config = SkewHandlingConfig {
+            min_rows_for_skew_detection: 1,
+            ..Default::default()
+        };
         let handler = SkewHandler::with_config(config);
         
         // Create a batch with uniformly distributed keys
@@ -760,9 +761,11 @@ mod tests {
     
     #[test]
     fn test_skew_detection_with_skew() {
-        let mut config = SkewHandlingConfig::default();
-        config.min_rows_for_skew_detection = 1;
-        config.skew_threshold = 0.8;
+        let config = SkewHandlingConfig {
+            min_rows_for_skew_detection: 1,
+            skew_threshold: 0.8,
+            ..Default::default()
+        };
         let handler = SkewHandler::with_config(config);
         
         // Create a batch with skewed keys (key 1 appears much more frequently)

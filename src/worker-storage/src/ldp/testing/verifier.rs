@@ -350,39 +350,48 @@ impl TestVerifier {
 }
 
 /// Errors that can occur during test result verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum VerificationError {
     /// Arrow-related error during comparison.
+    #[error("Arrow error: {0}")]
     ArrowError(String),
     /// Empty results provided for comparison.
+    #[error("Empty results provided for comparison")]
     EmptyResults,
     /// Row count mismatch between distributed and reference results.
+    #[error("Row count mismatch: distributed={distributed} vs reference={reference}")]
     RowCountMismatch { distributed: usize, reference: usize },
     /// Column count mismatch between distributed and reference results.
+    #[error("Column count mismatch: distributed={distributed} vs reference={reference}")]
     ColumnCountMismatch { distributed: usize, reference: usize },
     /// Schema mismatch between distributed and reference results.
+    #[error("Schema mismatch between results")]
     SchemaMismatch { 
         distributed: Arc<arrow::datatypes::Schema>, 
         reference: Arc<arrow::datatypes::Schema> 
     },
     /// Row content mismatch at a specific index.
+    #[error("Row mismatch at index {index}: distributed='{distributed}' vs reference='{reference}'")]
     RowMismatch { 
         index: usize, 
         distributed: String, 
         reference: String 
     },
     /// Column length mismatch.
+    #[error("Column {column_index} length mismatch: {len1} vs {len2}")]
     ColumnLengthMismatch { 
         column_index: usize, 
         len1: usize, 
         len2: usize 
     },
     /// Column values mismatch.
+    #[error("Column {column_index} values mismatch: {message}")]
     ColumnValuesMismatch { 
         column_index: usize, 
         message: String 
     },
     /// Exact value mismatch.
+    #[error("Value mismatch at [{column_index},{row_index}]: '{value1}' vs '{value2}'")]
     ValueMismatch { 
         column_index: usize, 
         row_index: usize, 
@@ -390,6 +399,7 @@ pub enum VerificationError {
         value2: String 
     },
     /// Approximate value mismatch (beyond tolerance).
+    #[error("Approximate value mismatch at [{column_index},{row_index}] beyond tolerance {tolerance}: {value1} vs {value2}")]
     ApproximateValueMismatch { 
         column_index: usize, 
         row_index: usize, 
@@ -398,41 +408,6 @@ pub enum VerificationError {
         tolerance: f64 
     },
 }
-
-impl std::fmt::Display for VerificationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VerificationError::ArrowError(e) => write!(f, "Arrow error: {}", e),
-            VerificationError::EmptyResults => write!(f, "Empty results provided for comparison"),
-            VerificationError::RowCountMismatch { distributed, reference } => {
-                write!(f, "Row count mismatch: distributed={} vs reference={}", distributed, reference)
-            },
-            VerificationError::ColumnCountMismatch { distributed, reference } => {
-                write!(f, "Column count mismatch: distributed={} vs reference={}", distributed, reference)
-            },
-            VerificationError::SchemaMismatch { .. } => write!(f, "Schema mismatch between results"),
-            VerificationError::RowMismatch { index, distributed, reference } => {
-                write!(f, "Row mismatch at index {}: distributed='{}' vs reference='{}'", 
-                       index, distributed, reference)
-            },
-            VerificationError::ColumnLengthMismatch { column_index, len1, len2 } => {
-                write!(f, "Column {} length mismatch: {} vs {}", column_index, len1, len2)
-            },
-            VerificationError::ColumnValuesMismatch { column_index, message } => {
-                write!(f, "Column {} values mismatch: {}", column_index, message)
-            },
-            VerificationError::ValueMismatch { column_index, row_index, value1, value2 } => {
-                write!(f, "Value mismatch at [{},{}]: '{}' vs '{}'", column_index, row_index, value1, value2)
-            },
-            VerificationError::ApproximateValueMismatch { column_index, row_index, value1, value2, tolerance } => {
-                write!(f, "Approximate value mismatch at [{},{}] beyond tolerance {}: {} vs {}", 
-                       column_index, row_index, tolerance, value1, value2)
-            },
-        }
-    }
-}
-
-impl std::error::Error for VerificationError {}
 
 impl From<ArrowError> for VerificationError {
     fn from(error: ArrowError) -> Self {
@@ -488,7 +463,11 @@ mod tests {
         let batch2 = create_test_batch_with_ints(vec![3, 1, 2]); // Different order
 
         // Should pass when ordering is not checked
-        let result = TestVerifier::assert_results_equal(&[batch1.clone()], &[batch2.clone()], false);
+        let result = TestVerifier::assert_results_equal(
+            std::slice::from_ref(&batch1),
+            std::slice::from_ref(&batch2),
+            false,
+        );
         assert!(result.is_ok());
 
         // Should fail when ordering is checked
@@ -511,7 +490,12 @@ mod tests {
         let batch2 = create_test_batch_with_floats(vec![1.0002, 2.0002, 3.0002]); // Very close values
 
         // Should pass with tolerance of 0.001
-        let result = TestVerifier::assert_results_approximately_equal(&[batch1.clone()], &[batch2.clone()], 0.001, true);
+        let result = TestVerifier::assert_results_approximately_equal(
+            std::slice::from_ref(&batch1),
+            std::slice::from_ref(&batch2),
+            0.001,
+            true,
+        );
         assert!(result.is_ok());
 
         // Should fail with tighter tolerance

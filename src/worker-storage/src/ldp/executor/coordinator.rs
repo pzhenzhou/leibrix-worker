@@ -85,75 +85,32 @@ use arrow::datatypes::{DataType, Schema};
 // ============================================================================
 
 /// Errors that can occur during query coordination.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     /// Query was rejected by admission control.
-    AdmissionRejected(AdmissionError),
+    #[error("Query rejected: {0}")]
+    AdmissionRejected(#[from] AdmissionError),
     /// SQL transformation failed.
+    #[error("SQL transformation failed: {0}")]
     TransformFailed(String),
     /// LDP planning failed.
-    PlanningFailed(PipelineError),
+    #[error("LDP planning failed: {0}")]
+    PlanningFailed(#[from] PipelineError),
     /// Stage execution failed.
-    ExecutionFailed(ExecutionError),
+    #[error("Execution failed: {0}")]
+    ExecutionFailed(#[from] ExecutionError),
     /// DuckDB connection error.
+    #[error("Connection failed: {0}")]
     ConnectionFailed(String),
     /// Worker communication failed.
+    #[error("Worker {0} failed: {1}")]
     WorkerFailed(WorkerId, String),
     /// Query timeout.
+    #[error("Query timeout after {0:?}")]
     Timeout(Duration),
     /// Invalid configuration.
+    #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
-}
-
-impl std::fmt::Display for CoordinatorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CoordinatorError::AdmissionRejected(e) => {
-                write!(f, "Query rejected: {}", e)
-            }
-            CoordinatorError::TransformFailed(msg) => {
-                write!(f, "SQL transformation failed: {}", msg)
-            }
-            CoordinatorError::PlanningFailed(e) => {
-                write!(f, "LDP planning failed: {}", e)
-            }
-            CoordinatorError::ExecutionFailed(e) => {
-                write!(f, "Execution failed: {}", e)
-            }
-            CoordinatorError::ConnectionFailed(msg) => {
-                write!(f, "Connection failed: {}", msg)
-            }
-            CoordinatorError::WorkerFailed(worker, msg) => {
-                write!(f, "Worker {} failed: {}", worker, msg)
-            }
-            CoordinatorError::Timeout(duration) => {
-                write!(f, "Query timeout after {:?}", duration)
-            }
-            CoordinatorError::InvalidConfig(msg) => {
-                write!(f, "Invalid configuration: {}", msg)
-            }
-        }
-    }
-}
-
-impl std::error::Error for CoordinatorError {}
-
-impl From<AdmissionError> for CoordinatorError {
-    fn from(err: AdmissionError) -> Self {
-        CoordinatorError::AdmissionRejected(err)
-    }
-}
-
-impl From<PipelineError> for CoordinatorError {
-    fn from(err: PipelineError) -> Self {
-        CoordinatorError::PlanningFailed(err)
-    }
-}
-
-impl From<ExecutionError> for CoordinatorError {
-    fn from(err: ExecutionError) -> Self {
-        CoordinatorError::ExecutionFailed(err)
-    }
 }
 
 impl From<StageExecutionError> for CoordinatorError {
@@ -1222,12 +1179,10 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         const DEFAULT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 
         // Compute capacity in number of batches
-        let capacity = (target_buffer_bytes / DEFAULT_BATCH_BYTES)
+        (target_buffer_bytes / DEFAULT_BATCH_BYTES)
             .max(2)   // Minimum 2 batches
             .min(64)  // Maximum 64 batches
-            as usize;
-
-        capacity
+            as usize
     }
 
     /// Resolve input streams for a stage from inter-stage channels.

@@ -70,13 +70,11 @@ impl StarRocksJdbcOptions {
         let max_conn = pool_opts
             .and_then(|p| p.max_connections)
             .unwrap_or(DEFAULT_MAX_CONNECTIONS)
-            .max(1)
-            .min(100);
+            .clamp(1, 100);
 
         let min_conn = pool_opts
             .and_then(|p| p.min_connections)
             .unwrap_or(DEFAULT_MIN_CONNECTIONS)
-            .max(0)
             .min(max_conn);
 
         let acquire_to = pool_opts
@@ -102,8 +100,7 @@ impl StarRocksJdbcOptions {
         let batch_sz = pool_opts
             .and_then(|p| p.batch_size.map(|b| b as usize))
             .unwrap_or(DEFAULT_BATCH_SIZE)
-            .max(1)
-            .min(100_000);
+            .clamp(1, 100_000);
 
         Self {
             max_connections: max_conn,
@@ -201,7 +198,7 @@ impl StarRocksJdbcClient {
             );
 
             let connect_opts =
-                MySqlConnectOptions::from_str(&uri).map_err(|e| SourceError::Config {
+                MySqlConnectOptions::from_str(uri).map_err(|e| SourceError::Config {
                     catalog: "jdbc".to_string(),
                     reason: format!("invalid MySQL URI '{}': {}", uri, e),
                 })?;

@@ -175,10 +175,8 @@ impl PredicateAnalyzer {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 // Add table name
-                if let Some(last) = name.0.last() {
-                    if let ObjectNamePart::Identifier(ident) = last {
-                        refs.insert(ident.value.to_lowercase());
-                    }
+                if let Some(ObjectNamePart::Identifier(ident)) = name.0.last() {
+                    refs.insert(ident.value.to_lowercase());
                 }
                 // Add alias if present
                 if let Some(a) = alias {
@@ -192,10 +190,10 @@ impl PredicateAnalyzer {
                 }
             }
             // Derived tables (subqueries) don't expose their inner tables to outer scope
-            TableFactor::Derived { alias, .. } => {
-                if let Some(a) = alias {
-                    refs.insert(a.name.value.to_lowercase());
-                }
+            TableFactor::Derived {
+                alias: Some(a), ..
+            } => {
+                refs.insert(a.name.value.to_lowercase());
             }
             _ => {}
         }

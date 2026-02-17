@@ -165,32 +165,21 @@ impl<E: StageExecutor> LdpExecutor<E> {
 }
 
 /// Error during LDP execution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ExecutionError {
     /// Stage not found in plan.
+    #[error("Stage {0} not found")]
     StageNotFound(StageId),
     /// Stage execution failed.
+    #[error("Stage {0} execution failed: {1}")]
     StageFailed(StageId, String),
     /// Exchange execution failed.
+    #[error("Exchange failed: {0}")]
     ExchangeFailed(String),
     /// Plan is invalid.
+    #[error("Invalid plan: {0}")]
     InvalidPlan(String),
 }
-
-impl std::fmt::Display for ExecutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExecutionError::StageNotFound(id) => write!(f, "Stage {} not found", id),
-            ExecutionError::StageFailed(id, msg) => {
-                write!(f, "Stage {} execution failed: {}", id, msg)
-            }
-            ExecutionError::ExchangeFailed(msg) => write!(f, "Exchange failed: {}", msg),
-            ExecutionError::InvalidPlan(msg) => write!(f, "Invalid plan: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ExecutionError {}
 
 /// Convenience function to create and run an executor with the local backend.
 pub async fn execute_local(plan: &LdpPlan) -> Result<Vec<RecordBatch>, ExecutionError> {

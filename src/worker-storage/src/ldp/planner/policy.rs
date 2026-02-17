@@ -298,9 +298,9 @@ mod tests {
         let policy = PlannerPolicy::default();
 
         // Within both limits
-        assert!(policy.can_gather(10_000_000, 1 * 1024 * 1024 * 1024));
+        assert!(policy.can_gather(10_000_000, 1024 * 1024 * 1024));
         // Over row limit
-        assert!(!policy.can_gather(100_000_000, 1 * 1024 * 1024 * 1024));
+        assert!(!policy.can_gather(100_000_000, 1024 * 1024 * 1024));
         // Over byte limit
         assert!(!policy.can_gather(10_000_000, 10 * 1024 * 1024 * 1024));
     }
@@ -353,7 +353,7 @@ mod tests {
         // 30M rows * 2 = 60M > 50M limit
         assert!(!policy.can_gather_with_safety(
             30_000_000,
-            1 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
             false, // uncertain
         ));
 
@@ -361,7 +361,7 @@ mod tests {
         // 20M rows * 2 = 40M < 50M limit
         assert!(policy.can_gather_with_safety(
             20_000_000,
-            1 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
             false, // uncertain
         ));
     }
