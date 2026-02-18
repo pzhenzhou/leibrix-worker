@@ -354,8 +354,9 @@ mod tests {
         ]));
         let sql = build_create_table_sql("test_table", &schema, true).unwrap();
         assert!(sql.contains("CREATE TEMPORARY TABLE"));
-        assert!(sql.contains("id INTEGER NOT NULL"));
-        assert!(sql.contains("name VARCHAR"));
+        // Field names are double-quoted by quote_ident to handle special chars and reserved words
+        assert!(sql.contains("\"id\" INTEGER NOT NULL"));
+        assert!(sql.contains("\"name\" VARCHAR"));
     }
 
     #[test]

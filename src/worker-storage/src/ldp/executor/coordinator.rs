@@ -1496,14 +1496,26 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     
     /// Cancel a specific stage
     async fn cancel_stage(&self, query_id: &str, stage_id: StageId) -> Result<(), CoordinatorError> {
-        // For distributed execution, send cancellation to workers via Flight
+        // For distributed execution, propagate cancellation to all participant workers via Flight
         if self.config.distributed {
-            // In a real implementation, this would send a cancel action to workers
-            warn!(
-                query_id = %query_id,
-                stage_id = %stage_id,
-                "Distributed stage cancellation not fully implemented"
-            );
+            let pool = Arc::clone(&self.connection_pool);
+            let query_id_owned = query_id.to_string();
+            tokio::spawn(async move {
+                let workers = pool.worker_ids().await;
+                for worker_id in workers {
+                    if let Ok(mut conn) = pool.get_connection(&worker_id).await {
+                        let body = serde_json::json!({ "query_id": query_id_owned })
+                            .to_string()
+                            .into_bytes();
+                        let action = arrow_flight::Action {
+                            r#type: "cancel_query".to_string(),
+                            body: body.into(),
+                        };
+                        // Best-effort: ignore errors since the worker may have already finished
+                        let _ = conn.client.do_action(action).await;
+                    }
+                }
+            });
         } else {
             // For local execution, cancel via monitor
             if let Some(monitor) = {

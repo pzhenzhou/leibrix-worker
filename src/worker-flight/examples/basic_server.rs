@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
 use worker_flight::{FlightServerBuilder, FlightServerConfig};
 use worker_storage::engine::duckdb::{DuckDBConfig, DuckDBQueryEngine, SharedDatabase};
 use worker_storage::sql::{RegisteredDataset, SqlTransformer};
@@ -67,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Create query engine
     println!("\n🔧 Creating query engine...");
-    let query_engine = Arc::new(DuckDBQueryEngine::new(shared_db, 32));
+    let query_engine = Arc::new(DuckDBQueryEngine::new(Arc::clone(&shared_db), 32));
     println!("✓ Query engine ready with 32 max concurrent queries");
 
     // 4. Register logical datasets with SQL transformer
@@ -77,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         "sales_data".to_string(),
         "dt".to_string(),
     ));
-    let sql_transformer = Arc::new(sql_transformer);
+    let sql_transformer = Arc::new(RwLock::new(sql_transformer));
     println!("✓ Registered logical dataset: sales_data");
 
     // 5. Configure Flight server
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         query_engine,
         sql_transformer,
         "test-tenant".to_string(),
+        shared_db,
     )
     .run_with_shutdown(async {
         tokio::signal::ctrl_c()

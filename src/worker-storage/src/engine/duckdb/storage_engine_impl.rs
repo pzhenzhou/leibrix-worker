@@ -11,6 +11,10 @@ use tokio::sync::oneshot;
 use tracing::{error, info};
 
 /// An in-memory DuckDB storage engine for the acceleration layer.
+///
+/// Cloning produces a second handle to the **same** background engine thread.
+/// All clones share the same `in_progress` / `committed` state via the channel.
+#[derive(Clone)]
 pub struct MemoryDuckDBEngine {
     com_tx: sync::mpsc::Sender<EngineCom>,
     shared_db: Arc<SharedDatabase>,

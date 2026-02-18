@@ -353,6 +353,13 @@ pub fn cut_into_stages(
     // Assign target workers to stages based on distribution annotations
     assign_stage_workers(&mut plan, root, &ctx);
 
+    // The root stage produces the final output for the client.
+    // It must use Stream output regardless of its distribution annotation,
+    // because there is no downstream exchange that would consume partitioned data.
+    if let Some(root_stage) = plan.stages.iter_mut().find(|s| s.stage_id == plan.root_stage) {
+        root_stage.output = StageOutput::Stream;
+    }
+
     plan
 }
 
@@ -744,6 +751,26 @@ fn filter_ctes_for_stage(plan: &LogicalPlan, context: &PlanContext) -> PlanConte
     }
 }
 
+/// Returns true when a plan contains only exchange reads — no local catalog scans.
+/// Used to decide whether a SubqueryScan alias should be treated as a CTE reference.
+fn is_purely_exchange_backed(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::ExchangeRead { .. } => true,
+        LogicalPlan::Scan { .. } => false,
+        LogicalPlan::SubqueryScan { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Window { input, .. } => is_purely_exchange_backed(input),
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::SetOp { left, right, .. } => {
+            is_purely_exchange_backed(left) && is_purely_exchange_backed(right)
+        }
+    }
+}
+
 /// Collect all table names from Scan nodes in a plan.
 fn collect_scan_names(plan: &LogicalPlan) -> Vec<String> {
     let mut names = Vec::new();
@@ -766,7 +793,14 @@ fn collect_scan_names_recursive(plan: &LogicalPlan, names: &mut Vec<String>) {
         | Limit { input, .. }
         | Window { input, .. } => collect_scan_names_recursive(input, names),
         SubqueryScan { alias, input } => {
-            names.push(alias.name.value.clone());
+            // Only treat the alias as a potential CTE reference when the input
+            // contains at least one local scan.  If the subquery wraps an
+            // ExchangeRead (the exchange-backed case produced by stage cutting),
+            // the SubqueryScan alias is just a table alias for the exchange temp
+            // table — it does NOT reference a CTE body that needs to be re-emitted.
+            if !is_purely_exchange_backed(input) {
+                names.push(alias.name.value.clone());
+            }
             collect_scan_names_recursive(input, names);
         }
         Join { left, right, .. } | SetOp { left, right, .. } => {
@@ -920,7 +954,13 @@ fn assign_stage_workers(
 ) {
     for stage in &mut plan.stages {
         if let Some(ann_ref) = ctx.stage_annotations.get(&stage.stage_id) {
-            stage.target_workers = ann_ref.distribution.workers().to_vec();
+            let mut workers = ann_ref.distribution.workers().to_vec();
+            // Deduplicate workers: each worker should execute the stage only once.
+            // Duplicates arise when metadata is unavailable and the planner fills
+            // all partition slots with the coordinator.
+            workers.sort();
+            workers.dedup();
+            stage.target_workers = workers;
         }
 
         // If no workers assigned (shouldn't happen), use coordinator

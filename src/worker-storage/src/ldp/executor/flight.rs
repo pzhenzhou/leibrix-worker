@@ -224,32 +224,49 @@ impl FlightStageExecutor {
             body: request_bytes.into(),
         };
 
-        let response = conn
-            .client
-            .do_action(action)
-            .await
-            .map_err(|e| {
+        let response = match conn.client.do_action(action).await {
+            Ok(r) => r,
+            Err(e) => {
                 error!(
                     query_id = query_id,
                     stage_id = %stage.stage_id,
                     worker_id = %worker_id,
                     error = %e,
-                    "DoAction failed"
+                    "DoAction failed — evicting stale connection"
                 );
-                StageExecutionError::ExecutionFailed(format!("DoAction failed: {}", e))
-            })?;
+                self.connection_pool.remove_connection(worker_id).await;
+                return Err(StageExecutionError::WorkerUnavailable {
+                    worker_id: worker_id.clone(),
+                    detail: format!("DoAction failed: {}", e),
+                });
+            }
+        };
 
         // Process response stream
         let mut stream = response.into_inner();
-        let result = stream
-            .message()
-            .await
-            .map_err(|e| {
-                StageExecutionError::ExecutionFailed(format!("Failed to read response: {}", e))
-            })?
-            .ok_or_else(|| {
-                StageExecutionError::ExecutionFailed("Empty response from submit_stage".into())
-            })?;
+        let result = match stream.message().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                self.connection_pool.remove_connection(worker_id).await;
+                return Err(StageExecutionError::ExecutionFailed(
+                    "Empty response from submit_stage".into(),
+                ));
+            }
+            Err(e) => {
+                error!(
+                    query_id = query_id,
+                    stage_id = %stage.stage_id,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "Stream read failed — evicting stale connection"
+                );
+                self.connection_pool.remove_connection(worker_id).await;
+                return Err(StageExecutionError::ExecutionFailed(format!(
+                    "Failed to read response: {}",
+                    e
+                )));
+            }
+        };
 
         // Deserialize response
         let submit_response = deserialize_submit_stage_response(&result.body).map_err(|e| {
@@ -345,12 +362,8 @@ impl StageExecutor for FlightStageExecutor {
             "Fetching output from worker"
         );
 
-        // Get the cached result ticket - ticket_id contains the query_id we need
-        // Parse query_id from the ticket_id format: "stage_{stage_id}_worker_{worker_id}"
-        // We need to track which query this ticket belongs to
-        // For now, we reconstruct from stage_id (this is a limitation we'll address)
-        let query_id = format!("query_{}", ticket.stage_id);
-        let ticket_key = Self::ticket_key(&query_id, ticket.stage_id, &ticket.worker_id);
+        // Use the real query_id from the ticket (set when the ticket was created by submit_to_worker)
+        let ticket_key = Self::ticket_key(&ticket.query_id, ticket.stage_id, &ticket.worker_id);
 
         let ticket_bytes = {
             let cache = self.ticket_cache.read().await;

@@ -88,11 +88,12 @@ pub fn create_epoch_table_macro(
     epoch_tables: &[String],
 ) -> Result<(), MacroError> {
     if epoch_tables.is_empty() {
-        // Create an empty macro that returns no rows
+        // Create an empty macro that returns no rows.
+        // `VALUES()` is invalid in DuckDB; use a WHERE 1=0 guard instead.
         let macro_sql = format!(
             r#"
             CREATE OR REPLACE MACRO scan_{}(start_date, end_date) AS TABLE (
-                SELECT * FROM (VALUES()) AS t LIMIT 0
+                SELECT * FROM (SELECT 0 AS _empty) WHERE 1=0
             )
             "#,
             dataset_name
@@ -217,9 +218,11 @@ mod tests {
 
         assert!(result.is_ok());
 
-        // Test that the macro works
+        // Test that the macro works.
+        // Cast dt to VARCHAR because the DuckDB Rust driver does not implement
+        // FromSql for Date32 directly; casting avoids InvalidColumnType errors.
         let mut stmt = conn
-            .prepare("SELECT * FROM scan_test_dataset('2022-01-01', '2022-02-01')")
+            .prepare("SELECT id, CAST(dt AS VARCHAR) FROM scan_test_dataset('2022-01-01', '2022-02-01')")
             .unwrap();
         let rows: Vec<(i32, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -229,6 +232,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "2022-01-01");
     }
 
     #[tokio::test]
