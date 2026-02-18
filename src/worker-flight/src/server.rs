@@ -9,6 +9,8 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use tonic::transport::{Identity, Server};
 use tracing::{info, warn};
 
+use tokio::sync::RwLock;
+use worker_storage::engine::duckdb::SharedDatabase;
 use worker_storage::engine::query_engine::QueryEngine;
 use worker_storage::sql::SqlTransformer;
 
@@ -22,8 +24,9 @@ where
 {
     config: FlightServerConfig,
     query_engine: Arc<Q>,
-    sql_transformer: Arc<SqlTransformer>,
+    sql_transformer: Arc<RwLock<SqlTransformer>>,
     tenant_id: String,
+    shared_db: Arc<SharedDatabase>,
 }
 
 impl<Q> FlightServerBuilder<Q>
@@ -34,14 +37,16 @@ where
     pub fn new(
         config: FlightServerConfig,
         query_engine: Arc<Q>,
-        sql_transformer: Arc<SqlTransformer>,
+        sql_transformer: Arc<RwLock<SqlTransformer>>,
         tenant_id: String,
+        shared_db: Arc<SharedDatabase>,
     ) -> Self {
         Self {
             config,
             query_engine,
             sql_transformer,
             tenant_id,
+            shared_db,
         }
     }
 
@@ -56,6 +61,7 @@ where
             self.query_engine,
             self.sql_transformer,
             self.tenant_id.clone(),
+            self.shared_db,
         );
 
         let flight_server = FlightServiceServer::new(flight_service);
@@ -114,6 +120,7 @@ where
             self.query_engine,
             self.sql_transformer,
             self.tenant_id.clone(),
+            self.shared_db,
         );
 
         let flight_server = FlightServiceServer::new(flight_service);

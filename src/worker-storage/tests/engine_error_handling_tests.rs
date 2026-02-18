@@ -83,32 +83,57 @@ async fn test_error_drop_nonexistent_epoch() {
 
 #[tokio::test]
 async fn test_error_drop_in_progress_epoch() {
-    // Arrange
+    use arrow_array::RecordBatch;
+    use futures_util::stream::unfold;
+    use tokio::sync::mpsc;
+    use worker_storage::engine::storage_engine::{RecordBatchStream, StorageError};
+
     let engine = create_test_engine();
     let schema = create_test_schema();
-
-    // Create a large stream that takes time to process
-    let mut batches = Vec::new();
-    for i in 0..20 {
-        batches.push(create_test_batch(schema.clone(), i * 5000, 5000));
-    }
-    let stream = create_test_stream(batches);
     let epoch = create_test_epoch("dataset_inprog", "epoch_001");
 
-    // Start ingestion in background (don't await)
-    let _create_handle = tokio::spawn({
-        let engine_clone = create_test_engine();
-        async move {
-            engine_clone
-                .create_epoch_table("dataset_inprog".to_string(), epoch, stream)
-                .await
-        }
+    // Build a channel-backed stream so the test controls exactly when batches
+    // are delivered to the ingestion task.  The sequence is:
+    //   1. One batch is pre-loaded → ingestion reads it, enqueues StartEpoch +
+    //      IngestBatch to the engine, then blocks waiting for the next batch.
+    //   2. While the ingestion task is suspended, the test sends DropEpoch.
+    //   3. The engine's FIFO channel guarantees StartEpoch is processed before
+    //      DropEpoch, so the epoch is in `in_progress` when DropEpoch arrives.
+    //   4. Drop must fail with "in progress" / "Cannot drop".
+    //   5. Dropping `batch_tx` closes the stream so ingestion can finish cleanly.
+    let (batch_tx, batch_rx) = mpsc::channel::<RecordBatch>(1);
+
+    let ingest_stream: RecordBatchStream = Box::pin(unfold(batch_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|batch| (Ok::<_, StorageError>(batch), rx))
+    }));
+
+    // Pre-load one batch so the ingestion task has something to start with.
+    batch_tx
+        .send(create_test_batch(schema, 0, 5000))
+        .await
+        .unwrap();
+
+    // Spawn ingestion on the same engine clone so the state is shared.
+    let engine_clone = engine.clone();
+    let _ingest_handle = tokio::spawn(async move {
+        engine_clone
+            .create_epoch_table("dataset_inprog".to_string(), epoch, ingest_stream)
+            .await
     });
 
-    // Wait a bit to ensure ingestion has started
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Yield to the scheduler so the ingestion task runs until it suspends.
+    // With tokio's cooperative scheduler the task will:
+    //   - consume the pre-loaded batch
+    //   - send StartEpoch + IngestBatch to the engine channel (non-blocking,
+    //     channel has capacity)
+    //   - call stream.next() → channel empty → task suspends
+    // At that point we regain control with StartEpoch already in the engine's
+    // FIFO queue ahead of the DropEpoch we are about to send.
+    tokio::task::yield_now().await;
 
-    // Act - Try to drop while in progress
+    // Act — drop while in progress.
     let drop_result = engine
         .drop_epoch_table("dataset_inprog".to_string(), "epoch_001".to_string())
         .await;
@@ -124,6 +149,10 @@ async fn test_error_drop_in_progress_epoch() {
         "Error should mention in-progress state, got: {}",
         error_msg
     );
+
+    // Close the stream so the ingestion task can terminate cleanly (it will
+    // finish with the single batch already sent).
+    drop(batch_tx);
 }
 
 #[tokio::test]

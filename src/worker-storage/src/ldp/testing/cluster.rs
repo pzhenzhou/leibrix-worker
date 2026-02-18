@@ -190,9 +190,11 @@ impl TestCluster {
         self.workers.get_mut(worker_id)
     }
 
-    /// Get all worker IDs.
+    /// Get all worker IDs (sorted for deterministic ordering).
     pub fn worker_ids(&self) -> Vec<WorkerId> {
-        self.workers.keys().map(|k| WorkerId::from(k.as_str())).collect()
+        let mut ids: Vec<WorkerId> = self.workers.keys().map(|k| WorkerId::from(k.as_str())).collect();
+        ids.sort();
+        ids
     }
 
     /// Execute a query using the coordinator.

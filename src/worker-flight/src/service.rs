@@ -22,8 +22,9 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
 
+use worker_storage::engine::duckdb::SharedDatabase;
 use worker_storage::engine::query_engine::QueryEngine;
-use worker_storage::sql::SqlTransformer;
+use worker_storage::sql::{RegisteredDataset, SqlTransformer};
 
 use crate::error::{map_query_error_to_status, map_transform_error_to_status};
 use crate::ticket::{FlightTicket, QueryTicket, StageResultTicket};
@@ -139,6 +140,27 @@ impl StageResultStore {
         self.results.write().await.remove(key)
     }
 
+    /// Get the batches for a stage result without removing it (non-destructive read).
+    ///
+    /// Returns `None` if the result is not cached. The caller should retry with DoGet
+    /// if retries are needed — the result remains available until TTL expiry.
+    pub async fn get_batches(&self, key: &StageResultKey) -> Option<Vec<RecordBatch>> {
+        self.results
+            .read()
+            .await
+            .get(key)
+            .map(|r| r.batches.clone())
+    }
+
+    /// Evict results older than `ttl`. Called from the background cleanup task.
+    pub async fn evict_expired(&self, ttl: Duration) {
+        let now = Instant::now();
+        self.results
+            .write()
+            .await
+            .retain(|_, result| now.duration_since(result.created_at) < ttl);
+    }
+
     /// Check if a result exists.
     pub async fn contains(&self, key: &StageResultKey) -> bool {
         self.results.read().await.contains_key(key)
@@ -172,11 +194,13 @@ where
     Q: QueryEngine,
 {
     query_engine: Arc<Q>,
-    sql_transformer: Arc<SqlTransformer>,
+    sql_transformer: Arc<RwLock<SqlTransformer>>,
     /// Tenant ID bound at startup (shared-nothing architecture)
     tenant_id: String,
     /// Cache for stage execution results (for LDP DoGet retrieval)
     stage_results: Arc<StageResultStore>,
+    /// Shared DuckDB database used for stage execution (gives access to epoch tables and macros)
+    shared_db: Arc<SharedDatabase>,
 }
 
 impl<Q> WorkerFlightService<Q>
@@ -187,19 +211,40 @@ where
     ///
     /// # Arguments
     /// * `query_engine` - The query engine to execute SQL queries
-    /// * `sql_transformer` - Transforms logical tables to macro calls
+    /// * `sql_transformer` - Transforms logical tables to macro calls (wrapped in RwLock for runtime updates)
     /// * `tenant_id` - Tenant ID for this worker (validated on each request)
+    /// * `shared_db` - Shared DuckDB database (gives stage execution access to epoch tables and macros)
     pub fn new(
         query_engine: Arc<Q>,
-        sql_transformer: Arc<SqlTransformer>,
+        sql_transformer: Arc<RwLock<SqlTransformer>>,
         tenant_id: String,
+        shared_db: Arc<SharedDatabase>,
     ) -> Self {
+        let stage_results = Arc::new(StageResultStore::new());
+
+        // Spawn background TTL eviction task for stage results
+        let store_clone = Arc::clone(&stage_results);
+        tokio::spawn(async move {
+            let ttl = Duration::from_secs(300);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                store_clone.evict_expired(ttl).await;
+            }
+        });
+
         Self {
             query_engine,
             sql_transformer,
             tenant_id,
-            stage_results: Arc::new(StageResultStore::new()),
+            stage_results,
+            shared_db,
         }
+    }
+
+    /// Register a dataset at runtime (called when control plane sends DataAssignmentEvent).
+    pub async fn register_dataset(&self, dataset: RegisteredDataset) {
+        self.sql_transformer.write().await.register_dataset(dataset);
     }
 
     /// Validate that the request tenant matches this worker's tenant.
@@ -211,6 +256,29 @@ where
             ))));
         }
         Ok(())
+    }
+
+    /// Extract and validate the `x-tenant-id` gRPC metadata header.
+    ///
+    /// Used by metadata RPCs (`list_flights`, `get_flight_info`, `get_schema`) that do
+    /// not carry a tenant in their payload.  Returns `PERMISSION_DENIED` on mismatch
+    /// and `UNAUTHENTICATED` when the header is absent.
+    #[allow(clippy::result_large_err)]
+    fn validate_tenant_from_metadata(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(), Status> {
+        match metadata.get("x-tenant-id") {
+            Some(value) => {
+                let tenant = value.to_str().map_err(|_| {
+                    Status::invalid_argument("x-tenant-id header contains invalid UTF-8")
+                })?;
+                self.validate_tenant(tenant).map_err(|e| *e)
+            }
+            None => Err(Status::unauthenticated(
+                "Missing required x-tenant-id metadata header",
+            )),
+        }
     }
 
     /// Handle the `submit_stage` DoAction.
@@ -456,7 +524,8 @@ where
 
     /// Execute a stage's SQL with DuckDB and exchange inputs.
     ///
-    /// This method runs in a blocking task to avoid blocking the async runtime.
+    /// Uses the shared database so stage SQL can reference epoch tables and scan macros.
+    /// Runs in a blocking task to avoid blocking the async runtime.
     async fn execute_stage_with_duckdb(
         &self,
         query_id: &str,
@@ -464,7 +533,6 @@ where
         stage_sql: &str,
         exchange_inputs: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, String> {
-        use duckdb::Connection;
         use worker_storage::engine::duckdb::arrow_utils::{
             drop_temp_table, register_arrow_batches,
         };
@@ -473,12 +541,15 @@ where
         let stage_sql = stage_sql.to_string();
         let exchange_inputs = exchange_inputs.clone();
         let query_id = query_id.to_string();
+        let shared_db = Arc::clone(&self.shared_db);
 
         // Execute in blocking task (DuckDB operations are synchronous)
         tokio::task::spawn_blocking(move || {
-            // Create DuckDB connection
-            let conn = Connection::open_in_memory()
-                .map_err(|e| format!("Failed to create DuckDB connection: {}", e))?;
+            // Get a pooled connection from the shared database so stage SQL has
+            // access to epoch tables (sales_data__epoch_*) and scan macros.
+            let conn = shared_db
+                .get()
+                .map_err(|e| format!("Failed to get pooled DB connection: {}", e))?;
 
             debug!(
                 query_id = %query_id,
@@ -563,6 +634,8 @@ where
         // Transform SQL: logical tables -> macro calls
         let transform_result = self
             .sql_transformer
+            .read()
+            .await
             .transform(&query_ticket.sql)
             .map_err(map_transform_error_to_status)?;
 
@@ -605,9 +678,9 @@ where
             "Handling stage result DoGet"
         );
 
-        // Look up the cached stage result
+        // Look up the cached stage result (non-destructive — TTL eviction handles cleanup)
         let key = StageResultKey::from_ticket(&stage_ticket);
-        let cached_result = self.stage_results.take(&key).await.ok_or_else(|| {
+        let batches = self.stage_results.get_batches(&key).await.ok_or_else(|| {
             warn!(
                 query_id = %stage_ticket.query_id,
                 stage_id = stage_ticket.stage_id,
@@ -622,13 +695,9 @@ where
         info!(
             query_id = %stage_ticket.query_id,
             stage_id = stage_ticket.stage_id,
-            batches = cached_result.batches.len(),
-            rows = cached_result.stats.rows_produced,
+            batches = batches.len(),
             "Retrieved stage result from cache"
         );
-
-        // Convert batches to FlightData stream
-        let batches = cached_result.batches;
         
         if batches.is_empty() {
             // Return empty stream with proper type
@@ -670,10 +739,13 @@ where
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
         debug!("list_flights called");
+        self.validate_tenant_from_metadata(_request.metadata())?;
 
         // Get registered logical dataset IDs from the transformer
         let dataset_ids: Vec<String> = self
             .sql_transformer
+            .read()
+            .await
             .registered_dataset_ids()
             .into_iter()
             .collect();
@@ -698,6 +770,7 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.validate_tenant_from_metadata(request.metadata())?;
         let descriptor = request.into_inner();
         debug!(?descriptor, "get_flight_info called");
 
@@ -712,6 +785,8 @@ where
         // Transform SQL: logical tables -> macro calls
         let transform_result = self
             .sql_transformer
+            .read()
+            .await
             .transform(&sql)
             .map_err(map_transform_error_to_status)?;
 
@@ -772,6 +847,7 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
+        self.validate_tenant_from_metadata(request.metadata())?;
         let descriptor = request.into_inner();
         debug!(?descriptor, "get_schema called");
 
@@ -786,6 +862,8 @@ where
         // Transform SQL: logical tables -> macro calls
         let transform_result = self
             .sql_transformer
+            .read()
+            .await
             .transform(&sql)
             .map_err(map_transform_error_to_status)?;
 

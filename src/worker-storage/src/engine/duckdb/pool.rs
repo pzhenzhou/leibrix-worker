@@ -127,12 +127,22 @@ impl DuckDbConnectionPool {
             .config(pool_config)
             .build()?;
 
-        // Pre-populate the pool with initial connections
-        for _ in 0..config.initial_size {
+        // Pre-populate the pool by holding connections simultaneously, then
+        // releasing them all at once.  Acquiring one at a time and immediately
+        // dropping reuses the same connection; holding them forces the pool to
+        // create distinct connections.
+        //
+        // Cap at max_size: requesting more than max_size connections while
+        // holding all of them would deadlock because the pool has no spare
+        // capacity to satisfy the next get().
+        let warm_count = config.initial_size.min(config.max_size);
+        let mut warm_conns = Vec::with_capacity(warm_count);
+        for _ in 0..warm_count {
             if let Ok(conn) = pool.get().await {
-                drop(conn); // Return to pool
+                warm_conns.push(conn);
             }
         }
+        drop(warm_conns); // Return all connections to the pool at once
 
         let semaphore = Arc::new(Semaphore::new(config.max_size));
 
@@ -252,21 +262,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_acquisition() {
+        // Each connection in DuckDbConnectionPool has its own isolated in-memory
+        // database — they do NOT share state.  Use separate table names per
+        // connection and never assume data written on conn1 is visible on conn2.
         let config = DuckDbPoolConfig::default().with_max_size(2);
         let pool = DuckDbConnectionPool::new(config).await.unwrap();
-        
-        // Acquire one connection
+
+        // Acquire first connection and use it end-to-end in its own DB.
         let mut conn1 = pool.acquire().await.unwrap();
-        assert!(conn1.execute("CREATE TABLE test (id INTEGER)", &[]).is_ok());
+        assert!(conn1.execute("CREATE TABLE t1 (id INTEGER)", &[]).is_ok());
+        assert!(conn1.execute("INSERT INTO t1 VALUES (1)", &[]).is_ok());
 
-        // Acquire another connection
+        // Acquire second connection simultaneously — its own isolated DB.
         let mut conn2 = pool.acquire().await.unwrap();
-        assert!(conn2.execute("INSERT INTO test VALUES (1)", &[]).is_ok());
+        assert!(conn2.execute("CREATE TABLE t2 (id INTEGER)", &[]).is_ok());
+        assert!(conn2.execute("INSERT INTO t2 VALUES (2)", &[]).is_ok());
 
-        // Try to acquire a third connection (should work as we return first one)
+        // Return both connections to the pool, then verify we can still acquire.
         drop(conn1);
+        drop(conn2);
         let mut conn3 = pool.acquire().await.unwrap();
-        assert!(conn3.execute("SELECT * FROM test", &[]).is_ok());
+        assert!(conn3.execute("SELECT 1", &[]).is_ok());
     }
 
     #[tokio::test]

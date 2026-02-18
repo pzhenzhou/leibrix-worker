@@ -191,8 +191,16 @@ fn generate_sql(plan: &LogicalPlan, sql: &mut String) {
 
             // WHERE clause (if input has a filter, it's already in the from fragment).
 
-            // GROUP BY — GroupByExpr::Display already includes "GROUP BY".
-            write!(sql, " {}", group_by).unwrap();
+            // GROUP BY — only emit when there are grouping expressions.
+            // GroupByExpr::Expressions([], _) formats as "GROUP BY " (no columns),
+            // which DuckDB rejects with "syntax error at end of input".
+            let has_group_by = match group_by {
+                sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+                sqlparser::ast::GroupByExpr::All(_) => true,
+            };
+            if has_group_by {
+                write!(sql, " {}", group_by).unwrap();
+            }
 
             // HAVING.
             if let Some(h) = having {
