@@ -191,6 +191,7 @@ fn generate_supplier_data(row_count: usize) -> Vec<RecordBatch> {
 }
 
 async fn setup_test_cluster_with_all_tables() -> anyhow::Result<Arc<TestCluster>> {
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(
         TestCluster::builder()
             .workers(3)

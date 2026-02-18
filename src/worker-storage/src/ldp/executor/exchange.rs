@@ -23,6 +23,24 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Parameters for a distributed hash-partition exchange.
+pub struct HashPartitionRequest<'a> {
+    /// Query identifier.
+    pub query_id: &'a str,
+    /// Upstream stage that produced the data.
+    pub stage_id: StageId,
+    /// Workers that hold the upstream data.
+    pub source_workers: &'a [WorkerId],
+    /// Columns to hash-partition on.
+    pub column_refs: &'a [ColumnRef],
+    /// Total number of partitions.
+    pub num_partitions: u32,
+    /// Mapping from partition index to target worker.
+    pub partition_to_worker: &'a [WorkerId],
+    /// The local worker requesting its share of the partitions.
+    pub local_worker: &'a WorkerId,
+}
+
 /// Runtime for executing exchange operations.
 ///
 /// Handles fetching data from upstream stages and transforming it
@@ -1111,14 +1129,17 @@ impl DistributedExchangeRuntime {
     /// Record batches for the local worker's partition(s).
     pub async fn execute_hash_partition(
         &self,
-        query_id: &str,
-        stage_id: StageId,
-        source_workers: &[WorkerId],
-        column_refs: &[ColumnRef],
-        num_partitions: u32,
-        partition_to_worker: &[WorkerId],
-        local_worker: &WorkerId,
+        req: HashPartitionRequest<'_>,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
+        let HashPartitionRequest {
+            query_id,
+            stage_id,
+            source_workers,
+            column_refs,
+            num_partitions,
+            partition_to_worker,
+            local_worker,
+        } = req;
         info!(
             query_id = query_id,
             stage_id = %stage_id,
@@ -1212,15 +1233,15 @@ impl DistributedExchangeRuntime {
                 column_refs,
                 partitions,
             } => {
-                self.execute_hash_partition(
+                self.execute_hash_partition(HashPartitionRequest {
                     query_id,
-                    edge.from_stage,
+                    stage_id: edge.from_stage,
                     source_workers,
                     column_refs,
-                    *partitions,
-                    &edge.partition_to_worker,
+                    num_partitions: *partitions,
+                    partition_to_worker: &edge.partition_to_worker,
                     local_worker,
-                )
+                })
                 .await
             }
         }

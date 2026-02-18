@@ -14,6 +14,26 @@ use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::{Distribution, DistributionAnnotation, Exchange, RequiredDistribution, WorkerId};
 use crate::sql::logical_plan::ColumnRef;
 
+/// Context bundle for determining exchange decisions for a join operator.
+pub struct JoinExchangeContext<'a> {
+    /// Statistics annotation for the left input.
+    pub left_annotation: &'a DistributionAnnotation,
+    /// Statistics annotation for the right input.
+    pub right_annotation: &'a DistributionAnnotation,
+    /// Actual output distribution of the left input.
+    pub left_actual: &'a Distribution,
+    /// Actual output distribution of the right input.
+    pub right_actual: &'a Distribution,
+    /// Join keys for the left side.
+    pub left_keys: &'a [ColumnRef],
+    /// Join keys for the right side.
+    pub right_keys: &'a [ColumnRef],
+    /// Planner policy (thresholds, limits).
+    pub policy: &'a PlannerPolicy,
+    /// Workers that will execute the join stage.
+    pub target_workers: &'a [WorkerId],
+}
+
 /// Result of exchange determination.
 #[derive(Clone, Debug)]
 pub enum ExchangeDecision {
@@ -219,15 +239,18 @@ fn determine_hash_or_broadcast_exchange(
 /// # Returns
 /// (left_decision, right_decision) - Exchange decisions for each side
 pub fn determine_join_exchanges(
-    left_annotation: &DistributionAnnotation,
-    right_annotation: &DistributionAnnotation,
-    left_actual: &Distribution,
-    right_actual: &Distribution,
-    left_keys: &[ColumnRef],
-    right_keys: &[ColumnRef],
-    policy: &PlannerPolicy,
-    target_workers: &[WorkerId],
+    ctx: JoinExchangeContext<'_>,
 ) -> (ExchangeDecision, ExchangeDecision) {
+    let JoinExchangeContext {
+        left_annotation,
+        right_annotation,
+        left_actual,
+        right_actual,
+        left_keys,
+        right_keys,
+        policy,
+        target_workers,
+    } = ctx;
     // === Colocation Optimization 1: Replicated build side ===
     // If the right side is already replicated by control-plane placement,
     // no exchange is needed for either side.
@@ -609,16 +632,16 @@ mod tests {
         let left_key = ColumnRef { table: None, column: "col0".into() };
         let right_key = ColumnRef { table: None, column: "col0".into() };
 
-        let (left_decision, right_decision) = determine_join_exchanges(
-            &left_annotation,
-            &right_annotation,
-            &left_actual,
-            &right_actual,
-            &[left_key],
-            &[right_key],
-            &policy,
-            &["w1".into(), "w2".into()],
-        );
+        let (left_decision, right_decision) = determine_join_exchanges(JoinExchangeContext {
+            left_annotation: &left_annotation,
+            right_annotation: &right_annotation,
+            left_actual: &left_actual,
+            right_actual: &right_actual,
+            left_keys: &[left_key],
+            right_keys: &[right_key],
+            policy: &policy,
+            target_workers: &["w1".into(), "w2".into()],
+        });
 
         assert!(matches!(left_decision, ExchangeDecision::None));
         assert!(matches!(right_decision, ExchangeDecision::None));
@@ -652,16 +675,16 @@ mod tests {
         let left_key = ColumnRef { table: None, column: "col0".into() };
         let right_key = ColumnRef { table: None, column: "col0".into() };
 
-        let (left_decision, right_decision) = determine_join_exchanges(
-            &left_annotation,
-            &right_annotation,
-            &left_actual,
-            &right_actual,
-            &[left_key],
-            &[right_key],
-            &policy,
-            &["w1".into(), "w2".into(), "w3".into()],
-        );
+        let (left_decision, right_decision) = determine_join_exchanges(JoinExchangeContext {
+            left_annotation: &left_annotation,
+            right_annotation: &right_annotation,
+            left_actual: &left_actual,
+            right_actual: &right_actual,
+            left_keys: &[left_key],
+            right_keys: &[right_key],
+            policy: &policy,
+            target_workers: &["w1".into(), "w2".into(), "w3".into()],
+        });
 
         assert!(matches!(left_decision, ExchangeDecision::None));
         assert!(matches!(right_decision, ExchangeDecision::None));

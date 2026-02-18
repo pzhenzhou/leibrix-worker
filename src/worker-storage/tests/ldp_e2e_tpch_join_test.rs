@@ -331,6 +331,7 @@ async fn test_tpch_inspired_join_two_large_tables() {
     println!("\n=== TPC-H Inspired Join Test: Two Large Tables ===\n");
 
     // 1. Create cluster with 3 workers
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(
         TestCluster::builder()
             .workers(3)

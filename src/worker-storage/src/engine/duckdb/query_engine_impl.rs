@@ -14,6 +14,9 @@ const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
 /// Default memory limit per query if not specified (1024 MB)
 const DEFAULT_QUERY_MEMORY_MB: usize = 1024;
 
+/// Result type for streaming record batches out of the query engine.
+type BatchResult = Result<arrow::array::RecordBatch, QueryError>;
+
 pub struct DuckDBQueryEngine {
     /// Shared database handle for creating read connections
     pub shared_db: Arc<SharedDatabase>,
@@ -205,8 +208,8 @@ impl QueryEngine for DuckDBQueryEngine {
                 .map_err(|_| QueryError::Internal("query limiter closed".into()))?;
 
             let (tx, rx): (
-                tokio::sync::mpsc::Sender<Result<arrow::array::RecordBatch, QueryError>>,
-                tokio::sync::mpsc::Receiver<Result<arrow::array::RecordBatch, QueryError>>,
+                tokio::sync::mpsc::Sender<BatchResult>,
+                tokio::sync::mpsc::Receiver<BatchResult>,
             ) = tokio::sync::mpsc::channel(100);
             let tx_blocking = tx.clone(); // Clone for blocking task
 

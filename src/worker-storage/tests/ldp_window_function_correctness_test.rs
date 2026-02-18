@@ -110,6 +110,7 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
 }
 
 async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(
         TestCluster::builder()
             .workers(3)

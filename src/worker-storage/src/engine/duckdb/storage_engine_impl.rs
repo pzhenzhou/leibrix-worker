@@ -220,17 +220,15 @@ impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
         }
     }
 
-    fn shutdown(self) -> impl Future<Output = anyhow::Result<()>> + Send {
-        async move {
-            let (resp_tx, resp_rx) = oneshot::channel();
-            self.com_tx
-                .send(EngineCom::Shutdown { resp: resp_tx })
-                .await
-                .map_err(|_| anyhow::anyhow!("Engine channel closed"))?;
+    async fn shutdown(self) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.com_tx
+            .send(EngineCom::Shutdown { resp: resp_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine channel closed"))?;
 
-            resp_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("Response channel closed"))?
-        }
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Response channel closed"))?
     }
 }

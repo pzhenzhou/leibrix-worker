@@ -14,7 +14,7 @@
 //!   5. Return annotated node with any inserted exchanges
 //! ```
 
-use crate::ldp::planner::exchange::{determine_exchange, determine_join_exchanges, ExchangeDecision, RejectReason};
+    use crate::ldp::planner::exchange::{determine_exchange, determine_join_exchanges, ExchangeDecision, JoinExchangeContext, RejectReason};
 use crate::ldp::planner::metadata::Metadata;
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::requirements::get_logical_plan_requirements;
@@ -262,16 +262,16 @@ fn handle_join_exchanges(
         _ => return Ok((ExchangeDecision::None, ExchangeDecision::None)),
     };
 
-    let (left_decision, right_decision) = determine_join_exchanges(
-        &left_child.annotation,
-        &right_child.annotation,
-        &left_child.annotation.distribution,
-        &right_child.annotation.distribution,
-        &left_keys,
-        &right_keys,
+    let (left_decision, right_decision) = determine_join_exchanges(JoinExchangeContext {
+        left_annotation: &left_child.annotation,
+        right_annotation: &right_child.annotation,
+        left_actual: &left_child.annotation.distribution,
+        right_actual: &right_child.annotation.distribution,
+        left_keys: &left_keys,
+        right_keys: &right_keys,
         policy,
         target_workers,
-    );
+    });
 
     // Check for rejections
     if let ExchangeDecision::Reject(reason) = &left_decision {

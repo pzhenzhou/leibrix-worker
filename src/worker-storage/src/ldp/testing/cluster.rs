@@ -150,6 +150,7 @@ impl TestCluster {
         .with_retries(1);
         let metadata = Arc::new(crate::ldp::planner::metadata::InMemoryMetadata::new());
         
+        #[allow(clippy::arc_with_non_send_sync)]
         let coordinator = Arc::new(
             crate::ldp::executor::coordinator::LdpCoordinator::new(coordinator_config, metadata.clone())
                 .map_err(|e| format!("Failed to create coordinator: {:?}", e))?

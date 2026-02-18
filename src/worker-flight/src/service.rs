@@ -148,6 +148,11 @@ impl StageResultStore {
     pub async fn len(&self) -> usize {
         self.results.read().await.len()
     }
+
+    /// Return `true` when the store has no cached results.
+    pub async fn is_empty(&self) -> bool {
+        self.results.read().await.is_empty()
+    }
 }
 
 /// Arrow Flight query service that provides SQL query execution over Arrow Flight protocol.
@@ -198,12 +203,12 @@ where
     }
 
     /// Validate that the request tenant matches this worker's tenant.
-    fn validate_tenant(&self, request_tenant: &str) -> Result<(), Status> {
+    fn validate_tenant(&self, request_tenant: &str) -> Result<(), Box<Status>> {
         if request_tenant != self.tenant_id {
-            return Err(Status::permission_denied(format!(
+            return Err(Box::new(Status::permission_denied(format!(
                 "Tenant ID mismatch: expected '{}', got '{}'",
                 self.tenant_id, request_tenant
-            )));
+            ))));
         }
         Ok(())
     }
@@ -242,7 +247,7 @@ where
         );
 
         // Validate tenant
-        self.validate_tenant(&request.tenant_id)?;
+        self.validate_tenant(&request.tenant_id).map_err(|e| *e)?;
 
         // Deserialize exchange inputs from Arrow IPC streams
         let exchange_input_batches = deserialize_exchange_inputs(&request.exchange_inputs)
@@ -843,7 +848,7 @@ where
         let flight_ticket = FlightTicket::decode(&ticket)?;
 
         // Validate tenant
-        self.validate_tenant(flight_ticket.tenant_id())?;
+        self.validate_tenant(flight_ticket.tenant_id()).map_err(|e| *e)?;
 
         match flight_ticket {
             FlightTicket::Query(query_ticket) => {

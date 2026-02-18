@@ -1,3 +1,5 @@
+#![allow(dead_code, unused)]
+
 use crate::engine::storage_engine::{RecordBatchStream, StorageError};
 use crate::loader::types::{Catalog, DataSource, SourceError};
 use crate::loader::starrocks::select_text;

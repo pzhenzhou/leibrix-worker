@@ -7,6 +7,12 @@ use crate::ldp::{Distribution, EpochStats, StatsSource, WorkerId};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// Optional closed time range `[start_unix_secs, end_unix_secs)`.
+type TimeRange = Option<(u64, u64)>;
+
+/// Index mapping a table name to its list of `(epoch_id, time_range)` entries.
+type EpochIndex = HashMap<String, Vec<(String, TimeRange)>>;
+
 /// Trait for accessing metadata during LDP planning.
 ///
 /// This abstracts over the actual metadata storage (could be in-memory,
@@ -112,7 +118,7 @@ pub struct InMemoryMetadata {
     /// epoch_id -> (stats, worker_id)
     epochs: RwLock<HashMap<String, (EpochStats, WorkerId)>>,
     /// table_name -> vec of (epoch_id, time_range)
-    table_epochs: RwLock<HashMap<String, Vec<(String, Option<(u64, u64)>)>>>,
+    table_epochs: RwLock<EpochIndex>,
     /// table_name -> table-level scan stats from master/control plane
     table_stats: RwLock<HashMap<String, TableScanStats>>,
 }
