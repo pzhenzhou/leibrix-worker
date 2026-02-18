@@ -16,6 +16,7 @@ use worker_storage::ldp::testing::macro_helpers::register_dataset_with_macros;
 #[tokio::test]
 async fn test_gather_exchange_e2e() {
     // Create a test cluster with 2 workers
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
@@ -53,6 +54,7 @@ async fn test_gather_exchange_e2e() {
 #[tokio::test]
 async fn test_broadcast_exchange_e2e() {
     // Create a test cluster with 2 workers
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
@@ -95,6 +97,7 @@ async fn test_broadcast_exchange_e2e() {
 #[tokio::test]
 async fn test_hash_partition_exchange_e2e() {
     // Create a test cluster with 3 workers
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(3)
         .tenant_id("test-tenant".to_string())
@@ -135,6 +138,7 @@ async fn test_hash_partition_exchange_e2e() {
 #[tokio::test]
 async fn test_parallel_stage_execution_e2e() {
     // Create a test cluster with 3 workers
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(3)
         .tenant_id("test-tenant".to_string())
@@ -192,6 +196,7 @@ async fn test_parallel_stage_execution_e2e() {
 #[tokio::test]
 async fn test_exchange_with_runtime_limits() {
     // Create a test cluster with limits enabled
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())
@@ -229,6 +234,7 @@ async fn test_exchange_with_runtime_limits() {
 #[tokio::test]
 async fn test_query_cancellation_during_exchange() {
     // Create a test cluster
+    #[allow(clippy::arc_with_non_send_sync)]
     let cluster = Arc::new(TestCluster::builder()
         .workers(2)
         .tenant_id("test-tenant".to_string())

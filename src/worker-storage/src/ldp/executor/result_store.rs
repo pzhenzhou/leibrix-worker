@@ -59,6 +59,7 @@ impl StageResultStore {
     }
 
     /// Create a new result store with a default TTL of 5 minutes.
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self::new(Duration::from_secs(300)) // 5 minutes
     }

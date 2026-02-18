@@ -166,8 +166,7 @@ async fn test_buffer_capacity_calculation() {
 
     // Expected capacity
     let expected_capacity = (target_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .max(2)
-        .min(64) as usize;
+        .clamp(2, 64) as usize;
 
     // For 32MB / 4MB = 8 batches
     assert_eq!(expected_capacity, 8);
@@ -290,12 +289,11 @@ async fn test_streaming_buffer_bounds() {
 
     // Very small buffer: 1MB / 4MB = 0.25 → should be clamped to 2
     let policy_small = PlannerPolicy::default()
-        .with_pipeline_buffer_bytes(1 * 1024 * 1024);
+        .with_pipeline_buffer_bytes(1024 * 1024);
 
     const DEFAULT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
     let capacity_small = (policy_small.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .max(2)
-        .min(64) as usize;
+        .clamp(2, 64) as usize;
     assert_eq!(capacity_small, 2);
 
     // Very large buffer: 512MB / 4MB = 128 → should be clamped to 64
@@ -303,8 +301,7 @@ async fn test_streaming_buffer_bounds() {
         .with_pipeline_buffer_bytes(512 * 1024 * 1024);
 
     let capacity_large = (policy_large.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .max(2)
-        .min(64) as usize;
+        .clamp(2, 64) as usize;
     assert_eq!(capacity_large, 64);
 
     // Normal buffer: 32MB / 4MB = 8 (within bounds)
@@ -312,7 +309,6 @@ async fn test_streaming_buffer_bounds() {
         .with_pipeline_buffer_bytes(32 * 1024 * 1024);
 
     let capacity_normal = (policy_normal.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .max(2)
-        .min(64) as usize;
+        .clamp(2, 64) as usize;
     assert_eq!(capacity_normal, 8);
 }

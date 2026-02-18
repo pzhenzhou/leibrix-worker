@@ -825,28 +825,9 @@ fn derive_relation_alias(plan: &LogicalPlan) -> Option<TableAlias> {
     }
 }
 
-/// Check if a plan has any ExchangeRead nodes (indicates it reads from upstream exchanges).
-fn has_exchange_read(plan: &LogicalPlan) -> bool {
-    use LogicalPlan::*;
-
-    match plan {
-        ExchangeRead { .. } => true,
-        Scan { .. } => false,
-        Filter { input, .. }
-        | Project { input, .. }
-        | Aggregate { input, .. }
-        | Sort { input, .. }
-        | Limit { input, .. }
-        | Window { input, .. }
-        | SubqueryScan { input, .. } => has_exchange_read(input),
-        Join { left, right, .. } | SetOp { left, right, .. } => {
-            has_exchange_read(left) || has_exchange_read(right)
-        }
-    }
-}
-
 /// Check if an AnnotatedPlan or any of its descendants has an exchange_before set.
 /// This is used to detect nested exchanges (e.g., Sort -> Project -> Join, where Join has exchange_before).
+#[allow(dead_code)]
 fn annotated_plan_has_exchange(annotated: &AnnotatedPlan) -> bool {
     // Check if this node has an exchange
     if annotated.exchange_before.is_some() {
@@ -860,17 +841,6 @@ fn annotated_plan_has_exchange(annotated: &AnnotatedPlan) -> bool {
         }
     }
 
-    false
-}
-
-/// Check if an AnnotatedPlan has any exchange in its descendants (but not at the root level).
-fn child_has_exchange_in_descendants(annotated: &AnnotatedPlan) -> bool {
-    // Check children recursively, but not the root itself
-    for child in &annotated.children {
-        if annotated_plan_has_exchange(child) {
-            return true;
-        }
-    }
     false
 }
 
@@ -1027,6 +997,25 @@ mod tests {
     use crate::ldp::types::WorkerId;
     use crate::sql::logical_plan::{ColumnRef, LogicalPlan};
     use sqlparser::ast::Expr;
+
+    /// Check if a plan has any ExchangeRead nodes (used only in tests).
+    fn has_exchange_read(plan: &LogicalPlan) -> bool {
+        use LogicalPlan::*;
+        match plan {
+            ExchangeRead { .. } => true,
+            Scan { .. } => false,
+            Filter { input, .. }
+            | Project { input, .. }
+            | Aggregate { input, .. }
+            | Sort { input, .. }
+            | Limit { input, .. }
+            | Window { input, .. }
+            | SubqueryScan { input, .. } => has_exchange_read(input),
+            Join { left, right, .. } | SetOp { left, right, .. } => {
+                has_exchange_read(left) || has_exchange_read(right)
+            }
+        }
+    }
 
     fn test_policy() -> PlannerPolicy {
         PlannerPolicy::with_coordinator("coordinator")

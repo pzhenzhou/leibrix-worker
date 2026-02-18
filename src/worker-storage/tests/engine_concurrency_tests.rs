@@ -103,7 +103,7 @@ async fn test_concurrent_operations_same_dataset() {
     let drop_result = drop_task.await.unwrap();
     let create_result = create_task.await.unwrap();
 
-    let results = vec![
+    let results = [
         list_result.is_ok(),
         stats_result.is_ok(),
         metrics_result.is_ok(),

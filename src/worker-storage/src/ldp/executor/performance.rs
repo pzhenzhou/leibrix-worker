@@ -306,6 +306,7 @@ impl PerformanceOptimizer {
 
 /// Historical performance data for optimization learning.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PerformanceHistory {
     /// Query ID.
     query_id: String,

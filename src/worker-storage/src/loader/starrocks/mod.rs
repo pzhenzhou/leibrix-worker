@@ -9,6 +9,7 @@ mod jdbc_client;
 #[allow(unused_imports)]
 pub use backend::StarRocksBackend;
 
+#[allow(dead_code)]
 pub fn select_text(source: Arc<DataSource>, schema: Arc<Schema>) -> String {
     let column_list = schema
         .fields()

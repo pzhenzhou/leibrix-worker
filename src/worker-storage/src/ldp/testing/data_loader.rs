@@ -15,6 +15,24 @@ use rand::Rng;
 use super::cluster::TestCluster;
 use crate::ldp::WorkerId;
 
+/// Parameters for loading a single epoch into a worker's DuckDB instance.
+pub struct LoadEpochParams {
+    /// Worker to receive the data.
+    pub worker_id: String,
+    /// Name of the epoch table to create (e.g. `orders__epoch_0`).
+    pub epoch_table_name: String,
+    /// Base table name (reserved for future filtering logic).
+    pub base_table_name: String,
+    /// Record batches to load.
+    pub data: Vec<RecordBatch>,
+    /// Start of the epoch time range (reserved for future filtering).
+    pub start_date: NaiveDate,
+    /// End of the epoch time range (reserved for future filtering).
+    pub end_date: NaiveDate,
+    /// Date column name (reserved for future filtering).
+    pub date_column: String,
+}
+
 /// Distribution specification for loading data across workers.
 #[derive(Debug, Clone)]
 pub struct DataDistribution {
@@ -204,15 +222,15 @@ impl TestDataLoader {
             let epoch_table_name = format!("{}__{}", spec.dataset_id, epoch_spec.epoch_id);
 
             // Load data to worker's DuckDB instance
-            self.load_epoch_to_worker(
-                &epoch_spec.worker_id,
-                &epoch_table_name,
-                &spec.table_name,
-                epoch_data,
-                epoch_spec.start_date,
-                epoch_spec.end_date,
-                &spec.date_column,
-            )
+            self.load_epoch_to_worker(LoadEpochParams {
+                worker_id: epoch_spec.worker_id.clone(),
+                epoch_table_name: epoch_table_name.clone(),
+                base_table_name: spec.table_name.clone(),
+                data: epoch_data,
+                start_date: epoch_spec.start_date,
+                end_date: epoch_spec.end_date,
+                date_column: spec.date_column.clone(),
+            })
             .await?;
         }
 
@@ -235,14 +253,19 @@ impl TestDataLoader {
     /// Load a single epoch to a specific worker
     async fn load_epoch_to_worker(
         &self,
-        worker_id: &str,
-        epoch_table_name: &str,
-        _base_table_name: &str,
-        data: Vec<RecordBatch>,
-        _start_date: NaiveDate,
-        _end_date: NaiveDate,
-        _date_column: &str,
+        params: LoadEpochParams,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let LoadEpochParams {
+            worker_id,
+            epoch_table_name,
+            base_table_name: _base_table_name,
+            data,
+            start_date: _start_date,
+            end_date: _end_date,
+            date_column: _date_column,
+        } = params;
+        let worker_id = worker_id.as_str();
+        let epoch_table_name = epoch_table_name.as_str();
         if data.is_empty() {
             return Err(format!("No data provided for epoch table {}", epoch_table_name).into());
         }

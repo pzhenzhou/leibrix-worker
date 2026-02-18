@@ -81,6 +81,16 @@ use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
 use arrow::datatypes::{DataType, Schema};
 
 // ============================================================================
+// Type Aliases
+// ============================================================================
+
+/// Result type for inter-stage record batch channels.
+type StageBatchResult = Result<RecordBatch, StageExecutionError>;
+
+/// Map from exchange id to the (sender, receiver) channel pair connecting stages.
+type StageChannelMap = HashMap<ExchangeId, (mpsc::Sender<StageBatchResult>, mpsc::Receiver<StageBatchResult>)>;
+
+// ============================================================================
 // Coordinator Error
 // ============================================================================
 
@@ -246,6 +256,10 @@ pub enum StageStatus {
 ///
 /// The coordinator manages the complete lifecycle of a query from SQL
 /// to result streaming.
+// `duckdb::Connection` is not `Sync`, so `Arc<RwLock<Connection>>` is not
+// `Send + Sync`. The `RwLock` serialises access; the `Arc` provides shared
+// ownership required for the coordinator to be stored behind `Arc` in tests.
+#[allow(clippy::arc_with_non_send_sync)]
 pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
     /// Configuration.
     config: CoordinatorConfig,
@@ -265,6 +279,7 @@ pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
     worker_databases: DashMap<WorkerId, Arc<SharedDatabase>>,
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
 impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// Create a new coordinator with in-memory DuckDB.
     pub fn new(config: CoordinatorConfig, metadata: Arc<M>) -> Result<Self, CoordinatorError> {
@@ -1013,10 +1028,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         let mut workers_used: Vec<WorkerId> = Vec::new();
 
         // Create inter-stage channels with memory-bounded buffers
-        let mut stage_channels: HashMap<ExchangeId, (
-            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
-            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
-        )> = HashMap::new();
+        let mut stage_channels: StageChannelMap = HashMap::new();
 
         for edge in &plan.edges {
             let buffer_capacity = self.compute_buffer_capacity(
@@ -1180,19 +1192,14 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
         // Compute capacity in number of batches
         (target_buffer_bytes / DEFAULT_BATCH_BYTES)
-            .max(2)   // Minimum 2 batches
-            .min(64)  // Maximum 64 batches
-            as usize
+            .clamp(2, 64) as usize
     }
 
     /// Resolve input streams for a stage from inter-stage channels.
     fn resolve_input_streams(
         &self,
         stage: &Stage,
-        stage_channels: &mut HashMap<ExchangeId, (
-            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
-            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
-        )>,
+        stage_channels: &mut StageChannelMap,
     ) -> Result<HashMap<String, RecordBatchStream>, CoordinatorError> {
         let mut input_streams = HashMap::new();
 
@@ -1228,11 +1235,8 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         &self,
         stage_id: StageId,
         edges: &[crate::ldp::ExchangeEdge],
-        stage_channels: &HashMap<ExchangeId, (
-            mpsc::Sender<Result<RecordBatch, StageExecutionError>>,
-            mpsc::Receiver<Result<RecordBatch, StageExecutionError>>
-        )>,
-    ) -> Result<Vec<mpsc::Sender<Result<RecordBatch, StageExecutionError>>>, CoordinatorError> {
+        stage_channels: &StageChannelMap,
+    ) -> Result<Vec<mpsc::Sender<StageBatchResult>>, CoordinatorError> {
         let mut output_txs = Vec::new();
 
         // Find all edges where this stage is the source
@@ -1407,16 +1411,17 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                                     partitions = partitions,
                                     "Executing hash partition exchange"
                                 );
+                                use crate::ldp::executor::exchange::HashPartitionRequest;
                                 exchange_runtime
-                                    .execute_hash_partition(
-                                        plan.query_id.as_ref(),
-                                        upstream_stage,
-                                        &source_workers,
+                                    .execute_hash_partition(HashPartitionRequest {
+                                        query_id: plan.query_id.as_ref(),
+                                        stage_id: upstream_stage,
+                                        source_workers: &source_workers,
                                         column_refs,
-                                        *partitions,
-                                        &edge.partition_to_worker,
-                                        target_worker,
-                                    )
+                                        num_partitions: *partitions,
+                                        partition_to_worker: &edge.partition_to_worker,
+                                        local_worker: target_worker,
+                                    })
                                     .await
                                     .map_err(|e| ExecutionError::ExchangeFailed(e.to_string()))?
                             }
