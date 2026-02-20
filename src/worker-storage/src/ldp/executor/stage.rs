@@ -874,4 +874,83 @@ mod tests {
             "Temp table __exchange_0 must be cleaned up even after a failed execution"
         );
     }
+
+    // =========================================================================
+    // execute_stage_batches tests
+    //
+    // These tests exercise the free async helper `execute_stage_batches`, which
+    // opens its own in-memory DuckDB connection per call.  They verify that the
+    // function produces correct output on the happy path and returns a proper
+    // Err (rather than panicking) when SQL is invalid — both cases exercise the
+    // IIFE-based cleanup pattern introduced in the temp-table-leak fix.
+    // =========================================================================
+
+    /// `execute_stage_batches` — successful execution returns the expected rows.
+    #[tokio::test]
+    async fn test_execute_stage_batches_success() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let stage = Stage {
+            stage_id: StageId(0),
+            target_workers: vec!["local".into()],
+            inputs: vec![],
+            output: StageOutput::default(),
+            stage_sql: "SELECT id FROM \"__exchange_0\"".to_string(),
+            limits: StageLimits::default(),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        let result = execute_stage_batches(&stage, &inputs).await;
+
+        assert!(result.is_ok(), "Expected Ok but got: {:?}", result);
+        let total_rows: usize = result.unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Expected 3 rows in output");
+    }
+
+    /// `execute_stage_batches` — SQL error returns Err without panicking.
+    ///
+    /// Before the IIFE fix an early `?` return inside the execution block would
+    /// skip the cleanup loop.  Although the connection is local so the leak is
+    /// transient, the function must still surface the error as `Err` rather than
+    /// panicking or silently succeeding.
+    #[tokio::test]
+    async fn test_execute_stage_batches_error_on_invalid_sql() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let stage = Stage {
+            stage_id: StageId(0),
+            target_workers: vec!["local".into()],
+            inputs: vec![],
+            output: StageOutput::default(),
+            stage_sql: "THIS IS NOT VALID SQL !!".to_string(),
+            limits: StageLimits::default(),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        let result = execute_stage_batches(&stage, &inputs).await;
+
+        assert!(result.is_err(), "Expected Err for invalid SQL");
+    }
 }

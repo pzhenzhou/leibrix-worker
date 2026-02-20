@@ -1236,4 +1236,115 @@ mod tests {
         // key2 should be able to retrieve the value since it equals key1
         assert_eq!(map.get(&key2), Some(&"value1"));
     }
+
+    // =========================================================================
+    // execute_stage_with_duckdb cleanup tests  (SharedDatabase critical path)
+    //
+    // These tests verify that exchange temp tables are always dropped from the
+    // pooled (SharedDatabase) connection, regardless of whether the stage SQL
+    // succeeds or fails.  A pool_size=1 database is used so that every `get()`
+    // call returns the same underlying connection — making any leaked temp table
+    // immediately visible to subsequent acquisitions.
+    // =========================================================================
+
+    fn make_service_with_pool_size_1() -> (
+        WorkerFlightService<worker_storage::engine::duckdb::DuckDBQueryEngine>,
+        std::sync::Arc<worker_storage::engine::duckdb::SharedDatabase>,
+    ) {
+        use worker_storage::engine::duckdb::storage_engine_impl::MemoryDuckDBEngine;
+        use worker_storage::engine::duckdb::{DuckDBConfig, DuckDBQueryEngine};
+        use worker_storage::sql::SqlTransformer;
+        use tokio::sync::RwLock;
+
+        // Pool size 1 guarantees that every get() returns the same connection.
+        let config = DuckDBConfig::default().with_pool_size(1);
+        let storage = MemoryDuckDBEngine::new_with_fresh_db(config).unwrap();
+        let shared_db = storage.shared_database();
+        let query_engine = Arc::new(DuckDBQueryEngine::new(Arc::clone(&shared_db), 1));
+        let sql_transformer = Arc::new(RwLock::new(SqlTransformer::new()));
+
+        let service = WorkerFlightService::new(
+            query_engine,
+            sql_transformer,
+            "test-tenant".to_string(),
+            Arc::clone(&shared_db),
+        );
+
+        (service, shared_db)
+    }
+
+    /// After a successful stage execution the exchange temp table must no
+    /// longer be present on the pooled connection.
+    ///
+    /// With pool_size=1 the same DuckDB connection is always returned by
+    /// `shared_db.get()`, so any leaked temp table would remain visible.
+    #[tokio::test]
+    async fn test_execute_stage_with_duckdb_cleans_up_on_success() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let (service, shared_db) = make_service_with_pool_size_1();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        let result = service
+            .execute_stage_with_duckdb("q1", 0, "SELECT id FROM \"__exchange_0\"", &inputs)
+            .await;
+        assert!(result.is_ok(), "Stage execution should succeed: {:?}", result);
+
+        // Acquire the (only) pooled connection and confirm the temp table is gone.
+        let conn = shared_db.get().unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            "Temp table __exchange_0 must be absent on the pooled connection after success"
+        );
+    }
+
+    /// After a failed stage execution (invalid SQL) the exchange temp table
+    /// must still be removed from the pooled connection.
+    ///
+    /// Before the IIFE fix an early `?` return skipped the cleanup loop,
+    /// leaving the temp table on the connection and polluting the next stage
+    /// executed on the same pooled connection.
+    #[tokio::test]
+    async fn test_execute_stage_with_duckdb_cleans_up_on_error() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let (service, shared_db) = make_service_with_pool_size_1();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        // Invalid SQL — execute_stage_with_duckdb must still clean up before
+        // returning the Err.
+        let result = service
+            .execute_stage_with_duckdb("q1", 0, "THIS IS NOT VALID SQL !!", &inputs)
+            .await;
+        assert!(result.is_err(), "Invalid SQL should return Err");
+
+        // Acquire the (only) pooled connection and confirm the temp table is gone.
+        let conn = shared_db.get().unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            "Temp table __exchange_0 must be cleaned up on the pooled connection even after a failed execution"
+        );
+    }
 }
