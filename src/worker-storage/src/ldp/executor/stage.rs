@@ -386,7 +386,12 @@ impl LocalStageExecutor {
             }
         }
 
-        let result = {
+        // Wrap SQL execution in an immediately-invoked closure so that `?`
+        // returns from the closure, not from `run_sql_with_inputs`.  This
+        // guarantees the cleanup loop below always runs, even when prepare or
+        // query_arrow fails, which is essential for SharedDatabase (pooled)
+        // connections where a leaked temp table would persist across stages.
+        let result: Result<Vec<RecordBatch>, StageExecutionError> = (|| {
             let mut stmt = conn.prepare(stage_sql).map_err(|e| {
                 StageExecutionError::ExecutionFailed(format!("Failed to prepare SQL: {}", e))
             })?;
@@ -398,12 +403,13 @@ impl LocalStageExecutor {
 
             let batches: Vec<RecordBatch> = rows.collect();
             if batches.is_empty() {
-                Ok::<Vec<RecordBatch>, StageExecutionError>(vec![RecordBatch::new_empty(schema)])
+                Ok(vec![RecordBatch::new_empty(schema)])
             } else {
-                Ok::<Vec<RecordBatch>, StageExecutionError>(batches)
+                Ok(batches)
             }
-        };
+        })();
 
+        // Always clean up, regardless of whether execution succeeded or failed.
         for table_name in &registered_tables {
             let _ = drop_temp_table(conn, table_name);
         }
@@ -621,29 +627,31 @@ async fn execute_stage_batches(
         }
     }
 
-    // Execute the SQL query
-    let result = {
+    // Wrap SQL execution in an immediately-invoked closure so that `?`
+    // returns from the closure, not from `execute_stage_batches`.  This
+    // guarantees the cleanup loop below always runs even when SQL fails.
+    let result: Result<Vec<RecordBatch>, StageExecutionError> = (|| {
         let mut stmt = conn.prepare(&stage.stage_sql)
             .map_err(|e| StageExecutionError::ExecutionFailed(
                 format!("Failed to prepare SQL: {}", e)
             ))?;
-        
+
         let rows = stmt
             .query_arrow([])
             .map_err(|e| StageExecutionError::ExecutionFailed(
                 format!("Failed to execute SQL: {}", e)
             ))?;
         let schema = rows.get_schema();
-        
+
         let batches: Vec<RecordBatch> = rows.collect();
         if batches.is_empty() {
-            Ok::<Vec<RecordBatch>, StageExecutionError>(vec![RecordBatch::new_empty(schema)])
+            Ok(vec![RecordBatch::new_empty(schema)])
         } else {
-            Ok::<Vec<RecordBatch>, StageExecutionError>(batches)
+            Ok(batches)
         }
-    };
+    })();
 
-    // Clean up registered tables
+    // Always clean up, regardless of whether execution succeeded or failed.
     for table_name in &registered_tables {
         let _ = drop_temp_table(&conn, table_name);
     }
@@ -791,5 +799,79 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.tickets.len(), 1);
+    }
+
+    // =========================================================================
+    // Temp-table cleanup tests
+    //
+    // These tests verify that exchange temp tables are always dropped after
+    // stage SQL execution, regardless of whether execution succeeds or fails.
+    // The invariant is especially important when the caller reuses a pooled
+    // (SharedDatabase) connection across multiple stages: a leaked temp table
+    // would persist on that connection and pollute subsequent stage executions.
+    // =========================================================================
+
+    /// After a successful execution, the temp table must no longer exist.
+    #[test]
+    fn test_run_sql_cleans_up_temp_tables_on_success() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use duckdb::Connection;
+        use std::sync::Arc;
+
+        let conn = Connection::open_in_memory().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        let result =
+            LocalStageExecutor::run_sql_with_inputs(&conn, "SELECT id FROM \"__exchange_0\"", &inputs);
+
+        assert!(result.is_ok(), "SQL execution should have succeeded");
+
+        // The temp table must be gone so the pooled connection is clean.
+        assert!(
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            "Temp table __exchange_0 must be cleaned up after successful execution"
+        );
+    }
+
+    /// After a failed execution (bad SQL), the temp table must still be dropped.
+    #[test]
+    fn test_run_sql_cleans_up_temp_tables_on_error() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use duckdb::Connection;
+        use std::sync::Arc;
+
+        let conn = Connection::open_in_memory().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![batch]);
+
+        // Invalid SQL: prepare will fail, which previously caused an early
+        // `?` return that bypassed the cleanup loop.
+        let result =
+            LocalStageExecutor::run_sql_with_inputs(&conn, "THIS IS NOT VALID SQL !!!", &inputs);
+
+        assert!(result.is_err(), "Invalid SQL should have returned an error");
+
+        // Despite the error, the temp table must be cleaned up.
+        assert!(
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            "Temp table __exchange_0 must be cleaned up even after a failed execution"
+        );
     }
 }

@@ -591,15 +591,20 @@ where
                 "Executing stage SQL"
             );
 
-            let result = {
+            // Wrap SQL execution in an immediately-invoked closure so that `?`
+            // returns from the closure, not from the spawn_blocking closure.
+            // This guarantees the cleanup loop below always runs even when
+            // SQL prepare or execution fails, preventing temp-table leaks on
+            // the shared pooled connection.
+            let result: Result<Vec<RecordBatch>, String> = (|| {
                 let mut stmt = conn.prepare(&stage_sql)
                     .map_err(|e| format!("Failed to prepare SQL: {}", e))?;
                 let rows = stmt.query_arrow([])
                     .map_err(|e| format!("Failed to execute SQL: {}", e))?;
-                Ok::<Vec<RecordBatch>, String>(rows.collect())
-            };
+                Ok(rows.collect())
+            })();
 
-            // Clean up registered tables
+            // Clean up registered tables (always runs regardless of success/failure)
             for table_name in &registered_tables {
                 let _ = drop_temp_table(&conn, table_name);
             }
