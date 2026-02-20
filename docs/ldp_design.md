@@ -25,7 +25,7 @@ LDP solves these problems by:
 | **Epoch-native partitioning** | Data arrives in temporal segments. The planner must understand this natural partitioning to avoid unnecessary shuffles. |
 | **Single-tenant isolation** | Each worker binds to exactly one tenant. No cross-tenant data sharing or resource contention. |
 | **DuckDB as local engine** | Each worker runs an embedded DuckDB instance. LDP must generate standard SQL that DuckDB can execute — no proprietary IR. |
-| **Arrow throughout** | All data movement uses Apache Arrow columnar format for zero-copy compatibility with DuckDB and Arrow Flight. |
+| **Arrow throughout** | All data movement uses Apache Arrow columnar format for efficient interoperability with DuckDB and Arrow Flight. Exchange data is loaded into DuckDB via `CREATE TEMPORARY TABLE` DDL followed by the native `Appender` API (`append_record_batch`), which uses the Arrow C Data Interface for columnar bulk ingestion rather than row-by-row SQL. |
 | **Correctness over performance** | When statistics are uncertain, always choose the safe strategy (shuffle) over the optimized one (broadcast). |
 | **No recursive CTEs** | Recursive CTEs imply unbounded computation. The admission controller rejects them. |
 | **Date predicates required** | Epoch-partitioned tables require time-range predicates to enable epoch pruning. Queries without them are rejected at admission. |
@@ -1132,6 +1132,377 @@ Coordinator                          Worker
 
 ---
 
+## 10. Exchange Data Write Path: End-to-End Analysis
+
+This section traces exactly how exchange data is materialized on a target worker node
+during distributed LDP execution. The path covers five stages, from the coordinator
+fetching upstream output to DuckDB on the receiving worker being able to execute SQL
+against the transferred data.
+
+### 10.1 Overview: Five-Stage Write Path
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          Coordinator                                      │
+│                                                                          │
+│  [1] Fetch upstream output from source workers via Flight DoGet          │
+│       → Vec<RecordBatch>  (Gather / Broadcast / HashPartition)           │
+│                                                                          │
+│  [2] Apply exchange transformation                                       │
+│       • Gather         → concatenate all batches                         │
+│       • Broadcast      → use same batches for every target               │
+│       • HashPartition  → filter to the target worker's partitions        │
+│                                                                          │
+│  [3] Serialize transformed batches to Arrow IPC streams                  │
+│       serialize_submit_stage_request()  →  proto::SubmitStageRequest     │
+│         .exchange_inputs[i].table_name  = "__exchange_N"                 │
+│         .exchange_inputs[i].arrow_ipc_stream = <IPC bytes>               │
+│                                                                          │
+│  [4] Transmit to target worker via Flight DoAction("submit_stage")       │
+│       FlightStageExecutor::submit_to_worker()                            │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+                                   │ gRPC / Arrow Flight
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         Target Worker                                     │
+│                                                                          │
+│  [5] Receive, deserialize, and register exchange tables in DuckDB        │
+│       handle_submit_stage()                                              │
+│         → deserialize_exchange_inputs()   (Arrow IPC → RecordBatch)      │
+│         → register_arrow_batches(conn, "__exchange_N", batches)          │
+│         → conn.query_arrow(stage_sql)   (SQL reads __exchange_N)         │
+│         → store result → return StageTicket                              │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 Step-by-Step Code Trace
+
+#### Step 1 — Resolve exchange inputs (coordinator side)
+
+The coordinator calls `resolve_distributed_inputs_for_worker()` for each target worker
+before submitting the downstream stage. This function reads the upstream stage's
+`StageTickets` and calls the appropriate distributed exchange method.
+
+**Source**: `src/worker-storage/src/ldp/executor/coordinator.rs`
+– `resolve_distributed_inputs_for_worker()`
+
+```rust
+// For each ExchangeInput the downstream stage declares:
+match &edge.kind {
+    Exchange::Gather { target } => {
+        // Fetch from ALL source workers and concatenate at coordinator.
+        exchange_runtime.execute_gather(query_id, upstream_stage, &source_workers, target).await
+    }
+    Exchange::Broadcast { targets } => {
+        // Fetch from the single source worker; every target worker gets the same data.
+        exchange_runtime.execute_broadcast(query_id, upstream_stage, source, targets).await
+    }
+    Exchange::HashPartition { column_refs, partitions } => {
+        // Fetch all data, hash-partition by column values, return ONLY the
+        // partitions assigned to `target_worker`.
+        exchange_runtime.execute_hash_partition(HashPartitionRequest { ..., local_worker: target_worker }).await
+    }
+}
+// Result: HashMap<"__exchange_N" → Vec<RecordBatch>> for this specific worker.
+```
+
+#### Step 2 — Exchange transformation detail
+
+Each exchange type transforms the raw Arrow batches differently before they are shipped
+to the target worker:
+
+| Exchange | `DistributedExchangeRuntime` method | Transformation |
+|----------|-------------------------------------|----------------|
+| Gather | `execute_gather()` | Parallel `DoGet` from all source workers; batches concatenated |
+| Broadcast | `execute_broadcast()` | Single `DoGet` from source; same batches returned for every target |
+| HashPartition | `execute_hash_partition()` | `DoGet` from all sources; `hash_partition_batch()` applied; only `local_partitions` kept |
+
+**Source**: `src/worker-storage/src/ldp/executor/exchange.rs`
+
+Hash-partitioning selects which rows belong to this worker:
+
+```rust
+// find partitions owned by local_worker
+let local_partitions: Vec<u32> = partition_to_worker.iter().enumerate()
+    .filter(|(_, w)| *w == local_worker)
+    .map(|(i, _)| i as u32)
+    .collect();
+
+for batch in all_batches {
+    let partitioned = hash_partition_batch(&batch, &field_refs, num_partitions)?;
+    for p in &local_partitions {
+        local_batches.push(partitioned[*p as usize].clone());
+    }
+}
+```
+
+`hash_partition_batch()` uses `DefaultHasher` over the partition-key columns for each
+row (`hash_column_value()`) and routes each row to `hash % num_partitions`.
+
+#### Step 3 — Serialize to Arrow IPC (coordinator side)
+
+The resolved `HashMap<String, Vec<RecordBatch>>` (one entry per exchange input table)
+is serialized inside `serialize_submit_stage_request()`:
+
+**Source**: `src/worker-storage/src/ldp/proto_convert.rs`
+
+```rust
+for (table_name, batches) in exchange_inputs {
+    let schema = batches[0].schema();
+    let mut writer = StreamWriter::try_new(&mut buffer, &schema)?;
+    for batch in batches { writer.write(batch)?; }
+    writer.finish()?;
+
+    serialized_inputs.push(proto::ExchangeInputRegistration {
+        table_name: table_name.clone(),        // e.g. "__exchange_0"
+        arrow_ipc_stream: buffer.into_inner(), // raw Arrow IPC bytes
+    });
+}
+// Encoded into proto::SubmitStageRequest and sent as DoAction body.
+```
+
+Arrow IPC (Streaming format) is chosen because it preserves the full Arrow schema and
+enables efficient schema-preserving deserialization on the receiving end. After
+deserialization, exchange data is loaded into DuckDB in two steps: a `CREATE TEMPORARY TABLE`
+DDL statement derived from the Arrow schema, followed by bulk ingestion via the DuckDB
+`Appender` API (`conn.appender()` + `append_record_batch`), which passes each `RecordBatch`
+through the Arrow C Data Interface rather than decomposing it into individual SQL statements.
+
+#### Step 4 — Transmit via Arrow Flight DoAction (coordinator side)
+
+`FlightStageExecutor::submit_to_worker()` wraps the proto bytes in a Flight `Action`
+and calls `do_action("submit_stage")`:
+
+**Source**: `src/worker-storage/src/ldp/executor/flight.rs`
+
+```rust
+let action = Action {
+    r#type: "submit_stage".to_string(),
+    body: request_bytes.into(),     // SubmitStageRequest proto bytes
+};
+conn.client.do_action(action).await?;
+// Response: SubmitStageResponse { result_ticket, stats }
+// Ticket is cached for later DoGet.
+```
+
+The worker-side Flight service routes the action in `do_action()`:
+
+```rust
+"submit_stage" => self.handle_submit_stage(&action.body).await
+```
+
+**Source**: `src/worker-flight/src/service.rs`
+
+#### Step 5 — Receive, deserialize, and register on target worker
+
+`handle_submit_stage()` on the receiving worker:
+
+1. **Deserialize proto**: `deserialize_submit_stage_request(body)` → `proto::SubmitStageRequest`
+2. **Deserialize Arrow IPC**: `deserialize_exchange_inputs(&request.exchange_inputs)` → `HashMap<String, Vec<RecordBatch>>`
+
+```rust
+// Arrow IPC → RecordBatch
+let cursor = Cursor::new(&input_reg.arrow_ipc_stream);
+let reader = StreamReader::try_new(cursor, None)?;
+for batch_result in reader { batches.push(batch_result?); }
+result.insert(input_reg.table_name.clone(), batches);
+```
+
+**Source**: `src/worker-storage/src/ldp/proto_convert.rs` – `deserialize_exchange_inputs()`
+
+3. **Register as DuckDB temporary tables**: `register_arrow_batches(conn, "__exchange_N", batches)`
+
+```rust
+// 1. CREATE TEMPORARY TABLE "__exchange_0" (col1 TYPE1, col2 TYPE2, ...)
+//    DDL is generated from the Arrow schema via build_create_table_sql().
+//
+// 2. conn.appender("__exchange_0")? → mut appender
+//    appender.append_record_batch(batch)?  // Arrow C Data Interface — columnar bulk
+//    appender.flush()?                     // commit to DuckDB
+//
+// Implemented in append_arrow_batches(), called by register_arrow_batches_with_options().
+```
+
+**Source**: `src/worker-storage/src/engine/duckdb/arrow_utils.rs` – `register_arrow_batches()`
+
+4. **Execute stage SQL**: `conn.prepare(stage_sql)?; stmt.query_arrow([])?`  
+   The SQL references `__exchange_0` (or later exchanges) as ordinary tables.
+
+5. **Cache and return ticket**: Results are stored in `StageResultStore` and a `StageResultTicket`
+   is returned. The coordinator later calls `DoGet(ticket)` to retrieve the final output.
+
+### 10.3 Concrete SQL Example: GROUP BY with Gather Exchange
+
+**Query**:
+```sql
+SELECT region, SUM(revenue)
+FROM sales
+WHERE dt >= '2025-01-01'
+GROUP BY region
+```
+
+**Cluster**: `sales` epochs on w1 and w2; coordinator is `w2`.
+
+---
+
+**Planning output** (Section 4.1 for full detail):
+```
+Stage 0  (target_workers: [w1, w2])
+  stage_sql: SELECT region, SUM(revenue)
+             FROM scan_sales('2025-01-01', '9999-12-31')
+             WHERE dt >= '2025-01-01'
+             GROUP BY region
+  inputs: [LocalCatalog]
+
+Exchange 0: Gather → w2 (coordinator)
+
+Stage 1  (target_workers: [w2])
+  stage_sql: SELECT region, SUM(revenue) FROM __exchange_0 GROUP BY region
+  inputs: [ExchangeInput { exchange_id: 0, table_name: "__exchange_0" }]
+```
+
+---
+
+**Exchange write path trace for Stage 1**:
+
+```
+[1] Coordinator (w2) calls:
+      resolve_distributed_inputs_for_worker(plan, stage_id=1, target_worker=w2, ...)
+
+[2] Exchange type is Gather { target: w2 }.
+    Coordinator fetches Stage 0 output from both w1 and w2:
+      execute_gather(query_id, stage_id=0, source_workers=[w1, w2], target=w2)
+        → DoGet(ticket_w1) → 1 000 rows from w1   (partial GROUP BY results)
+        → DoGet(ticket_w2) →   800 rows from w2   (partial GROUP BY results)
+        → concat: 1 800 rows  (Vec<RecordBatch>)
+
+[3] Coordinator serializes:
+      serialize_submit_stage_request(
+          tenant_id, query_id, stage_id=1,
+          stage_sql = "SELECT region, SUM(revenue) FROM __exchange_0 GROUP BY region",
+          exchange_inputs = {
+              "__exchange_0": <Arrow IPC bytes for 1 800 rows>
+          }
+      )
+
+[4] Coordinator sends:
+      DoAction("submit_stage") → w2
+      body = <SubmitStageRequest proto bytes>
+
+[5] w2 Flight service (handle_submit_stage):
+      deserialize exchange inputs:
+          "__exchange_0" → 1 800 RecordBatches (Arrow IPC decode)
+      register_arrow_batches(conn, "__exchange_0", batches)
+          → CREATE TEMPORARY TABLE "__exchange_0" (region VARCHAR, revenue DOUBLE)
+          → appender.append_record_batch(batch) × N  (Arrow C Data Interface bulk ingestion)
+          → appender.flush()
+      execute:
+          SELECT region, SUM(revenue) FROM __exchange_0 GROUP BY region
+          → DuckDB re-aggregates the partial sums → final answer (N distinct regions)
+      store result in StageResultStore
+      return StageResultTicket → coordinator
+```
+
+**Coordinator final step**: `DoGet(StageResultTicket)` → Arrow batches → client.
+
+### 10.4 Concrete SQL Example: Join with HashPartition Exchange
+
+**Query**:
+```sql
+SELECT o.customer_id, SUM(o.amount)
+FROM orders o
+JOIN large_customers c ON o.customer_id = c.customer_id
+WHERE o.dt >= '2025-06-01'
+GROUP BY o.customer_id
+```
+
+**Cluster**: `orders` on w1, w2; `large_customers` on w1, w2 (both EpochPartitioned).
+With `Unknown` statistics, the planner selects a HashPartition exchange for both sides.
+
+---
+
+**Planning output** (simplified):
+```
+Stage 0  (target_workers: [w1, w2])
+  stage_sql: SELECT customer_id, amount
+             FROM scan_orders('2025-06-01', '9999-12-31')
+             WHERE dt >= '2025-06-01'
+  inputs: [LocalCatalog]
+
+Exchange 0: HashPartition(customer_id, 4 partitions)
+  partition_to_worker: [w1, w2, w1, w2]  ← round-robin assignment
+
+Stage 1  (target_workers: [w1, w2])
+  stage_sql: SELECT o.customer_id, SUM(o.amount)
+             FROM __exchange_0 o
+             JOIN __exchange_1 c ON o.customer_id = c.customer_id
+             GROUP BY o.customer_id
+  inputs: [ExchangeInput("__exchange_0"), ExchangeInput("__exchange_1")]
+
+Stage 2  (target_workers: [coordinator])
+  stage_sql: SELECT customer_id, SUM(amount) FROM __exchange_2 GROUP BY customer_id
+  inputs: [ExchangeInput("__exchange_2")]
+```
+
+---
+
+**Exchange write path trace for Stage 1, target worker w1**:
+
+```
+[1] Coordinator calls:
+      resolve_distributed_inputs_for_worker(plan, stage_id=1, target_worker=w1, ...)
+
+[2a] Exchange 0 is HashPartition(customer_id, partitions=4).
+     w1 is assigned partitions 0 and 2 (partition_to_worker=[w1,w2,w1,w2]).
+     Coordinator:
+       execute_hash_partition(source_workers=[w1,w2], column_refs=[customer_id],
+                              num_partitions=4, local_worker=w1)
+         → execute_gather(w1, w2)           (fetch ALL upstream batches first)
+         → for each batch: hash_partition_batch(batch, [customer_id_idx], 4)
+         → keep only partitions 0 and 2 → rows where hash(customer_id)%4 ∈ {0,2}
+
+[2b] Exchange 1 is HashPartition(customer_id, partitions=4), same logic for
+     large_customers.
+
+[3] Coordinator serializes Stage 1 request for w1:
+      exchange_inputs = {
+          "__exchange_0": <Arrow IPC, orders rows for partitions 0+2>,
+          "__exchange_1": <Arrow IPC, customers rows for partitions 0+2>
+      }
+
+[4] DoAction("submit_stage") → w1
+
+[5] w1:
+      CREATE TEMPORARY TABLE "__exchange_0" (customer_id BIGINT, amount DOUBLE)
+      INSERT ... (only rows hashing to partitions 0 or 2)
+      CREATE TEMPORARY TABLE "__exchange_1" (customer_id BIGINT, ...)
+      INSERT ...
+      execute:
+          SELECT o.customer_id, SUM(o.amount)
+          FROM __exchange_0 o
+          JOIN __exchange_1 c ON o.customer_id = c.customer_id
+          GROUP BY o.customer_id
+      → local hash-join + partial aggregate → store → return ticket
+```
+
+Worker w2 receives the complementary partitions 1 and 3 via a separate
+`DoAction("submit_stage")` call with its own serialized Arrow IPC payload.
+
+### 10.5 Key Design Properties
+
+| Property | Mechanism | Code location |
+|----------|-----------|---------------|
+| **Bulk Arrow ingestion** | `register_arrow_batches()` issues `CREATE TEMPORARY TABLE` DDL (schema derived from the first batch), then calls `conn.appender()` + `append_record_batch` (DuckDB `appender-arrow` feature). Each `RecordBatch` is passed through the Arrow C Data Interface for columnar bulk ingestion — no per-row SQL overhead. | `arrow_utils.rs` |
+| **Worker isolation** | Each target worker receives only its own subset (no over-delivery) | `execute_hash_partition_for_worker()` |
+| **Schema preservation** | Arrow IPC embeds the full schema; DuckDB temp table DDL is derived from it | `build_create_table_sql()` |
+| **Empty-batch safety** | Exchange functions preserve schema even when zero rows are produced by returning `RecordBatch::new_empty(schema)` instead of an empty `Vec`. The downstream `register_arrow_batches()` creates a properly-schemaed 0-row temp table so stage SQL referencing columns by name works. If schema is genuinely unavailable (no upstream tickets), the table is skipped and the SQL fails with a clear "table does not exist" error. | `ExchangeRuntime`, `arrow_utils.rs` |
+| **Result retrieval** | Output is stored in `StageResultStore` (TTL-based, keyed by `(tenant_id, query_id, stage_id)`); coordinator retrieves it via `DoGet(ticket)` | `result_store.rs`, `service.rs` |
+| **Retry safety** | `execute_stage_with_retry()` uses exponential back-off; exchange inputs are re-serialized on each attempt | `coordinator.rs` |
+
+---
+
 ## Appendix A: Configuration Reference
 
 ### PlannerPolicy Defaults
@@ -1216,3 +1587,4 @@ Coordinator                          Worker
 - 2025-01-11: Initial design document
 - 2026-01-17: Updated implementation status
 - 2026-02-15: Complete rewrite reflecting SQL-native architecture (Substrait removed), actual code implementation, execution examples for multi-table joins, CTEs, and unsupported use cases
+- 2026-02-20: Added Section 10 — Exchange Data Write Path (end-to-end analysis with code references and SQL examples)

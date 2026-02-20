@@ -154,15 +154,24 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         num_partitions: u32,
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         let mut all_batches = Vec::new();
+        let mut last_schema: Option<SchemaRef> = None;
 
         for ticket in upstream_tickets.all() {
             let batches = self.executor.fetch_output(ticket).await.map_err(|e| {
                 ExchangeError::FetchFailed(format!("Failed to fetch {}: {}", ticket.ticket_id, e))
             })?;
+            for batch in &batches {
+                if batch.num_columns() > 0 {
+                    last_schema = Some(batch.schema());
+                }
+            }
             all_batches.extend(batches);
         }
 
         if all_batches.is_empty() {
+            if let Some(schema) = last_schema {
+                return Ok(vec![RecordBatch::new_empty(schema)]);
+            }
             return Ok(vec![]);
         }
 
@@ -226,6 +235,8 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
     /// Execute a Broadcast exchange.
     ///
     /// Replicates the upstream data to all targets.
+    /// If all upstream workers produced zero rows, returns an empty batch
+    /// with the correct schema so that downstream SQL can still reference columns.
     async fn execute_broadcast(
         &self,
         upstream_tickets: &StageTickets,
@@ -234,12 +245,26 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         // For broadcast, we just need to fetch the data once
         // Each target will receive a copy
         let mut all_batches = Vec::new();
+        let mut last_schema: Option<SchemaRef> = None;
 
         for ticket in upstream_tickets.all() {
             let batches = self.executor.fetch_output(ticket).await.map_err(|e| {
                 ExchangeError::FetchFailed(format!("Failed to fetch {}: {}", ticket.ticket_id, e))
             })?;
+            for batch in &batches {
+                if batch.num_columns() > 0 {
+                    last_schema = Some(batch.schema());
+                }
+            }
             all_batches.extend(batches);
+        }
+
+        // If all batches are empty but we have a schema, return one empty batch
+        // so the downstream stage gets the correct column definitions.
+        if all_batches.is_empty() {
+            if let Some(schema) = last_schema {
+                return Ok(vec![RecordBatch::new_empty(schema)]);
+            }
         }
 
         Ok(all_batches)
@@ -259,15 +284,24 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         // Collect all upstream data
         let mut all_batches = Vec::new();
+        let mut last_schema: Option<SchemaRef> = None;
 
         for ticket in upstream_tickets.all() {
             let batches = self.executor.fetch_output(ticket).await.map_err(|e| {
                 ExchangeError::FetchFailed(format!("Failed to fetch {}: {}", ticket.ticket_id, e))
             })?;
+            for batch in &batches {
+                if batch.num_columns() > 0 {
+                    last_schema = Some(batch.schema());
+                }
+            }
             all_batches.extend(batches);
         }
 
         if all_batches.is_empty() {
+            if let Some(schema) = last_schema {
+                return Ok(vec![RecordBatch::new_empty(schema)]);
+            }
             return Ok(vec![]);
         }
 
@@ -921,6 +955,7 @@ impl DistributedExchangeRuntime {
 
         let mut all_batches = Vec::new();
         let mut errors = Vec::new();
+        let mut last_schema: Option<SchemaRef> = None;
 
         // Fetch from each source worker in parallel
         let fetch_futures: Vec<_> = source_workers
@@ -943,6 +978,11 @@ impl DistributedExchangeRuntime {
                         batches = batches.len(),
                         "Gathered data from worker"
                     );
+                    for batch in &batches {
+                        if batch.num_columns() > 0 {
+                            last_schema = Some(batch.schema());
+                        }
+                    }
                     all_batches.extend(batches);
                 }
                 Err(e) => {
@@ -970,6 +1010,14 @@ impl DistributedExchangeRuntime {
                 all_batches.len(),
                 errors.len()
             );
+        }
+
+        // If all batches are empty but we observed a schema, return one empty
+        // batch so the downstream stage gets the correct column definitions.
+        if all_batches.is_empty() {
+            if let Some(schema) = last_schema {
+                return Ok(vec![RecordBatch::new_empty(schema)]);
+            }
         }
 
         info!(
@@ -1181,8 +1229,8 @@ impl DistributedExchangeRuntime {
         // Partition each batch and collect the local partitions
         let mut local_batches = Vec::new();
 
-        for batch in all_batches {
-            let partitioned = hash_partition_batch(&batch, &field_refs, num_partitions)?;
+        for batch in &all_batches {
+            let partitioned = hash_partition_batch(batch, &field_refs, num_partitions)?;
 
             for p in &local_partitions {
                 let partition_batch = &partitioned[*p as usize];
@@ -1190,6 +1238,12 @@ impl DistributedExchangeRuntime {
                     local_batches.push(partition_batch.clone());
                 }
             }
+        }
+
+        // If all local partitions were empty, return an empty batch with
+        // correct schema so downstream stage SQL can reference columns.
+        if local_batches.is_empty() {
+            return Ok(vec![RecordBatch::new_empty(schema)]);
         }
 
         info!(
