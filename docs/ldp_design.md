@@ -1497,7 +1497,7 @@ Worker w2 receives the complementary partitions 1 and 3 via a separate
 | **Bulk Arrow ingestion** | `register_arrow_batches()` issues `CREATE TEMPORARY TABLE` DDL (schema derived from the first batch), then calls `conn.appender()` + `append_record_batch` (DuckDB `appender-arrow` feature). Each `RecordBatch` is passed through the Arrow C Data Interface for columnar bulk ingestion — no per-row SQL overhead. | `arrow_utils.rs` |
 | **Worker isolation** | Each target worker receives only its own subset (no over-delivery) | `execute_hash_partition_for_worker()` |
 | **Schema preservation** | Arrow IPC embeds the full schema; DuckDB temp table DDL is derived from it | `build_create_table_sql()` |
-| **Empty-batch safety** | If an exchange produces zero rows, a stub `CREATE TEMPORARY TABLE … AS SELECT … WHERE FALSE` is created so stage SQL does not fail | `LocalStageExecutor::run_sql_with_inputs()` |
+| **Empty-batch safety** | Exchange functions preserve schema even when zero rows are produced by returning `RecordBatch::new_empty(schema)` instead of an empty `Vec`. The downstream `register_arrow_batches()` creates a properly-schemaed 0-row temp table so stage SQL referencing columns by name works. If schema is genuinely unavailable (no upstream tickets), the table is skipped and the SQL fails with a clear "table does not exist" error. | `ExchangeRuntime`, `arrow_utils.rs` |
 | **Result retrieval** | Output is stored in `StageResultStore` (TTL-based, keyed by `(tenant_id, query_id, stage_id)`); coordinator retrieves it via `DoGet(ticket)` | `result_store.rs`, `service.rs` |
 | **Retry safety** | `execute_stage_with_retry()` uses exponential back-off; exchange inputs are re-serialized on each attempt | `coordinator.rs` |
 

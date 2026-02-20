@@ -559,11 +559,18 @@ where
             let mut registered_tables = Vec::new();
             for (table_name, batches) in &exchange_inputs {
                 if batches.is_empty() {
-                    debug!(
+                    // Exchange returned a truly empty Vec (no batches at all,
+                    // no schema).  After the exchange-level schema-preservation
+                    // fix this path should be extremely rare.  Skip table
+                    // registration so that any SQL referencing the table fails
+                    // with a clear "table does not exist" error rather than a
+                    // silent column mismatch.
+                    warn!(
                         query_id = %query_id,
                         stage_id = stage_id,
                         table = %table_name,
-                        "Skipping empty exchange input"
+                        "Exchange input has no batches and no schema — \
+                         skipping table registration"
                     );
                     continue;
                 }

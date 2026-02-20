@@ -360,29 +360,20 @@ impl LocalStageExecutor {
                 })?;
                 registered_tables.push(table_name.clone());
             } else {
-                // Exchange returned no data.  We still need the table to exist
-                // so that SQL referencing it (e.g. `SELECT * FROM __exchange_0`)
-                // does not fail with "table does not exist".  Create a stub
-                // empty table.  This can happen legitimately when an upstream
-                // stage produces zero rows.
-                tracing::debug!(
+                // Exchange returned a truly empty Vec (no batches at all, no
+                // schema).  After the exchange-level schema-preservation fix
+                // this path should be extremely rare — it only triggers when
+                // zero upstream tickets existed for the exchange.  Instead of
+                // creating a wrong-schema stub (`SELECT 1 WHERE FALSE`), skip
+                // the table so that any SQL referencing it fails with a clear
+                // "table does not exist" error rather than a silent column
+                // mismatch.
+                tracing::warn!(
                     table_name = table_name.as_str(),
-                    "Registering empty exchange table (0 batches)"
+                    "Exchange input has no batches and no schema — \
+                     skipping table registration (SQL referencing this \
+                     table will fail)"
                 );
-                conn.execute(
-                    &format!(
-                        "CREATE TEMPORARY TABLE IF NOT EXISTS \"{}\" AS SELECT 1 WHERE FALSE",
-                        table_name.replace('"', "\"\"")
-                    ),
-                    [],
-                )
-                .map_err(|e| {
-                    StageExecutionError::ExecutionFailed(format!(
-                        "Failed to create empty stub for '{}': {}",
-                        table_name, e
-                    ))
-                })?;
-                registered_tables.push(table_name.clone());
             }
         }
 
@@ -612,18 +603,14 @@ async fn execute_stage_batches(
                 ))?;
             registered_tables.push(table_name.clone());
         } else {
-            // Create empty stub table so SQL doesn't fail
-            conn.execute(
-                &format!(
-                    "CREATE TEMPORARY TABLE IF NOT EXISTS \"{}\" AS SELECT 1 WHERE FALSE",
-                    table_name.replace('"', "\"\"")
-                ),
-                [],
-            )
-            .map_err(|e| StageExecutionError::ExecutionFailed(
-                format!("Failed to create empty stub for '{}': {}", table_name, e)
-            ))?;
-            registered_tables.push(table_name.clone());
+            // Exchange returned a truly empty Vec — skip table registration.
+            // See run_sql_with_inputs() for the detailed rationale.
+            tracing::warn!(
+                table_name = table_name.as_str(),
+                "Exchange input has no batches and no schema — \
+                 skipping table registration (SQL referencing this \
+                 table will fail)"
+            );
         }
     }
 
@@ -952,5 +939,123 @@ mod tests {
         let result = execute_stage_batches(&stage, &inputs).await;
 
         assert!(result.is_err(), "Expected Err for invalid SQL");
+    }
+
+    // =========================================================================
+    // Empty exchange schema-preservation tests
+    //
+    // Verify that a 0-row RecordBatch with the correct schema (produced by the
+    // exchange-level fix) allows downstream SQL to reference columns by name,
+    // and that a truly empty Vec<RecordBatch> (no schema) is handled gracefully
+    // by skipping table registration.
+    // =========================================================================
+
+    /// A 0-row batch carrying the correct schema should produce a table with
+    /// the right columns so that `SELECT col FROM __exchange_0` works.
+    #[test]
+    fn test_run_sql_with_empty_schema_preserving_batch() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use duckdb::Connection;
+        use std::sync::Arc;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Build a 0-row batch that carries a 2-column schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        let empty_batch = RecordBatch::new_empty(schema);
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![empty_batch]);
+
+        // SQL references columns by name — this would fail with the old
+        // `SELECT 1 WHERE FALSE` stub because neither "region" nor "amount"
+        // existed in that schema.
+        let result = LocalStageExecutor::run_sql_with_inputs(
+            &conn,
+            "SELECT region, amount FROM \"__exchange_0\"",
+            &inputs,
+        );
+
+        assert!(
+            result.is_ok(),
+            "SQL with column references should succeed on a 0-row schema-preserving table: {:?}",
+            result.err()
+        );
+
+        let batches = result.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "Expected 0 rows from an empty exchange");
+    }
+
+    /// A truly empty Vec (no batches, no schema) should be skipped rather than
+    /// creating a wrong-schema stub table.
+    #[test]
+    fn test_run_sql_with_truly_empty_input_skips_table() {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![]);
+
+        // SQL references the exchange table — it should fail because the empty
+        // input was skipped (no table created).
+        let result = LocalStageExecutor::run_sql_with_inputs(
+            &conn,
+            "SELECT region FROM \"__exchange_0\"",
+            &inputs,
+        );
+
+        assert!(
+            result.is_err(),
+            "SQL should fail when exchange has no batches and no schema"
+        );
+
+        let err_msg = format!("{:?}", result.err().unwrap());
+        // DuckDB should report the table as non-existent rather than a
+        // column mismatch on a wrong-schema stub.
+        assert!(
+            err_msg.contains("__exchange_0"),
+            "Error should mention the missing table name, got: {}",
+            err_msg
+        );
+    }
+
+    /// `execute_stage_batches` with a 0-row schema-preserving batch.
+    #[tokio::test]
+    async fn test_execute_stage_batches_empty_schema_preserving_batch() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int64, false),
+            Field::new("total", DataType::Float64, true),
+        ]));
+        let empty_batch = RecordBatch::new_empty(schema);
+
+        let stage = Stage {
+            stage_id: StageId(0),
+            target_workers: vec!["local".into()],
+            inputs: vec![],
+            output: StageOutput::default(),
+            stage_sql: "SELECT customer_id, total FROM \"__exchange_0\"".to_string(),
+            limits: StageLimits::default(),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("__exchange_0".to_string(), vec![empty_batch]);
+
+        let result = execute_stage_batches(&stage, &inputs).await;
+
+        assert!(
+            result.is_ok(),
+            "Schema-preserving empty batch should allow column-referencing SQL: {:?}",
+            result.err()
+        );
+        let total_rows: usize = result.unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0);
     }
 }
