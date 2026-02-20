@@ -16,6 +16,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use dashmap::DashMap;
 use futures_util::stream::{self, BoxStream};
 use futures_util::TryStreamExt;
 use tokio::sync::RwLock;
@@ -102,26 +103,31 @@ pub struct CachedStageStats {
 ///
 /// Results are cached here after `submit_stage` and retrieved via `do_get`.
 /// TODO: Add TTL-based expiration for stale results.
-#[derive(Default)]
 pub struct StageResultStore {
-    results: RwLock<HashMap<StageResultKey, CachedStageResult>>,
+    results: DashMap<StageResultKey, CachedStageResult>,
+}
+
+impl Default for StageResultStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StageResultStore {
     pub fn new() -> Self {
         Self {
-            results: RwLock::new(HashMap::new()),
+            results: DashMap::new(),
         }
     }
 
     /// Insert a cached stage result.
     pub async fn insert(&self, key: StageResultKey, result: CachedStageResult) {
-        self.results.write().await.insert(key, result);
+        self.results.insert(key, result);
     }
 
     /// Get a reference to a cached stage result (doesn't remove it).
     pub async fn get(&self, key: &StageResultKey) -> Option<CachedStageStats> {
-        self.results.read().await.get(key).map(|r| r.stats.clone())
+        self.results.get(key).map(|r| r.stats.clone())
     }
 
     /// Store a stage result.
@@ -132,12 +138,12 @@ impl StageResultStore {
         stats: CachedStageStats,
     ) {
         let result = CachedStageResult::new(batches, stats);
-        self.results.write().await.insert(key, result);
+        self.results.insert(key, result);
     }
 
     /// Retrieve and remove a stage result.
     pub async fn take(&self, key: &StageResultKey) -> Option<CachedStageResult> {
-        self.results.write().await.remove(key)
+        self.results.remove(key).map(|(_, v)| v)
     }
 
     /// Get the batches for a stage result without removing it (non-destructive read).
@@ -145,35 +151,29 @@ impl StageResultStore {
     /// Returns `None` if the result is not cached. The caller should retry with DoGet
     /// if retries are needed — the result remains available until TTL expiry.
     pub async fn get_batches(&self, key: &StageResultKey) -> Option<Vec<RecordBatch>> {
-        self.results
-            .read()
-            .await
-            .get(key)
-            .map(|r| r.batches.clone())
+        self.results.get(key).map(|r| r.batches.clone())
     }
 
     /// Evict results older than `ttl`. Called from the background cleanup task.
     pub async fn evict_expired(&self, ttl: Duration) {
         let now = Instant::now();
         self.results
-            .write()
-            .await
             .retain(|_, result| now.duration_since(result.created_at) < ttl);
     }
 
     /// Check if a result exists.
     pub async fn contains(&self, key: &StageResultKey) -> bool {
-        self.results.read().await.contains_key(key)
+        self.results.contains_key(key)
     }
 
     /// Get the number of cached results.
     pub async fn len(&self) -> usize {
-        self.results.read().await.len()
+        self.results.len()
     }
 
     /// Return `true` when the store has no cached results.
     pub async fn is_empty(&self) -> bool {
-        self.results.read().await.is_empty()
+        self.results.is_empty()
     }
 }
 
@@ -509,9 +509,7 @@ where
         // 3. Remove cached results
         
         // For now, just remove any cached results for this query
-        let mut results = self.stage_results.results.write().await;
-        results.retain(|key, _| key.query_id != request.query_id);
-        drop(results);
+        self.stage_results.results.retain(|key, _| key.query_id != request.query_id);
 
         // Create response
         let response_body = format!("Query {} cancelled", request.query_id);

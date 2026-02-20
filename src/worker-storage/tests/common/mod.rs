@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures_util::stream;
@@ -91,7 +93,7 @@ pub fn create_test_batch(schema: Arc<Schema>, start_id: i64, row_count: usize) -
 /// Creates a test Arrow stream from batches
 pub fn create_test_stream(batches: Vec<RecordBatch>) -> RecordBatchStream {
     Box::pin(stream::iter(
-        batches.into_iter().map(|b| Ok::<_, StorageError>(b)),
+        batches.into_iter().map(Ok::<_, StorageError>),
     ))
 }
 

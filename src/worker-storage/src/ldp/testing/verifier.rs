@@ -24,8 +24,32 @@ impl TestVerifier {
         reference: &[RecordBatch],
         check_ordering: bool,
     ) -> Result<(), VerificationError> {
-        let dist_concat = Self::concat_batches(distributed)?;
-        let ref_concat = Self::concat_batches(reference)?;
+        let dist_result = Self::concat_batches(distributed);
+        let ref_result = Self::concat_batches(reference);
+
+        // Treat empty-vs-empty as equal. Both sides produced no batches (e.g. a
+        // query that returns zero rows via Arrow Flight / the reference engine).
+        // If only one side is empty that is a row-count mismatch.
+        let (dist_concat, ref_concat) = match (dist_result, ref_result) {
+            (Err(VerificationError::EmptyResults), Err(VerificationError::EmptyResults)) => {
+                return Ok(());
+            }
+            (Err(VerificationError::EmptyResults), Ok(ref_b)) => {
+                return Err(VerificationError::RowCountMismatch {
+                    distributed: 0,
+                    reference: ref_b.num_rows(),
+                });
+            }
+            (Ok(dist_b), Err(VerificationError::EmptyResults)) => {
+                return Err(VerificationError::RowCountMismatch {
+                    distributed: dist_b.num_rows(),
+                    reference: 0,
+                });
+            }
+            (Err(e), _) => return Err(e),
+            (_, Err(e)) => return Err(e),
+            (Ok(d), Ok(r)) => (d, r),
+        };
 
         if dist_concat.num_rows() != ref_concat.num_rows() {
             return Err(VerificationError::RowCountMismatch {
@@ -83,8 +107,30 @@ impl TestVerifier {
         tolerance: f64,
         check_ordering: bool,
     ) -> Result<(), VerificationError> {
-        let dist_concat = Self::concat_batches(distributed)?;
-        let ref_concat = Self::concat_batches(reference)?;
+        let dist_result = Self::concat_batches(distributed);
+        let ref_result = Self::concat_batches(reference);
+
+        // Mirror the empty-vs-empty logic from assert_results_equal.
+        let (dist_concat, ref_concat) = match (dist_result, ref_result) {
+            (Err(VerificationError::EmptyResults), Err(VerificationError::EmptyResults)) => {
+                return Ok(());
+            }
+            (Err(VerificationError::EmptyResults), Ok(ref_b)) => {
+                return Err(VerificationError::RowCountMismatch {
+                    distributed: 0,
+                    reference: ref_b.num_rows(),
+                });
+            }
+            (Ok(dist_b), Err(VerificationError::EmptyResults)) => {
+                return Err(VerificationError::RowCountMismatch {
+                    distributed: dist_b.num_rows(),
+                    reference: 0,
+                });
+            }
+            (Err(e), _) => return Err(e),
+            (_, Err(e)) => return Err(e),
+            (Ok(d), Ok(r)) => (d, r),
+        };
 
         if dist_concat.num_rows() != ref_concat.num_rows() {
             return Err(VerificationError::RowCountMismatch {
@@ -100,27 +146,32 @@ impl TestVerifier {
             });
         }
 
-        // For approximate comparison, we need to handle floating point values specially
-        for col_idx in 0..dist_concat.num_columns() {
-            let dist_col = dist_concat.column(col_idx);
-            let ref_col = ref_concat.column(col_idx);
+        // Sort both sides to a canonical row order when order-independence is
+        // required, ensuring we always compare logically equivalent rows against
+        // each other regardless of engine output order. This prevents the old
+        // bug where positional column comparison paired wrong rows together when
+        // the two sides happened to return rows in different orders.
+        let (dist_aligned, ref_aligned) = if check_ordering {
+            (dist_concat, ref_concat)
+        } else {
+            (
+                Self::sort_batch_by_all_columns(&dist_concat)?,
+                Self::sort_batch_by_all_columns(&ref_concat)?,
+            )
+        };
 
-            Self::compare_columns_approximately(dist_col, ref_col, tolerance, col_idx)?;
+        // Compare cell by cell: float columns use tolerance, all others exact.
+        for col_idx in 0..dist_aligned.num_columns() {
+            for row_idx in 0..dist_aligned.num_rows() {
+                Self::compare_cell_approximately(
+                    dist_aligned.column(col_idx),
+                    ref_aligned.column(col_idx),
+                    row_idx,
+                    col_idx,
+                    tolerance,
+                )?;
+            }
         }
-
-        // Also check row equivalence (for non-floating point cols mainly)
-        let dist_rows = Self::convert_to_sorted_rows(&dist_concat, check_ordering)?;
-        let ref_rows = Self::convert_to_sorted_rows(&ref_concat, check_ordering)?;
-
-        if dist_rows.len() != ref_rows.len() {
-            return Err(VerificationError::RowCountMismatch {
-                distributed: dist_rows.len(),
-                reference: ref_rows.len(),
-            });
-        }
-
-        // For approximate comparison, we can't rely on row comparison for float cols
-        // So we've already checked individual columns above
 
         Ok(())
     }
@@ -191,7 +242,137 @@ impl TestVerifier {
         }
     }
 
+    /// Sort a `RecordBatch` by all columns lexicographically, producing a new
+    /// batch with rows in a canonical order.
+    ///
+    /// This is used by [`Self::assert_results_approximately_equal`] to align
+    /// rows from both sides before cell-by-cell comparison, so that logically
+    /// equivalent result sets compare equal regardless of row order.
+    fn sort_batch_by_all_columns(batch: &RecordBatch) -> Result<RecordBatch, VerificationError> {
+        use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
+
+        if batch.num_rows() == 0 {
+            return Ok(batch.clone());
+        }
+
+        let sort_columns: Vec<SortColumn> = batch
+            .columns()
+            .iter()
+            .map(|col| SortColumn {
+                values: Arc::clone(col),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            })
+            .collect();
+
+        let indices = lexsort_to_indices(&sort_columns, None)
+            .map_err(|e| VerificationError::ArrowError(e.to_string()))?;
+
+        let sorted_columns: Result<Vec<ArrayRef>, ArrowError> = batch
+            .columns()
+            .iter()
+            .map(|col| take(col.as_ref(), &indices, None))
+            .collect();
+
+        let sorted_columns =
+            sorted_columns.map_err(|e| VerificationError::ArrowError(e.to_string()))?;
+        RecordBatch::try_new(batch.schema(), sorted_columns)
+            .map_err(|e| VerificationError::ArrowError(e.to_string()))
+    }
+
+    /// Compare a single cell from two arrays.
+    ///
+    /// - `Float32` / `Float64` columns: passes if `|a - b| <= tolerance`.
+    /// - All other types: passes only on exact equality.
+    /// - If exactly one of the two cells is `null`, returns a mismatch error.
+    fn compare_cell_approximately(
+        dist_col: &ArrayRef,
+        ref_col: &ArrayRef,
+        row_idx: usize,
+        col_idx: usize,
+        tolerance: f64,
+    ) -> Result<(), VerificationError> {
+        // Null handling: both null → equal; exactly one null → mismatch.
+        match (dist_col.is_null(row_idx), ref_col.is_null(row_idx)) {
+            (true, true) => return Ok(()),
+            (true, false) | (false, true) => {
+                return Err(VerificationError::ValueMismatch {
+                    column_index: col_idx,
+                    row_index: row_idx,
+                    value1: Self::format_cell_value(dist_col, row_idx),
+                    value2: Self::format_cell_value(ref_col, row_idx),
+                });
+            }
+            (false, false) => {}
+        }
+
+        match dist_col.data_type() {
+            DataType::Float32 => {
+                let a = dist_col
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(row_idx) as f64;
+                let b = ref_col
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(row_idx) as f64;
+                if (a - b).abs() > tolerance {
+                    return Err(VerificationError::ApproximateValueMismatch {
+                        column_index: col_idx,
+                        row_index: row_idx,
+                        value1: a,
+                        value2: b,
+                        tolerance,
+                    });
+                }
+            }
+            DataType::Float64 => {
+                let a = dist_col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row_idx);
+                let b = ref_col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row_idx);
+                if (a - b).abs() > tolerance {
+                    return Err(VerificationError::ApproximateValueMismatch {
+                        column_index: col_idx,
+                        row_index: row_idx,
+                        value1: a,
+                        value2: b,
+                        tolerance,
+                    });
+                }
+            }
+            // All other types: slice the array to a single-row view and
+            // compare exactly. Using a slice avoids downcasting against every
+            // possible concrete Arrow array type.
+            _ => {
+                let dist_slice = dist_col.slice(row_idx, 1);
+                let ref_slice = ref_col.slice(row_idx, 1);
+                if dist_slice != ref_slice {
+                    return Err(VerificationError::ValueMismatch {
+                        column_index: col_idx,
+                        row_index: row_idx,
+                        value1: Self::format_cell_value(dist_col, row_idx),
+                        value2: Self::format_cell_value(ref_col, row_idx),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compare two columns for approximate equality.
+    #[allow(dead_code)]
     fn compare_columns_approximately(
         col1: &ArrayRef,
         col2: &ArrayRef,
@@ -524,5 +705,51 @@ mod tests {
         let batch = create_test_batch_with_strings(vec!["hello", "world"]);
         TestVerifier::print_results(&[batch], "test");
         // Just checking this doesn't panic
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue-2 regression tests: approximate comparison must be order-independent
+    // -----------------------------------------------------------------------
+
+    /// Two float batches with the same values in *different row orders* must
+    /// compare as equal in order-independent mode (check_ordering = false).
+    #[test]
+    fn test_approx_equal_order_independent_same_values() {
+        // dist:      [3.0, 1.0, 2.0]
+        // reference: [1.0, 2.0, 3.0]  — same set, different order
+        let dist = create_test_batch_with_floats(vec![3.0, 1.0, 2.0]);
+        let reference = create_test_batch_with_floats(vec![1.0, 2.0, 3.0]);
+
+        let result = TestVerifier::assert_results_approximately_equal(
+            &[dist],
+            &[reference],
+            0.001,
+            false, // order-independent
+        );
+        assert!(
+            result.is_ok(),
+            "same float values in different order should pass: {result:?}"
+        );
+    }
+
+    /// Two float batches whose values differ by more than the tolerance after
+    /// row alignment must fail, even when check_ordering = false.
+    #[test]
+    fn test_approx_equal_order_independent_exceeds_tolerance() {
+        // After sorting both: [1.0, 2.0, 3.0] vs [1.0, 2.0, 3.5]
+        // The last pair differs by 0.5 > 0.1.
+        let dist = create_test_batch_with_floats(vec![3.0, 1.0, 2.0]);
+        let reference = create_test_batch_with_floats(vec![1.0, 2.0, 3.5]);
+
+        let result = TestVerifier::assert_results_approximately_equal(
+            &[dist],
+            &[reference],
+            0.1,
+            false, // order-independent
+        );
+        assert!(
+            result.is_err(),
+            "values exceeding tolerance after alignment should fail"
+        );
     }
 }

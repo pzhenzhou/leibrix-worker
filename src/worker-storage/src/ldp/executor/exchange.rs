@@ -20,7 +20,7 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 /// Parameters for a distributed hash-partition exchange.
@@ -820,7 +820,7 @@ pub struct DistributedExchangeRuntime {
     /// Connection pool to workers.
     connection_pool: Arc<WorkerConnectionPool>,
     /// Cached remote tickets (query_id:stage_id:worker_id -> ticket_bytes).
-    remote_tickets: RwLock<HashMap<String, Vec<u8>>>,
+    remote_tickets: DashMap<String, Vec<u8>>,
     /// Metrics registry for tracking exchange performance.
     metrics_registry: Arc<ExchangeMetricsRegistry>,
 }
@@ -831,7 +831,7 @@ impl DistributedExchangeRuntime {
         Self {
             tenant_id,
             connection_pool,
-            remote_tickets: RwLock::new(HashMap::new()),
+            remote_tickets: DashMap::new(),
             metrics_registry: Arc::new(ExchangeMetricsRegistry::new()),
         }
     }
@@ -850,7 +850,7 @@ impl DistributedExchangeRuntime {
         Self {
             tenant_id,
             connection_pool,
-            remote_tickets: RwLock::new(HashMap::new()),
+            remote_tickets: DashMap::new(),
             metrics_registry,
         }
     }
@@ -874,7 +874,7 @@ impl DistributedExchangeRuntime {
         ticket_bytes: Vec<u8>,
     ) {
         let key = format!("{}:{}:{}", query_id, stage_id, worker_id);
-        self.remote_tickets.write().await.insert(key, ticket_bytes);
+        self.remote_tickets.insert(key, ticket_bytes);
     }
 
     /// Get a registered ticket.
@@ -885,7 +885,7 @@ impl DistributedExchangeRuntime {
         worker_id: &WorkerId,
     ) -> Option<Vec<u8>> {
         let key = format!("{}:{}:{}", query_id, stage_id, worker_id);
-        self.remote_tickets.read().await.get(&key).cloned()
+        self.remote_tickets.get(&key).map(|v| v.clone())
     }
 
     // ========================================================================

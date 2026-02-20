@@ -5,12 +5,11 @@
 //! Each worker maintains its own result store to serve results to other workers
 //! and the coordinator.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tracing::{debug, error};
 
 use super::stage::StageExecutionStats;
@@ -41,7 +40,7 @@ impl CachedStageResult {
 /// Store for caching stage execution results with TTL-based eviction.
 pub struct StageResultStore {
     /// Cache mapping (tenant_id, query_id, stage_id) to cached results.
-    cache: RwLock<HashMap<(String, String, u32), CachedStageResult>>,
+    cache: DashMap<(String, String, u32), CachedStageResult>,
     /// Time-to-live for cached results.
     ttl: Duration,
     /// Cleanup interval for expired results.
@@ -52,7 +51,7 @@ impl StageResultStore {
     /// Create a new result store with the specified TTL.
     pub fn new(ttl: Duration) -> Self {
         Self {
-            cache: RwLock::new(HashMap::new()),
+            cache: DashMap::new(),
             ttl,
             cleanup_interval: Duration::from_secs(60), // Cleanup every minute
         }
@@ -76,15 +75,12 @@ impl StageResultStore {
         let key = (tenant_id, query_id, stage_id);
         let result = CachedStageResult::new(batches, stats);
 
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(key.clone(), result);
-        }
-
         debug!(
             "Registered stage result: tenant={}, query={}, stage={}",
             key.0, key.1, key.2
         );
+
+        self.cache.insert(key, result);
 
         Ok(())
     }
@@ -98,24 +94,21 @@ impl StageResultStore {
     ) -> Result<Option<Vec<RecordBatch>>, Box<dyn std::error::Error + Send + Sync>> {
         let key = (tenant_id.to_string(), query_id.to_string(), stage_id);
 
-        {
-            let cache = self.cache.read().await;
-            if let Some(result) = cache.get(&key) {
-                // Check if result is expired
-                if result.created_at.elapsed() > self.ttl {
-                    debug!(
-                        "Cached result expired: tenant={}, query={}, stage={}",
-                        key.0, key.1, key.2
-                    );
-                    return Ok(None);
-                }
-
+        if let Some(result) = self.cache.get(&key) {
+            // Check if result is expired
+            if result.created_at.elapsed() > self.ttl {
                 debug!(
-                    "Retrieved cached result: tenant={}, query={}, stage={}",
+                    "Cached result expired: tenant={}, query={}, stage={}",
                     key.0, key.1, key.2
                 );
-                return Ok(Some(result.batches.clone()));
+                return Ok(None);
             }
+
+            debug!(
+                "Retrieved cached result: tenant={}, query={}, stage={}",
+                key.0, key.1, key.2
+            );
+            return Ok(Some(result.batches.clone()));
         }
 
         debug!(
@@ -134,8 +127,7 @@ impl StageResultStore {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let key = (tenant_id.to_string(), query_id.to_string(), stage_id);
 
-        let mut cache = self.cache.write().await;
-        let existed = cache.remove(&key).is_some();
+        let existed = self.cache.remove(&key).is_some();
 
         if existed {
             debug!(
@@ -153,22 +145,23 @@ impl StageResultStore {
         tenant_id: &str,
         query_id: &str,
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cache = self.cache.write().await;
-        let mut removed_count = 0;
-
-        let keys_to_remove: Vec<_> = cache
-            .keys()
-            .filter(|(t, q, _)| t == tenant_id && q == query_id)
-            .cloned()
+        let keys_to_remove: Vec<_> = self.cache
+            .iter()
+            .filter(|entry| {
+                let k = entry.key();
+                k.0 == tenant_id && k.1 == query_id
+            })
+            .map(|entry| entry.key().clone())
             .collect();
 
+        let mut removed_count = 0;
         for key in keys_to_remove {
-            cache.remove(&key);
-            removed_count += 1;
             debug!(
                 "Removed cached result for query: tenant={}, query={}, stage={}",
                 key.0, key.1, key.2
             );
+            self.cache.remove(&key);
+            removed_count += 1;
         }
 
         Ok(removed_count)
@@ -176,18 +169,16 @@ impl StageResultStore {
 
     /// Cleanup expired results from the cache.
     pub async fn cleanup_expired(&self) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cache = self.cache.write().await;
-        let now = Instant::now();
         let ttl = self.ttl;
 
-        let keys_to_remove: Vec<_> = cache
+        let keys_to_remove: Vec<_> = self.cache
             .iter()
-            .filter(|(_, result)| now.duration_since(result.created_at) > ttl)
-            .map(|(k, _)| k.clone())
+            .filter(|entry| entry.value().created_at.elapsed() > ttl)
+            .map(|entry| entry.key().clone())
             .collect();
 
         for key in &keys_to_remove {
-            cache.remove(key);
+            self.cache.remove(key);
             debug!(
                 "Expired cached result: tenant={}, query={}, stage={}",
                 key.0, key.1, key.2
@@ -223,14 +214,13 @@ impl StageResultStore {
 
     /// Get cache statistics.
     pub async fn stats(&self) -> Result<StageResultStoreStats, Box<dyn std::error::Error + Send + Sync>> {
-        let cache = self.cache.read().await;
-        let total_entries = cache.len();
+        let total_entries = self.cache.len();
 
         let mut valid_count = 0;
         let mut expired_count = 0;
 
-        for (_, result) in cache.iter() {
-            if result.created_at.elapsed() > self.ttl {
+        for entry in self.cache.iter() {
+            if entry.value().created_at.elapsed() > self.ttl {
                 expired_count += 1;
             } else {
                 valid_count += 1;

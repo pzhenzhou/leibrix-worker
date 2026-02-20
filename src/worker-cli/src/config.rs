@@ -9,6 +9,7 @@ use worker_storage::engine::duckdb::DuckDBConfig;
 ///
 /// This does not establish a connection; it only ensures the CLI config can
 /// cleanly map into the generated client types.
+#[allow(dead_code)]
 pub type ControlPlaneClient =
     worker_cp::proto::control_plane::control_plane_service_client::ControlPlaneServiceClient<
         tonic::transport::Channel,
@@ -37,6 +38,7 @@ pub enum Command {
 ///
 /// This struct lives in `worker-cli` and is produced from clap-parsed arguments.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LeibrixWorkerConfig {
     pub tenant_id: String,
     pub worker_id: String,
@@ -47,6 +49,7 @@ pub struct LeibrixWorkerConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct TlsConfig {
     pub ca_path: Option<PathBuf>,
     pub cert_path: Option<PathBuf>,
@@ -213,12 +216,10 @@ impl LeibrixWorkerConfig {
 
         // TLS: either all (ca/cert/key) are present, or none.
         let tls_any = args.tls_ca.is_some() || args.tls_cert.is_some() || args.tls_key.is_some();
-        if tls_any {
-            if args.tls_ca.is_none() || args.tls_cert.is_none() || args.tls_key.is_none() {
-                anyhow::bail!(
-                    "TLS is partially configured; provide --tls-ca, --tls-cert, and --tls-key together"
-                );
-            }
+        if tls_any && (args.tls_ca.is_none() || args.tls_cert.is_none() || args.tls_key.is_none()) {
+            anyhow::bail!(
+                "TLS is partially configured; provide --tls-ca, --tls-cert, and --tls-key together"
+            );
         }
 
         let channel_capacity: usize = usize::try_from(args.duckdb_channel_capacity)
@@ -226,15 +227,17 @@ impl LeibrixWorkerConfig {
         let max_identifiers: usize = usize::try_from(args.duckdb_max_identifiers)
             .context("duckdb-max-identifiers is too large for this platform")?;
 
-        let mut duckdb = DuckDBConfig::default();
-        duckdb.flush_rows_threshold = args.duckdb_flush_rows_threshold;
-        duckdb.channel_capacity = channel_capacity;
-        duckdb.tmp_dir = args.duckdb_tmp_dir;
-        duckdb.max_identifiers = max_identifiers;
-        duckdb.memory_limit_mb = if args.duckdb_no_memory_limit {
-            None
-        } else {
-            Some(args.duckdb_memory_limit_mb)
+        let duckdb = DuckDBConfig {
+            flush_rows_threshold: args.duckdb_flush_rows_threshold,
+            channel_capacity,
+            tmp_dir: args.duckdb_tmp_dir,
+            max_identifiers,
+            memory_limit_mb: if args.duckdb_no_memory_limit {
+                None
+            } else {
+                Some(args.duckdb_memory_limit_mb)
+            },
+            ..DuckDBConfig::default()
         };
 
         Ok(Self {

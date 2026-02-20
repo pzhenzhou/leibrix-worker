@@ -3,9 +3,11 @@
 //! This module provides the server builder and runner for the Arrow Flight
 //! query service.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
+use tokio::net::TcpListener;
 use tonic::transport::{Identity, Server};
 use tracing::{info, warn};
 
@@ -79,10 +81,12 @@ where
             warn!("TLS is disabled for Flight server - not recommended for production");
         }
 
-        // Apply server configuration
+        // Apply server configuration.
+        // h2 max_frame_size must be in [16_384, 16_777_215]; clamp to stay in range.
+        let h2_frame_size = (self.config.max_message_size as u32).min(16_777_215);
         let router = server_builder
             .tcp_nodelay(true)
-            .max_frame_size(Some(self.config.max_message_size as u32))
+            .max_frame_size(Some(h2_frame_size))
             .concurrency_limit_per_connection(self.config.concurrency_limit)
             .add_service(flight_server);
 
@@ -138,10 +142,12 @@ where
             warn!("TLS is disabled for Flight server - not recommended for production");
         }
 
-        // Apply server configuration
+        // Apply server configuration.
+        // h2 max_frame_size must be in [16_384, 16_777_215]; clamp to stay in range.
+        let h2_frame_size = (self.config.max_message_size as u32).min(16_777_215);
         let router = server_builder
             .tcp_nodelay(true)
-            .max_frame_size(Some(self.config.max_message_size as u32))
+            .max_frame_size(Some(h2_frame_size))
             .concurrency_limit_per_connection(self.config.concurrency_limit)
             .add_service(flight_server);
 
@@ -161,6 +167,91 @@ where
         info!("Arrow Flight server stopped gracefully");
         Ok(())
     }
+
+    /// Build and run the Flight server on an OS-assigned ephemeral port with graceful shutdown.
+    ///
+    /// Pre-binds a [`TcpListener`] to `127.0.0.1:0`, letting the OS assign a free port.
+    /// Returns the actual bound [`SocketAddr`] alongside the server future so callers
+    /// (typically tests) can connect a client without polling.
+    ///
+    /// # Arguments
+    /// * `shutdown_signal` - A future that completes when shutdown is requested
+    ///
+    /// # Returns
+    /// A tuple of the server future and the bound [`SocketAddr`].
+    ///
+    /// # Errors
+    /// Returns an error if the TCP listener fails to bind or TLS configuration is invalid.
+    pub async fn run_with_shutdown_and_addr<F>(
+        self,
+        shutdown_signal: F,
+    ) -> Result<
+        (
+            impl std::future::Future<Output = Result<(), FlightServerError>>,
+            SocketAddr,
+        ),
+        FlightServerError,
+    >
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let flight_service = WorkerFlightService::new(
+            self.query_engine,
+            self.sql_transformer,
+            self.tenant_id.clone(),
+            self.shared_db,
+        );
+
+        let flight_server = FlightServiceServer::new(flight_service);
+
+        // Build the tonic server
+        let mut server_builder = Server::builder();
+
+        // Configure TLS if provided
+        if let Some(tls_config) = self.config.tls_config {
+            info!("TLS enabled for Flight server");
+            server_builder = server_builder
+                .tls_config(tls_config)
+                .map_err(FlightServerError::TlsConfig)?;
+        } else {
+            warn!("TLS is disabled for Flight server - not recommended for production");
+        }
+
+        // Apply server configuration.
+        // h2 max_frame_size must be in [16_384, 16_777_215]; clamp to stay in range.
+        let h2_frame_size = (self.config.max_message_size as u32).min(16_777_215);
+        let router = server_builder
+            .tcp_nodelay(true)
+            .max_frame_size(Some(h2_frame_size))
+            .concurrency_limit_per_connection(self.config.concurrency_limit)
+            .add_service(flight_server);
+
+        // Pre-bind to an ephemeral port so the caller knows the address before awaiting.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(FlightServerError::Bind)?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(FlightServerError::Bind)?;
+
+        info!(
+            bind_addr = %bound_addr,
+            tenant_id = %self.tenant_id,
+            max_message_size = self.config.max_message_size,
+            concurrency_limit = self.config.concurrency_limit,
+            "Starting Arrow Flight server (ephemeral port) with graceful shutdown"
+        );
+
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let server_future = async move {
+            router
+                .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                .await
+                .map_err(FlightServerError::ServerRun)
+        };
+
+        Ok((server_future, bound_addr))
+    }
 }
 
 /// Errors that can occur during Flight server operation.
@@ -171,6 +262,9 @@ pub enum FlightServerError {
 
     #[error("Server runtime error: {0}")]
     ServerRun(#[source] tonic::transport::Error),
+
+    #[error("Failed to bind TCP listener: {0}")]
+    Bind(#[source] std::io::Error),
 
     #[error("Failed to read certificate file: {0}")]
     CertificateRead(#[source] std::io::Error),
