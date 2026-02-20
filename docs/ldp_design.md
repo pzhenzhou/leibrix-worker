@@ -25,7 +25,7 @@ LDP solves these problems by:
 | **Epoch-native partitioning** | Data arrives in temporal segments. The planner must understand this natural partitioning to avoid unnecessary shuffles. |
 | **Single-tenant isolation** | Each worker binds to exactly one tenant. No cross-tenant data sharing or resource contention. |
 | **DuckDB as local engine** | Each worker runs an embedded DuckDB instance. LDP must generate standard SQL that DuckDB can execute — no proprietary IR. |
-| **Arrow throughout** | All data movement uses Apache Arrow columnar format for zero-copy compatibility with DuckDB and Arrow Flight. |
+| **Arrow throughout** | All data movement uses Apache Arrow columnar format for efficient interoperability with DuckDB and Arrow Flight. Exchange data is loaded into DuckDB via `CREATE TEMPORARY TABLE` DDL followed by the native `Appender` API (`append_record_batch`), which uses the Arrow C Data Interface for columnar bulk ingestion rather than row-by-row SQL. |
 | **Correctness over performance** | When statistics are uncertain, always choose the safe strategy (shuffle) over the optimized one (broadcast). |
 | **No recursive CTEs** | Recursive CTEs imply unbounded computation. The admission controller rejects them. |
 | **Date predicates required** | Epoch-partitioned tables require time-range predicates to enable epoch pruning. Queries without them are rejected at admission. |
@@ -1264,7 +1264,11 @@ for (table_name, batches) in exchange_inputs {
 ```
 
 Arrow IPC (Streaming format) is chosen because it preserves the full Arrow schema and
-supports zero-copy deserialization on the receiving end.
+enables efficient schema-preserving deserialization on the receiving end. After
+deserialization, exchange data is loaded into DuckDB in two steps: a `CREATE TEMPORARY TABLE`
+DDL statement derived from the Arrow schema, followed by bulk ingestion via the DuckDB
+`Appender` API (`conn.appender()` + `append_record_batch`), which passes each `RecordBatch`
+through the Arrow C Data Interface rather than decomposing it into individual SQL statements.
 
 #### Step 4 — Transmit via Arrow Flight DoAction (coordinator side)
 
@@ -1311,8 +1315,14 @@ result.insert(input_reg.table_name.clone(), batches);
 3. **Register as DuckDB temporary tables**: `register_arrow_batches(conn, "__exchange_N", batches)`
 
 ```rust
-// Build and execute: CREATE TEMPORARY TABLE "__exchange_0" (col1 TYPE1, col2 TYPE2, ...)
-// Then bulk-insert batches via the Arrow C Data Interface appender.
+// 1. CREATE TEMPORARY TABLE "__exchange_0" (col1 TYPE1, col2 TYPE2, ...)
+//    DDL is generated from the Arrow schema via build_create_table_sql().
+//
+// 2. conn.appender("__exchange_0")? → mut appender
+//    appender.append_record_batch(batch)?  // Arrow C Data Interface — columnar bulk
+//    appender.flush()?                     // commit to DuckDB
+//
+// Implemented in append_arrow_batches(), called by register_arrow_batches_with_options().
 ```
 
 **Source**: `src/worker-storage/src/engine/duckdb/arrow_utils.rs` – `register_arrow_batches()`
@@ -1386,7 +1396,8 @@ Stage 1  (target_workers: [w2])
           "__exchange_0" → 1 800 RecordBatches (Arrow IPC decode)
       register_arrow_batches(conn, "__exchange_0", batches)
           → CREATE TEMPORARY TABLE "__exchange_0" (region VARCHAR, revenue DOUBLE)
-          → INSERT 1 800 rows via Arrow appender
+          → appender.append_record_batch(batch) × N  (Arrow C Data Interface bulk ingestion)
+          → appender.flush()
       execute:
           SELECT region, SUM(revenue) FROM __exchange_0 GROUP BY region
           → DuckDB re-aggregates the partial sums → final answer (N distinct regions)
@@ -1483,7 +1494,7 @@ Worker w2 receives the complementary partitions 1 and 3 via a separate
 
 | Property | Mechanism | Code location |
 |----------|-----------|---------------|
-| **Zero-copy within a worker** | Arrow IPC uses a memory-mapped format; DuckDB ingests via Arrow C Data Interface | `arrow_utils.rs` |
+| **Bulk Arrow ingestion** | `register_arrow_batches()` issues `CREATE TEMPORARY TABLE` DDL (schema derived from the first batch), then calls `conn.appender()` + `append_record_batch` (DuckDB `appender-arrow` feature). Each `RecordBatch` is passed through the Arrow C Data Interface for columnar bulk ingestion — no per-row SQL overhead. | `arrow_utils.rs` |
 | **Worker isolation** | Each target worker receives only its own subset (no over-delivery) | `execute_hash_partition_for_worker()` |
 | **Schema preservation** | Arrow IPC embeds the full schema; DuckDB temp table DDL is derived from it | `build_create_table_sql()` |
 | **Empty-batch safety** | If an exchange produces zero rows, a stub `CREATE TEMPORARY TABLE … AS SELECT … WHERE FALSE` is created so stage SQL does not fail | `LocalStageExecutor::run_sql_with_inputs()` |

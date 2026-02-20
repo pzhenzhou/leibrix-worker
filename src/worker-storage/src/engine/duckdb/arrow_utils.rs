@@ -4,10 +4,19 @@
 //! temporary tables and cleaning them up. They are Substrait-independent and
 //! used for registering exchange inputs within the LDP executor.
 //!
+//! # Ingestion mechanism
+//!
+//! Data is loaded via the DuckDB native `Appender` API together with
+//! `Appender::append_record_batch`, which is enabled by the `appender-arrow`
+//! Cargo feature compiled into `worker-storage`.  Each `RecordBatch` is handed
+//! to DuckDB as an Arrow C Data Interface stream, so data is ingested as a
+//! columnar bulk transfer rather than row-by-row.  A final `flush()` call
+//! commits the buffered data before the appender is dropped.
+//!
 //! # Lifecycle
 //!
 //! 1. **Register**: `register_arrow_batches(conn, table_name, batches)` creates
-//!    a DuckDB temporary table from Arrow data.
+//!    a DuckDB temporary table and bulk-loads the batches via the appender.
 //! 2. **Query**: The stage executor runs SQL against the temp table via
 //!    `conn.query_arrow(sql)`.
 //! 3. **Cleanup**: `drop_temp_table(conn, table_name)` removes the temp table.
@@ -15,8 +24,6 @@
 use anyhow::{Context, Result};
 use duckdb::Connection;
 
-use arrow::array::*;
-use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
@@ -27,6 +34,10 @@ use arrow::record_batch::RecordBatch;
 /// Register Arrow record batches as a temporary table in DuckDB.
 ///
 /// This allows exchange inputs to be queried as tables within stage SQL.
+/// Internally it issues `CREATE TEMPORARY TABLE` DDL (schema derived from the
+/// first batch) and then bulk-loads the data via the DuckDB native `Appender`
+/// API (`conn.appender()` + `append_record_batch`), which passes each
+/// `RecordBatch` through the Arrow C Data Interface for columnar bulk ingestion.
 ///
 /// # Arguments
 /// * `conn` - DuckDB connection
@@ -34,7 +45,7 @@ use arrow::record_batch::RecordBatch;
 /// * `batches` - Arrow record batches to register
 ///
 /// # Note
-/// Creates a temporary table that will be dropped when the connection closes,
+/// The table is temporary: it will be dropped when the connection closes,
 /// or explicitly via [`drop_temp_table`].
 pub fn register_arrow_batches(
     conn: &Connection,
@@ -137,133 +148,43 @@ fn arrow_type_to_duckdb(arrow_type: &DataType) -> Result<String> {
     Ok(duckdb_type.to_string())
 }
 
-/// Insert Arrow data into a DuckDB table row-by-row.
+/// Bulk-load Arrow record batches into an existing DuckDB table using the
+/// native `Appender` API.
 ///
-/// Not optimal, but works for bounded intermediates (exchange data between stages).
-fn insert_arrow_data(
+/// Requires the `appender-arrow` Cargo feature (already enabled in
+/// `worker-storage`).  Each `RecordBatch` is handed to DuckDB as an Arrow C
+/// Data Interface stream, so data is ingested in columnar bulk rather than
+/// row-by-row.  A final `flush()` call commits the buffered data before the
+/// appender is dropped.
+fn append_arrow_batches(
     conn: &Connection,
     table_name: &str,
-    batch: &RecordBatch,
+    batches: &[RecordBatch],
 ) -> Result<()> {
-    if batch.num_rows() == 0 {
-        return Ok(());
-    }
+    let mut appender = conn
+        .appender(table_name)
+        .with_context(|| format!("Failed to create appender for '{}'", table_name))?;
 
-    let num_cols = batch.num_columns();
-    let placeholders: Vec<&str> = (0..num_cols).map(|_| "?").collect();
-    let insert_sql = format!(
-        "INSERT INTO {} VALUES ({})",
-        quote_ident(table_name),
-        placeholders.join(", ")
-    );
-
-    let mut stmt = conn
-        .prepare(&insert_sql)
-        .context("Failed to prepare insert statement")?;
-
-    for row in 0..batch.num_rows() {
-        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(num_cols);
-
-        for col in 0..num_cols {
-            let column = batch.column(col);
-            let param = arrow_value_to_duckdb(column, row)?;
-            params.push(param);
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
         }
-
-        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        stmt.execute(param_refs.as_slice())
-            .context("Failed to insert row")?;
+        appender
+            .append_record_batch(batch.clone())
+            .with_context(|| {
+                format!(
+                    "Failed to append batch ({} rows) to '{}'",
+                    batch.num_rows(),
+                    table_name
+                )
+            })?;
     }
+
+    appender
+        .flush()
+        .context("Failed to flush appender to DuckDB")?;
 
     Ok(())
-}
-
-/// Convert an Arrow array value at `row` to a boxed `dyn duckdb::ToSql`.
-fn arrow_value_to_duckdb(
-    array: &dyn Array,
-    row: usize,
-) -> Result<Box<dyn duckdb::ToSql>> {
-    if array.is_null(row) {
-        return Ok(Box::new(None::<i64>));
-    }
-
-    let value: Box<dyn duckdb::ToSql> = match array.data_type() {
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            Box::new(arr.value(row) as i32)
-        }
-        DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            Box::new(arr.value(row) as i32)
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            Box::new(arr.value(row) as i32)
-        }
-        DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            Box::new(arr.value(row) as i32)
-        }
-        DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            Box::new(arr.value(row) as f64)
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            Box::new(arr.value(row).to_string())
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            Box::new(arr.value(row).to_string())
-        }
-        DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            let days = arr.value(row);
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
-                .ok_or_else(|| anyhow::anyhow!("Invalid Date32 value: {}", days))?;
-            // Insert as ISO string; DuckDB will coerce to DATE.
-            Box::new(date.to_string())
-        }
-        DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
-            let millis = arr.value(row);
-            let dt = chrono::DateTime::from_timestamp_millis(millis)
-                .ok_or_else(|| anyhow::anyhow!("Invalid Date64 value: {}", millis))?;
-            Box::new(dt.naive_utc().to_string())
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported type for insertion: {:?}",
-                array.data_type()
-            ))
-        }
-    };
-
-    Ok(value)
 }
 
 /// Register Arrow record batches with configurable table scope and lifecycle.
@@ -278,14 +199,7 @@ fn register_arrow_batches_with_options(
         return Ok(());
     }
 
-    // Concatenate all batches into one.
     let schema = batches[0].schema();
-    let combined = if batches.len() == 1 {
-        batches[0].clone()
-    } else {
-        concat_batches(&schema, batches)
-            .context("Failed to concatenate batches for registration")?
-    };
 
     if replace_if_exists {
         conn.execute(
@@ -295,7 +209,7 @@ fn register_arrow_batches_with_options(
         .with_context(|| format!("Failed to drop existing table '{}'", table_name))?;
     }
 
-    // Create the table with matching schema.
+    // Create the table with a schema derived from the first batch.
     let create_sql = build_create_table_sql(table_name, &schema, temporary)?;
     conn.execute(&create_sql, []).with_context(|| {
         format!(
@@ -305,9 +219,9 @@ fn register_arrow_batches_with_options(
         )
     })?;
 
-    // Insert the data.
-    insert_arrow_data(conn, table_name, &combined)
-        .with_context(|| format!("Failed to insert arrow data into table '{}'", table_name))?;
+    // Bulk-load data via the native Arrow appender.
+    append_arrow_batches(conn, table_name, batches)
+        .with_context(|| format!("Failed to append arrow data into table '{}'", table_name))?;
 
     Ok(())
 }
@@ -324,6 +238,7 @@ fn quote_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::*;
     use std::sync::Arc;
 
     #[test]
