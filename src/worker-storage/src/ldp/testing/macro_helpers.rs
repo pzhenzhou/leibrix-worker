@@ -6,6 +6,7 @@
 
 use crate::ldp::testing::cluster::TestWorker;
 use crate::ldp::types::WorkerId;
+use dashmap::DashMap;
 use duckdb::{Connection, Error as DuckDBError};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -13,26 +14,24 @@ use thiserror::Error;
 /// Placeholder for LogicalDatasetManager (not yet implemented).
 /// In production, this would manage logical dataset to physical table mappings.
 pub struct LogicalDatasetManager {
-    datasets: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    datasets: DashMap<String, Vec<String>>,
 }
 
 impl LogicalDatasetManager {
     pub fn new() -> Self {
         Self {
-            datasets: tokio::sync::RwLock::new(HashMap::new()),
+            datasets: DashMap::new(),
         }
     }
 
     pub async fn get_dataset_tables(&self, dataset_name: &str) -> Vec<String> {
-        let datasets = self.datasets.read().await;
-        datasets.get(dataset_name).cloned().unwrap_or_default()
+        self.datasets.get(dataset_name).map(|v| v.clone()).unwrap_or_default()
     }
 
     pub async fn register_table(&self, dataset_name: &str, table_name: String) {
-        let mut datasets = self.datasets.write().await;
-        datasets
+        self.datasets
             .entry(dataset_name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(table_name);
     }
 }

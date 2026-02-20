@@ -3,10 +3,9 @@
 //! This module provides facilities to monitor performance and apply optimizations
 //! based on runtime benchmarks and profiling data.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tracing::{info, warn, debug};
 
 use crate::ldp::StageId;
@@ -71,10 +70,10 @@ pub struct PerformanceOptimizer {
     metrics_registry: Arc<LdpMetricsRegistry>,
     
     /// Performance history cache.
-    history_cache: Arc<RwLock<HashMap<String, PerformanceHistory>>>,
+    history_cache: Arc<DashMap<String, PerformanceHistory>>,
     
     /// Optimization recommendations.
-    recommendations: Arc<RwLock<HashMap<String, OptimizationRecommendation>>>,
+    recommendations: Arc<DashMap<String, OptimizationRecommendation>>,
 }
 
 impl PerformanceOptimizer {
@@ -83,8 +82,8 @@ impl PerformanceOptimizer {
         Self {
             config: PerformanceConfig::default(),
             metrics_registry,
-            history_cache: Arc::new(RwLock::new(HashMap::new())),
-            recommendations: Arc::new(RwLock::new(HashMap::new())),
+            history_cache: Arc::new(DashMap::new()),
+            recommendations: Arc::new(DashMap::new()),
         }
     }
     
@@ -93,8 +92,8 @@ impl PerformanceOptimizer {
         Self {
             config,
             metrics_registry,
-            history_cache: Arc::new(RwLock::new(HashMap::new())),
-            recommendations: Arc::new(RwLock::new(HashMap::new())),
+            history_cache: Arc::new(DashMap::new()),
+            recommendations: Arc::new(DashMap::new()),
         }
     }
     
@@ -139,8 +138,7 @@ impl PerformanceOptimizer {
         
         // Store recommendations if any
         if !recommendations.is_empty() {
-            let mut rec_map = self.recommendations.write().await;
-            rec_map.insert(metrics.query_id.clone(), OptimizationRecommendation {
+            self.recommendations.insert(metrics.query_id.clone(), OptimizationRecommendation {
                 query_id: metrics.query_id.clone(),
                 suggestions: recommendations,
                 timestamp: std::time::Instant::now(),
@@ -189,8 +187,7 @@ impl PerformanceOptimizer {
         
         // Store recommendations if any
         if !recommendations.is_empty() {
-            let mut rec_map = self.recommendations.write().await;
-            rec_map.insert(
+            self.recommendations.insert(
                 format!("{}_{}", metrics.query_id, metrics.stage_id),
                 OptimizationRecommendation {
                     query_id: metrics.query_id.clone(),
@@ -206,13 +203,11 @@ impl PerformanceOptimizer {
         let mut applied_optimizations = Vec::new();
         
         // Get recommendations for this query
-        let rec_map = self.recommendations.read().await;
-        let query_recommendations: Vec<_> = rec_map
-            .values()
-            .filter(|rec| rec.query_id == query_id)
-            .cloned()
+        let query_recommendations: Vec<_> = self.recommendations
+            .iter()
+            .filter(|entry| entry.value().query_id == query_id)
+            .map(|entry| entry.value().clone())
             .collect();
-        drop(rec_map);
         
         for recommendation in query_recommendations {
             for suggestion in recommendation.suggestions {
@@ -288,19 +283,15 @@ impl PerformanceOptimizer {
     
     /// Get count of recommendations for a query.
     async fn get_recommendation_count(&self, query_id: &str) -> usize {
-        let rec_map = self.recommendations.read().await;
-        rec_map.values()
-            .filter(|rec| rec.query_id == query_id)
+        self.recommendations.iter()
+            .filter(|entry| entry.value().query_id == query_id)
             .count()
     }
     
     /// Clear performance data for a completed query.
     pub async fn clear_query_performance_data(&self, query_id: &str) {
-        let mut history_cache = self.history_cache.write().await;
-        history_cache.retain(|key, _| !key.starts_with(query_id));
-        
-        let mut recommendations = self.recommendations.write().await;
-        recommendations.retain(|key, _| !key.starts_with(query_id));
+        self.history_cache.retain(|key, _| !key.starts_with(query_id));
+        self.recommendations.retain(|key, _| !key.starts_with(query_id));
     }
 }
 
@@ -493,21 +484,18 @@ mod tests {
         let optimizer = PerformanceOptimizer::new(metrics_registry);
         
         // Simulate adding a recommendation
-        {
-            let mut rec_map = optimizer.recommendations.write().await;
-            rec_map.insert(
-                "test_query_1".to_string(),
-                OptimizationRecommendation {
-                    query_id: "test_query".to_string(),
-                    suggestions: vec![OptimizationSuggestion::SlowStageExecution {
-                        stage_id: StageId(1),
-                        duration_ms: 6000,
-                        threshold_ms: 5000,
-                    }],
-                    timestamp: std::time::Instant::now(),
-                }
-            );
-        }
+        optimizer.recommendations.insert(
+            "test_query_1".to_string(),
+            OptimizationRecommendation {
+                query_id: "test_query".to_string(),
+                suggestions: vec![OptimizationSuggestion::SlowStageExecution {
+                    stage_id: StageId(1),
+                    duration_ms: 6000,
+                    threshold_ms: 5000,
+                }],
+                timestamp: std::time::Instant::now(),
+            }
+        );
         
         let summary = optimizer.get_performance_summary("test_query").await;
         assert_eq!(summary.recommendations_count, 1);

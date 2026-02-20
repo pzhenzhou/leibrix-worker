@@ -4,14 +4,10 @@
 //! needed for cost-based planning decisions.
 
 use crate::ldp::{Distribution, EpochStats, StatsSource, WorkerId};
-use std::collections::HashMap;
-use std::sync::RwLock;
+use dashmap::DashMap;
 
 /// Optional closed time range `[start_unix_secs, end_unix_secs)`.
 type TimeRange = Option<(u64, u64)>;
-
-/// Index mapping a table name to its list of `(epoch_id, time_range)` entries.
-type EpochIndex = HashMap<String, Vec<(String, TimeRange)>>;
 
 /// Trait for accessing metadata during LDP planning.
 ///
@@ -112,23 +108,23 @@ impl TableScanStats {
 
 /// In-memory implementation of Metadata for testing and simple use cases.
 ///
-/// Uses interior mutability (`RwLock`) so metadata can be registered after
+/// Uses interior mutability (`DashMap`) so metadata can be registered after
 /// the instance is shared behind `Arc` (e.g., in the coordinator).
 pub struct InMemoryMetadata {
     /// epoch_id -> (stats, worker_id)
-    epochs: RwLock<HashMap<String, (EpochStats, WorkerId)>>,
+    epochs: DashMap<String, (EpochStats, WorkerId)>,
     /// table_name -> vec of (epoch_id, time_range)
-    table_epochs: RwLock<EpochIndex>,
+    table_epochs: DashMap<String, Vec<(String, TimeRange)>>,
     /// table_name -> table-level scan stats from master/control plane
-    table_stats: RwLock<HashMap<String, TableScanStats>>,
+    table_stats: DashMap<String, TableScanStats>,
 }
 
 impl std::fmt::Debug for InMemoryMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryMetadata")
-            .field("epochs", &*self.epochs.read().unwrap())
-            .field("table_epochs", &*self.table_epochs.read().unwrap())
-            .field("table_stats", &*self.table_stats.read().unwrap())
+            .field("epochs", &self.epochs)
+            .field("table_epochs", &self.table_epochs)
+            .field("table_stats", &self.table_stats)
             .finish()
     }
 }
@@ -136,9 +132,9 @@ impl std::fmt::Debug for InMemoryMetadata {
 impl Default for InMemoryMetadata {
     fn default() -> Self {
         Self {
-            epochs: RwLock::new(HashMap::new()),
-            table_epochs: RwLock::new(HashMap::new()),
-            table_stats: RwLock::new(HashMap::new()),
+            epochs: DashMap::new(),
+            table_epochs: DashMap::new(),
+            table_stats: DashMap::new(),
         }
     }
 }
@@ -160,13 +156,8 @@ impl InMemoryMetadata {
         let epoch_id = epoch_id.into();
         let table_name = table_name.into();
 
-        self.epochs
-            .write()
-            .unwrap()
-            .insert(epoch_id.clone(), (stats, worker));
+        self.epochs.insert(epoch_id.clone(), (stats, worker));
         self.table_epochs
-            .write()
-            .unwrap()
             .entry(table_name)
             .or_default()
             .push((epoch_id, None));
@@ -184,13 +175,8 @@ impl InMemoryMetadata {
         let epoch_id = epoch_id.into();
         let table_name = table_name.into();
 
-        self.epochs
-            .write()
-            .unwrap()
-            .insert(epoch_id.clone(), (stats, worker));
+        self.epochs.insert(epoch_id.clone(), (stats, worker));
         self.table_epochs
-            .write()
-            .unwrap()
             .entry(table_name)
             .or_default()
             .push((epoch_id, Some(time_range)));
@@ -223,8 +209,7 @@ impl InMemoryMetadata {
 
     /// Sort epochs by time range start for a table.
     pub fn sort_epochs_by_time(&self, table_name: &str) {
-        let mut table_epochs = self.table_epochs.write().unwrap();
-        if let Some(epochs) = table_epochs.get_mut(table_name) {
+        if let Some(mut epochs) = self.table_epochs.get_mut(table_name) {
             epochs.sort_by_key(|(_, time_range)| time_range.map(|(start, _)| start).unwrap_or(0));
         }
     }
@@ -239,7 +224,7 @@ impl InMemoryMetadata {
         byte_size: u64,
         stats_source: StatsSource,
     ) {
-        self.table_stats.write().unwrap().insert(
+        self.table_stats.insert(
             table_name.to_string(),
             TableScanStats {
                 rows: row_count,
@@ -255,18 +240,14 @@ impl InMemoryMetadata {
 impl Metadata for InMemoryMetadata {
     fn get_epoch_stats(&self, epoch_id: &str) -> Option<EpochStats> {
         self.epochs
-            .read()
-            .unwrap()
             .get(epoch_id)
-            .map(|(stats, _)| stats.clone())
+            .map(|entry| entry.0.clone())
     }
 
     fn get_epoch_worker(&self, epoch_id: &str) -> Option<WorkerId> {
         self.epochs
-            .read()
-            .unwrap()
             .get(epoch_id)
-            .map(|(_, worker)| worker.clone())
+            .map(|entry| entry.1.clone())
     }
 
     fn get_epochs_for_table(
@@ -279,24 +260,21 @@ impl Metadata for InMemoryMetadata {
         let start_ms = start_epoch.and_then(|s| s.parse::<u64>().ok());
         let end_ms = end_epoch.and_then(|s| s.parse::<u64>().ok());
 
-        let table_epochs = self.table_epochs.read().unwrap();
-        let epochs = self.epochs.read().unwrap();
-
         // The SQL transformer rewrites table names to macro calls, e.g.
         // `orders` → `scan_orders(...)`.  The metadata stores epochs under the
         // original base table name.  If a direct lookup fails and the name
         // starts with `scan_`, fall back to the base name so the annotator
         // resolves the correct distribution.
-        let resolved_name = if table_epochs.contains_key(table_name) {
-            table_name
+        let resolved_name = if self.table_epochs.contains_key(table_name) {
+            table_name.to_string()
         } else if let Some(base) = table_name.strip_prefix("scan_") {
-            if table_epochs.contains_key(base) { base } else { table_name }
+            if self.table_epochs.contains_key(base) { base.to_string() } else { table_name.to_string() }
         } else {
-            table_name
+            table_name.to_string()
         };
 
-        table_epochs
-            .get(resolved_name)
+        self.table_epochs
+            .get(&resolved_name)
             .map(|epoch_entries| {
                 epoch_entries
                     .iter()
@@ -316,9 +294,9 @@ impl Metadata for InMemoryMetadata {
                         };
 
                         if matches {
-                            epochs
+                            self.epochs
                                 .get(id)
-                                .map(|(_, worker)| (id.clone(), worker.clone()))
+                                .map(|entry| (id.clone(), entry.1.clone()))
                         } else {
                             None
                         }
@@ -333,15 +311,12 @@ impl Metadata for InMemoryMetadata {
         // Try direct lookup first; if the name starts with `scan_`, also
         // check the base name (the SQL transformer rewrites `orders` →
         // `scan_orders(...)`).
-        {
-            let stats_guard = self.table_stats.read().unwrap();
-            if let Some(scan_stats) = stats_guard.get(table_name) {
+        if let Some(scan_stats) = self.table_stats.get(table_name) {
+            return scan_stats.clone();
+        }
+        if let Some(base) = table_name.strip_prefix("scan_") {
+            if let Some(scan_stats) = self.table_stats.get(base) {
                 return scan_stats.clone();
-            }
-            if let Some(base) = table_name.strip_prefix("scan_") {
-                if let Some(scan_stats) = stats_guard.get(base) {
-                    return scan_stats.clone();
-                }
             }
         }
 

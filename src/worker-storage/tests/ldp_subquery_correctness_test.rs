@@ -135,6 +135,7 @@ fn generate_customer_data(row_count: usize) -> Vec<RecordBatch> {
     ).unwrap()]
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
 async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
     let cluster = Arc::new(
         TestCluster::builder()

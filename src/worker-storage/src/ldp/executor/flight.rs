@@ -10,8 +10,8 @@ use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Ticket};
+use dashmap::DashMap;
 use futures_util::TryStreamExt;
-use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use tracing::{debug, error, info};
 
@@ -63,23 +63,23 @@ impl WorkerConnection {
 /// Pool of connections to remote workers.
 pub struct WorkerConnectionPool {
     /// Map from worker ID to connection.
-    connections: RwLock<HashMap<WorkerId, WorkerConnection>>,
+    connections: DashMap<WorkerId, WorkerConnection>,
     /// Map from worker ID to endpoint URL.
-    endpoints: RwLock<HashMap<WorkerId, String>>,
+    endpoints: DashMap<WorkerId, String>,
 }
 
 impl WorkerConnectionPool {
     /// Create a new empty connection pool.
     pub fn new() -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
-            endpoints: RwLock::new(HashMap::new()),
+            connections: DashMap::new(),
+            endpoints: DashMap::new(),
         }
     }
 
     /// Register a worker endpoint.
     pub async fn register_worker(&self, worker_id: WorkerId, endpoint: String) {
-        self.endpoints.write().await.insert(worker_id, endpoint);
+        self.endpoints.insert(worker_id, endpoint);
     }
 
     /// Get or create a connection to a worker.
@@ -88,49 +88,40 @@ impl WorkerConnectionPool {
         worker_id: &WorkerId,
     ) -> Result<WorkerConnection, StageExecutionError> {
         // Check if we already have a connection
-        {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(worker_id) {
-                return Ok(conn.clone());
-            }
+        if let Some(conn) = self.connections.get(worker_id) {
+            return Ok(conn.clone());
         }
 
         // Get the endpoint
-        let endpoint = {
-            let endpoints = self.endpoints.read().await;
-            endpoints.get(worker_id).cloned().ok_or_else(|| {
-                StageExecutionError::WorkerUnavailable {
-                    worker_id: worker_id.clone(),
-                    detail: format!("No endpoint registered for worker '{}'", worker_id),
-                }
-            })?
-        };
+        let endpoint = self.endpoints.get(worker_id).map(|e| e.clone()).ok_or_else(|| {
+            StageExecutionError::WorkerUnavailable {
+                worker_id: worker_id.clone(),
+                detail: format!("No endpoint registered for worker '{}'", worker_id),
+            }
+        })?;
 
         // Create new connection
         let conn = WorkerConnection::connect(worker_id.clone(), &endpoint).await?;
 
         // Cache it
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(worker_id.clone(), conn.clone());
-        }
+        self.connections.insert(worker_id.clone(), conn.clone());
 
         Ok(conn)
     }
 
     /// Remove a worker connection (e.g., on failure).
     pub async fn remove_connection(&self, worker_id: &WorkerId) {
-        self.connections.write().await.remove(worker_id);
+        self.connections.remove(worker_id);
     }
 
     /// Get the endpoint URL for a worker.
     pub async fn get_endpoint(&self, worker_id: &WorkerId) -> Option<String> {
-        self.endpoints.read().await.get(worker_id).cloned()
+        self.endpoints.get(worker_id).map(|e| e.clone())
     }
 
     /// Get all registered worker IDs.
     pub async fn worker_ids(&self) -> Vec<WorkerId> {
-        self.endpoints.read().await.keys().cloned().collect()
+        self.endpoints.iter().map(|entry| entry.key().clone()).collect()
     }
 }
 
@@ -157,7 +148,7 @@ pub struct FlightStageExecutor {
     connection_pool: Arc<WorkerConnectionPool>,
     /// Cached tickets from submit_stage responses.
     /// Maps (query_id, stage_id, worker_id) -> ticket bytes
-    ticket_cache: RwLock<HashMap<String, Vec<u8>>>,
+    ticket_cache: DashMap<String, Vec<u8>>,
 }
 
 impl FlightStageExecutor {
@@ -166,7 +157,7 @@ impl FlightStageExecutor {
         Self {
             tenant_id,
             connection_pool,
-            ticket_cache: RwLock::new(HashMap::new()),
+            ticket_cache: DashMap::new(),
         }
     }
 
@@ -282,10 +273,7 @@ impl FlightStageExecutor {
 
         // Cache the result ticket using the actual query_id
         let ticket_key = Self::ticket_key(query_id, stage.stage_id, worker_id);
-        {
-            let mut cache = self.ticket_cache.write().await;
-            cache.insert(ticket_key, submit_response.result_ticket.clone());
-        }
+        self.ticket_cache.insert(ticket_key, submit_response.result_ticket.clone());
 
         // Log stats if available
         if let Some(stats) = submit_response.stats {
@@ -366,8 +354,7 @@ impl StageExecutor for FlightStageExecutor {
         let ticket_key = Self::ticket_key(&ticket.query_id, ticket.stage_id, &ticket.worker_id);
 
         let ticket_bytes = {
-            let cache = self.ticket_cache.read().await;
-            cache.get(&ticket_key).cloned().ok_or_else(|| {
+            self.ticket_cache.get(&ticket_key).map(|v| v.clone()).ok_or_else(|| {
                 StageExecutionError::InputNotReady(format!(
                     "No ticket cached for stage {} on worker {}",
                     ticket.stage_id, ticket.worker_id
@@ -619,7 +606,7 @@ mod tests {
     #[test]
     fn test_worker_connection_pool_default() {
         let pool = WorkerConnectionPool::default();
-        assert!(pool.connections.try_read().is_ok());
+        assert!(pool.connections.is_empty());
     }
 
     #[tokio::test]
@@ -628,8 +615,7 @@ mod tests {
         pool.register_worker(WorkerId::from("w1"), "http://localhost:50051".to_string())
             .await;
 
-        let endpoints = pool.endpoints.read().await;
-        assert_eq!(endpoints.get(&WorkerId::from("w1")), Some(&"http://localhost:50051".to_string()));
+        assert_eq!(pool.endpoints.get(&WorkerId::from("w1")).map(|e| e.clone()), Some("http://localhost:50051".to_string()));
     }
 
     #[tokio::test]
@@ -667,6 +653,6 @@ mod tests {
     #[test]
     fn test_flight_stage_executor_with_new_pool() {
         let executor = FlightStageExecutor::with_new_pool("test-tenant".to_string());
-        assert!(executor.connection_pool().connections.try_read().is_ok());
+        assert!(executor.connection_pool().connections.is_empty());
     }
 }

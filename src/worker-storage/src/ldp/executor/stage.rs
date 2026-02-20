@@ -7,6 +7,7 @@ use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 use crate::ldp::executor::monitor::StageExecutionMonitor;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -246,7 +247,7 @@ pub trait StageExecutor: Send + Sync {
 /// Useful for testing and single-node execution.
 pub struct LocalStageExecutor {
     /// Cached stage outputs (for local execution without Flight).
-    outputs: tokio::sync::RwLock<HashMap<String, Vec<RecordBatch>>>,
+    outputs: DashMap<String, Vec<RecordBatch>>,
     /// Worker DuckDB databases used to execute local catalog scans.
     worker_databases: HashMap<WorkerId, Arc<SharedDatabase>>,
 }
@@ -255,7 +256,7 @@ impl LocalStageExecutor {
     /// Create a new local executor.
     pub fn new() -> Self {
         Self {
-            outputs: tokio::sync::RwLock::new(HashMap::new()),
+            outputs: DashMap::new(),
             worker_databases: HashMap::new(),
         }
     }
@@ -263,7 +264,7 @@ impl LocalStageExecutor {
     /// Create a local executor backed by per-worker DuckDB databases.
     pub fn with_databases(worker_databases: HashMap<WorkerId, Arc<SharedDatabase>>) -> Self {
         Self {
-            outputs: tokio::sync::RwLock::new(HashMap::new()),
+            outputs: DashMap::new(),
             worker_databases,
         }
     }
@@ -485,10 +486,7 @@ impl StageExecutor for LocalStageExecutor {
                     let ticket = StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone());
                     
                     // Store output for later retrieval
-                    {
-                        let mut outputs = self.outputs.write().await;
-                        outputs.insert(ticket.ticket_id.clone(), output);
-                    }
+                    self.outputs.insert(ticket.ticket_id.clone(), output);
 
                     tickets.add(ticket);
                 }
@@ -503,8 +501,7 @@ impl StageExecutor for LocalStageExecutor {
                         tickets.add(part_ticket.clone());
 
                         // Store partitioned output
-                        let mut outputs = self.outputs.write().await;
-                        outputs.insert(part_ticket.ticket_id.clone(), partition_batches);
+                        self.outputs.insert(part_ticket.ticket_id.clone(), partition_batches);
                     }
                 }
             };
@@ -573,10 +570,9 @@ impl StageExecutor for LocalStageExecutor {
     }
 
     async fn fetch_output(&self, ticket: &StageTicket) -> Result<Vec<RecordBatch>, StageExecutionError> {
-        let outputs = self.outputs.read().await;
-        outputs
+        self.outputs
             .get(&ticket.ticket_id)
-            .cloned()
+            .map(|v| v.clone())
             .ok_or_else(|| StageExecutionError::InputNotReady(ticket.ticket_id.clone()))
     }
 }

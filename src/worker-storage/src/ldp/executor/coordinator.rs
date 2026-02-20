@@ -272,9 +272,9 @@ pub struct LdpCoordinator<M: Metadata = ClusterMetadata> {
     /// Worker connection pool (for distributed mode).
     connection_pool: Arc<WorkerConnectionPool>,
     /// Stage execution status tracking.
-    stage_status: RwLock<HashMap<(String, StageId), StageStatus>>,
+    stage_status: DashMap<(String, StageId), StageStatus>,
     /// Active stage monitors for cancellation.
-    stage_monitors: RwLock<HashMap<(String, StageId), SharedStageExecutionMonitor>>,
+    stage_monitors: DashMap<(String, StageId), SharedStageExecutionMonitor>,
     /// Worker-local DuckDB databases used by local execution in tests.
     worker_databases: DashMap<WorkerId, Arc<SharedDatabase>>,
 }
@@ -292,8 +292,8 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             metadata,
             conn: Arc::new(RwLock::new(conn)),
             connection_pool: Arc::new(WorkerConnectionPool::new()),
-            stage_status: RwLock::new(HashMap::new()),
-            stage_monitors: RwLock::new(HashMap::new()),
+            stage_status: DashMap::new(),
+            stage_monitors: DashMap::new(),
             worker_databases: DashMap::new(),
         })
     }
@@ -310,8 +310,8 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             metadata,
             conn: Arc::new(RwLock::new(conn)),
             connection_pool: Arc::new(WorkerConnectionPool::new()),
-            stage_status: RwLock::new(HashMap::new()),
-            stage_monitors: RwLock::new(HashMap::new()),
+            stage_status: DashMap::new(),
+            stage_monitors: DashMap::new(),
             worker_databases: DashMap::new(),
         }
     }
@@ -1442,8 +1442,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
     /// Set stage execution status.
     async fn set_stage_status(&self, query_id: &str, stage_id: StageId, status: StageStatus) {
-        let mut statuses = self.stage_status.write().await;
-        statuses.insert((query_id.to_string(), stage_id), status);
+        self.stage_status.insert((query_id.to_string(), stage_id), status);
     }
 
     /// Register a stage monitor for cancellation tracking.
@@ -1453,14 +1452,12 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         stage_id: StageId,
         monitor: SharedStageExecutionMonitor,
     ) {
-        let mut monitors = self.stage_monitors.write().await;
-        monitors.insert((query_id.to_string(), stage_id), monitor);
+        self.stage_monitors.insert((query_id.to_string(), stage_id), monitor);
     }
 
     /// Unregister a stage monitor after completion.
     pub async fn unregister_stage_monitor(&self, query_id: &str, stage_id: StageId) {
-        let mut monitors = self.stage_monitors.write().await;
-        monitors.remove(&(query_id.to_string(), stage_id));
+        self.stage_monitors.remove(&(query_id.to_string(), stage_id));
     }
 
     /// Cancel a running query and all its stages.
@@ -1468,16 +1465,13 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         info!(query_id = %query_id, "Cancelling query");
         
         // Find all in-flight stages for this query
-        let in_flight_stages: Vec<StageId> = {
-            let statuses = self.stage_status.read().await;
-            statuses
-                .iter()
-                .filter(|((qid, _), status)| {
-                    qid == query_id && matches!(status, StageStatus::Running { .. })
-                })
-                .map(|((_, stage_id), _)| *stage_id)
-                .collect()
-        };
+        let in_flight_stages: Vec<StageId> = self.stage_status
+            .iter()
+            .filter(|entry| {
+                entry.key().0 == query_id && matches!(entry.value(), StageStatus::Running { .. })
+            })
+            .map(|entry| entry.key().1)
+            .collect();
         
         // Cancel all in-flight stages
         for stage_id in &in_flight_stages {
@@ -1518,10 +1512,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             });
         } else {
             // For local execution, cancel via monitor
-            if let Some(monitor) = {
-                let monitors = self.stage_monitors.read().await;
-                monitors.get(&(query_id.to_string(), stage_id)).cloned()
-            } {
+            if let Some(monitor) = self.stage_monitors.get(&(query_id.to_string(), stage_id)).map(|m| m.clone()) {
                 monitor.cancel();
                 debug!(
                     query_id = %query_id,
@@ -1551,17 +1542,13 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     
     /// Clear all status entries for a query
     async fn clear_query_status(&self, query_id: &str) {
-        let mut statuses = self.stage_status.write().await;
-        statuses.retain(|(qid, _), _| qid != query_id);
-        
-        let mut monitors = self.stage_monitors.write().await;
-        monitors.retain(|(qid, _), _| qid != query_id);
+        self.stage_status.retain(|(qid, _), _| qid != query_id);
+        self.stage_monitors.retain(|(qid, _), _| qid != query_id);
     }
     
     /// Get stage execution status.
     pub async fn get_stage_status(&self, query_id: &str, stage_id: StageId) -> Option<StageStatus> {
-        let statuses = self.stage_status.read().await;
-        statuses.get(&(query_id.to_string(), stage_id)).cloned()
+        self.stage_status.get(&(query_id.to_string(), stage_id)).map(|v| v.clone())
     }
 }
 

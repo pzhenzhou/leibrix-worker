@@ -3,10 +3,9 @@
 //! This module provides facilities to track and collect metrics during
 //! LDP execution, including exchange operations, stage execution, and query performance.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tracing::{info, warn, debug, error};
 
 use crate::ldp::{ExchangeId, StageId, WorkerId};
@@ -236,33 +235,31 @@ impl ExchangeMetrics {
 #[derive(Clone)]
 pub struct ExchangeMetricsRegistry {
     /// Broadcast exchange metrics.
-    broadcast_metrics: Arc<RwLock<HashMap<String, BroadcastExchangeMetrics>>>,
+    broadcast_metrics: Arc<DashMap<String, BroadcastExchangeMetrics>>,
     
     /// General exchange metrics.
-    exchange_metrics: Arc<RwLock<HashMap<String, ExchangeMetrics>>>,
+    exchange_metrics: Arc<DashMap<String, ExchangeMetrics>>,
 }
 
 impl ExchangeMetricsRegistry {
     /// Create a new metrics registry.
     pub fn new() -> Self {
         Self {
-            broadcast_metrics: Arc::new(RwLock::new(HashMap::new())),
-            exchange_metrics: Arc::new(RwLock::new(HashMap::new())),
+            broadcast_metrics: Arc::new(DashMap::new()),
+            exchange_metrics: Arc::new(DashMap::new()),
         }
     }
 
     /// Register a new broadcast exchange metrics instance.
     pub async fn register_broadcast_metrics(&self, metrics: BroadcastExchangeMetrics) {
         let key = format!("{}_{}", metrics.query_id, metrics.exchange_id);
-        let mut broadcast_map = self.broadcast_metrics.write().await;
-        broadcast_map.insert(key, metrics);
+        self.broadcast_metrics.insert(key, metrics);
     }
 
     /// Register a new exchange metrics instance.
     pub async fn register_exchange_metrics(&self, metrics: ExchangeMetrics) {
         let key = format!("{}_{}", metrics.query_id, metrics.exchange_id);
-        let mut exchange_map = self.exchange_metrics.write().await;
-        exchange_map.insert(key, metrics);
+        self.exchange_metrics.insert(key, metrics);
     }
 
     /// Get broadcast metrics for a specific query and exchange.
@@ -272,8 +269,7 @@ impl ExchangeMetricsRegistry {
         exchange_id: ExchangeId,
     ) -> Option<BroadcastExchangeMetrics> {
         let key = format!("{}_{}", query_id, exchange_id);
-        let broadcast_map = self.broadcast_metrics.read().await;
-        broadcast_map.get(&key).cloned()
+        self.broadcast_metrics.get(&key).map(|v| v.clone())
     }
 
     /// Get exchange metrics for a specific query and exchange.
@@ -283,8 +279,7 @@ impl ExchangeMetricsRegistry {
         exchange_id: ExchangeId,
     ) -> Option<ExchangeMetrics> {
         let key = format!("{}_{}", query_id, exchange_id);
-        let exchange_map = self.exchange_metrics.read().await;
-        exchange_map.get(&key).cloned()
+        self.exchange_metrics.get(&key).map(|v| v.clone())
     }
 
     /// Get all broadcast metrics for a query.
@@ -292,11 +287,10 @@ impl ExchangeMetricsRegistry {
         &self,
         query_id: &str,
     ) -> Vec<BroadcastExchangeMetrics> {
-        let broadcast_map = self.broadcast_metrics.read().await;
-        broadcast_map
-            .values()
-            .filter(|m| m.query_id == query_id)
-            .cloned()
+        self.broadcast_metrics
+            .iter()
+            .filter(|entry| entry.value().query_id == query_id)
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
@@ -305,24 +299,17 @@ impl ExchangeMetricsRegistry {
         &self,
         query_id: &str,
     ) -> Vec<ExchangeMetrics> {
-        let exchange_map = self.exchange_metrics.read().await;
-        exchange_map
-            .values()
-            .filter(|m| m.query_id == query_id)
-            .cloned()
+        self.exchange_metrics
+            .iter()
+            .filter(|entry| entry.value().query_id == query_id)
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
     /// Clear metrics for a completed query.
     pub async fn clear_query_metrics(&self, query_id: &str) {
-        {
-            let mut broadcast_map = self.broadcast_metrics.write().await;
-            broadcast_map.retain(|key, _| !key.starts_with(query_id));
-        }
-        {
-            let mut exchange_map = self.exchange_metrics.write().await;
-            exchange_map.retain(|key, _| !key.starts_with(query_id));
-        }
+        self.broadcast_metrics.retain(|key, _| !key.starts_with(query_id));
+        self.exchange_metrics.retain(|key, _| !key.starts_with(query_id));
     }
 }
 
@@ -762,50 +749,47 @@ impl SystemHealthMetrics {
 #[derive(Clone)]
 pub struct LdpMetricsRegistry {
     /// Broadcast exchange metrics.
-    broadcast_metrics: Arc<RwLock<HashMap<String, BroadcastExchangeMetrics>>>,
+    broadcast_metrics: Arc<DashMap<String, BroadcastExchangeMetrics>>,
     
     /// General exchange metrics.
-    exchange_metrics: Arc<RwLock<HashMap<String, ExchangeMetrics>>>,
+    exchange_metrics: Arc<DashMap<String, ExchangeMetrics>>,
     
     /// Stage execution metrics.
-    stage_metrics: Arc<RwLock<HashMap<String, StageExecutionMetrics>>>,
+    stage_metrics: Arc<DashMap<String, StageExecutionMetrics>>,
     
     /// Query execution metrics.
-    query_metrics: Arc<RwLock<HashMap<String, QueryExecutionMetrics>>>,
+    query_metrics: Arc<DashMap<String, QueryExecutionMetrics>>,
     
     /// System health metrics.
-    health_metrics: Arc<RwLock<HashMap<WorkerId, SystemHealthMetrics>>>,
+    health_metrics: Arc<DashMap<WorkerId, SystemHealthMetrics>>,
 }
 
 impl LdpMetricsRegistry {
     /// Create a new comprehensive metrics registry.
     pub fn new() -> Self {
         Self {
-            broadcast_metrics: Arc::new(RwLock::new(HashMap::new())),
-            exchange_metrics: Arc::new(RwLock::new(HashMap::new())),
-            stage_metrics: Arc::new(RwLock::new(HashMap::new())),
-            query_metrics: Arc::new(RwLock::new(HashMap::new())),
-            health_metrics: Arc::new(RwLock::new(HashMap::new())),
+            broadcast_metrics: Arc::new(DashMap::new()),
+            exchange_metrics: Arc::new(DashMap::new()),
+            stage_metrics: Arc::new(DashMap::new()),
+            query_metrics: Arc::new(DashMap::new()),
+            health_metrics: Arc::new(DashMap::new()),
         }
     }
 
     /// Register stage execution metrics.
     pub async fn register_stage_metrics(&self, metrics: StageExecutionMetrics) {
         let key = format!("{}_{}", metrics.query_id, metrics.stage_id);
-        let mut stage_map = self.stage_metrics.write().await;
-        stage_map.insert(key, metrics);
+        self.stage_metrics.insert(key, metrics);
     }
 
     /// Register query execution metrics.
     pub async fn register_query_metrics(&self, metrics: QueryExecutionMetrics) {
-        let mut query_map = self.query_metrics.write().await;
-        query_map.insert(metrics.query_id.clone(), metrics);
+        self.query_metrics.insert(metrics.query_id.clone(), metrics);
     }
 
     /// Register system health metrics.
     pub async fn register_health_metrics(&self, metrics: SystemHealthMetrics) {
-        let mut health_map = self.health_metrics.write().await;
-        health_map.insert(metrics.worker_id.clone(), metrics);
+        self.health_metrics.insert(metrics.worker_id.clone(), metrics);
     }
 
     /// Get stage metrics for a specific query and stage.
@@ -815,8 +799,7 @@ impl LdpMetricsRegistry {
         stage_id: StageId,
     ) -> Option<StageExecutionMetrics> {
         let key = format!("{}_{}", query_id, stage_id);
-        let stage_map = self.stage_metrics.read().await;
-        stage_map.get(&key).cloned()
+        self.stage_metrics.get(&key).map(|v| v.clone())
     }
 
     /// Get query metrics for a specific query.
@@ -824,8 +807,7 @@ impl LdpMetricsRegistry {
         &self,
         query_id: &str,
     ) -> Option<QueryExecutionMetrics> {
-        let query_map = self.query_metrics.read().await;
-        query_map.get(query_id).cloned()
+        self.query_metrics.get(query_id).map(|v| v.clone())
     }
 
     /// Get system health metrics for a worker.
@@ -833,8 +815,7 @@ impl LdpMetricsRegistry {
         &self,
         worker_id: &str,
     ) -> Option<SystemHealthMetrics> {
-        let health_map = self.health_metrics.read().await;
-        health_map.get(&WorkerId::from(worker_id)).cloned()
+        self.health_metrics.get(&WorkerId::from(worker_id)).map(|v| v.clone())
     }
 
     /// Get all stage metrics for a query.
@@ -842,11 +823,10 @@ impl LdpMetricsRegistry {
         &self,
         query_id: &str,
     ) -> Vec<StageExecutionMetrics> {
-        let stage_map = self.stage_metrics.read().await;
-        stage_map
-            .values()
-            .filter(|m| m.query_id == query_id)
-            .cloned()
+        self.stage_metrics
+            .iter()
+            .filter(|entry| entry.value().query_id == query_id)
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
@@ -855,20 +835,14 @@ impl LdpMetricsRegistry {
     /// Clear metrics for a completed query.
     pub async fn clear_query_metrics(&self, query_id: &str) {
         // Clear from all maps
-        {
-            let mut stage_map = self.stage_metrics.write().await;
-            stage_map.retain(|key, _| !key.starts_with(query_id));
-        }
-        {
-            let mut query_map = self.query_metrics.write().await;
-            query_map.retain(|key, _| key != query_id);
-        }
+        self.stage_metrics.retain(|key, _| !key.starts_with(query_id));
+        self.query_metrics.retain(|key, _| key != query_id);
         // Call parent method for exchange metrics
         ExchangeMetricsRegistry::clear_query_metrics_from_maps(
             &self.broadcast_metrics, 
             &self.exchange_metrics, 
             query_id
-        ).await;
+        );
     }
 }
 
@@ -899,19 +873,13 @@ pub struct QuerySummary {
 
 impl ExchangeMetricsRegistry {
     /// Helper method to clear query metrics from maps (for use in LdpMetricsRegistry).
-    pub(super) async fn clear_query_metrics_from_maps(
-        broadcast_metrics: &Arc<RwLock<HashMap<String, BroadcastExchangeMetrics>>>,
-        exchange_metrics: &Arc<RwLock<HashMap<String, ExchangeMetrics>>>,
+    pub(super) fn clear_query_metrics_from_maps(
+        broadcast_metrics: &Arc<DashMap<String, BroadcastExchangeMetrics>>,
+        exchange_metrics: &Arc<DashMap<String, ExchangeMetrics>>,
         query_id: &str,
     ) {
-        {
-            let mut broadcast_map = broadcast_metrics.write().await;
-            broadcast_map.retain(|key, _| !key.starts_with(query_id));
-        }
-        {
-            let mut exchange_map = exchange_metrics.write().await;
-            exchange_map.retain(|key, _| !key.starts_with(query_id));
-        }
+        broadcast_metrics.retain(|key, _| !key.starts_with(query_id));
+        exchange_metrics.retain(|key, _| !key.starts_with(query_id));
     }
 }
 
