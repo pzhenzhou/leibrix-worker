@@ -18,9 +18,9 @@ use crate::sql::logical_plan::ColumnRef;
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
 /// Parameters for a distributed hash-partition exchange.
@@ -122,9 +122,7 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
         _target_workers: &[WorkerId],
     ) -> Result<Vec<RecordBatch>, ExchangeError> {
         match &edge.kind {
-            Exchange::Gather { target } => {
-                self.execute_gather(upstream_tickets, target).await
-            }
+            Exchange::Gather { target } => self.execute_gather(upstream_tickets, target).await,
             Exchange::Broadcast { targets } => {
                 self.execute_broadcast(upstream_tickets, targets).await
             }
@@ -135,12 +133,8 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
                 // Legacy path: return ALL partitions (used by resolve_inputs
                 // which doesn't distinguish per-worker).
                 // The per-worker path is execute_hash_partition_for_worker.
-                self.execute_hash_partition_all(
-                    upstream_tickets,
-                    column_refs,
-                    *partitions,
-                )
-                .await
+                self.execute_hash_partition_all(upstream_tickets, column_refs, *partitions)
+                    .await
             }
         }
     }
@@ -329,7 +323,7 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
 
         // Hash partition all batches
         let mut partitioned_batches: Vec<Vec<RecordBatch>> = vec![vec![]; num_partitions as usize];
-        
+
         for batch in &all_batches {
             let partitions = hash_partition_batch(batch, &field_refs, num_partitions)?;
             for (partition_id, partition_batch) in partitions.into_iter().enumerate() {
@@ -419,11 +413,8 @@ impl<E: StageExecutor> ExchangeRuntime<E> {
             }
             Exchange::Broadcast { .. } => {
                 // Broadcast: all targets get the same data
-                self.execute_broadcast(
-                    upstream_tickets,
-                    std::slice::from_ref(target_worker_id),
-                )
-                .await
+                self.execute_broadcast(upstream_tickets, std::slice::from_ref(target_worker_id))
+                    .await
             }
             Exchange::HashPartition {
                 column_refs,
@@ -716,26 +707,36 @@ fn hash_column_value(
             arr.value(row).hash(hasher);
         }
         // Timestamps
-        arrow::datatypes::DataType::Timestamp(unit, _) => {
-            match unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-                    arr.value(row).hash(hasher);
-                },
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
-                    arr.value(row).hash(hasher);
-                },
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
-                    arr.value(row).hash(hasher);
-                },
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
-                    arr.value(row).hash(hasher);
-                },
+        arrow::datatypes::DataType::Timestamp(unit, _) => match unit {
+            arrow::datatypes::TimeUnit::Second => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .unwrap();
+                arr.value(row).hash(hasher);
             }
-        }
+            arrow::datatypes::TimeUnit::Millisecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                arr.value(row).hash(hasher);
+            }
+            arrow::datatypes::TimeUnit::Microsecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                arr.value(row).hash(hasher);
+            }
+            arrow::datatypes::TimeUnit::Nanosecond => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                arr.value(row).hash(hasher);
+            }
+        },
         // Decimal
         arrow::datatypes::DataType::Decimal128(_, _) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -762,7 +763,10 @@ fn hash_column_value(
         }
         // Fixed-size binary
         arrow::datatypes::DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
             arr.value(row).hash(hasher);
         }
         // Dictionary types - hash the underlying value
@@ -772,18 +776,20 @@ fn hash_column_value(
             // We'll handle different key types generically by using the value directly
             let debug_str = format!("dictionary_{}", value_type);
             debug_str.hash(hasher);
-            return Err(ExchangeError::PartitionFailed(
-                format!("Dictionary type not fully supported for hash partitioning: {:?}", array.data_type())
-            ));
+            return Err(ExchangeError::PartitionFailed(format!(
+                "Dictionary type not fully supported for hash partitioning: {:?}",
+                array.data_type()
+            )));
         }
         // Other types that don't have direct hash support
         _ => {
             // For unsupported types, we hash their debug representation
             let debug_str = format!("{:?}", array.data_type());
             debug_str.hash(hasher);
-            return Err(ExchangeError::PartitionFailed(
-                format!("Unsupported data type for hash partitioning: {:?}", array.data_type())
-            ));
+            return Err(ExchangeError::PartitionFailed(format!(
+                "Unsupported data type for hash partitioning: {:?}",
+                array.data_type()
+            )));
         }
     }
 
@@ -960,9 +966,7 @@ impl DistributedExchangeRuntime {
         // Fetch from each source worker in parallel
         let fetch_futures: Vec<_> = source_workers
             .iter()
-            .map(|worker_id| {
-                self.fetch_from_worker(query_id, stage_id, worker_id)
-            })
+            .map(|worker_id| self.fetch_from_worker(query_id, stage_id, worker_id))
             .collect();
 
         // Execute all fetches concurrently
@@ -1067,7 +1071,10 @@ impl DistributedExchangeRuntime {
             .get_endpoint(worker_id)
             .await
             .ok_or_else(|| {
-                ExchangeError::FetchFailed(format!("No endpoint registered for worker {}", worker_id))
+                ExchangeError::FetchFailed(format!(
+                    "No endpoint registered for worker {}",
+                    worker_id
+                ))
             })
     }
 
@@ -1119,9 +1126,15 @@ impl DistributedExchangeRuntime {
             .await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let total_bytes: usize = batches.iter().map(|b| {
-            b.columns().iter().map(|c| c.get_array_memory_size()).sum::<usize>()
-        }).sum();
+        let total_bytes: usize = batches
+            .iter()
+            .map(|b| {
+                b.columns()
+                    .iter()
+                    .map(|c| c.get_array_memory_size())
+                    .sum::<usize>()
+            })
+            .sum();
 
         // Update metrics with data information
         metrics.update_data(total_rows as u64, total_bytes as u64);
@@ -1137,10 +1150,10 @@ impl DistributedExchangeRuntime {
 
         // Finalize metrics
         metrics.finalize();
-        
+
         // Log the metrics
         metrics.log_metrics();
-        
+
         // Register metrics in the registry
         self.metrics_registry
             .register_broadcast_metrics(metrics)
@@ -1318,11 +1331,7 @@ mod tests {
         let id_array = Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let name_array = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g", "h"]);
 
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 
     #[test]
@@ -1377,11 +1386,15 @@ mod tests {
             .await;
 
         // Retrieve it
-        let ticket = runtime.get_ticket("q1", StageId(1), &WorkerId::from("worker-1")).await;
+        let ticket = runtime
+            .get_ticket("q1", StageId(1), &WorkerId::from("worker-1"))
+            .await;
         assert_eq!(ticket, Some(vec![1, 2, 3]));
 
         // Non-existent ticket returns None
-        let missing = runtime.get_ticket("q1", StageId(2), &WorkerId::from("worker-1")).await;
+        let missing = runtime
+            .get_ticket("q1", StageId(2), &WorkerId::from("worker-1"))
+            .await;
         assert_eq!(missing, None);
     }
 
@@ -1389,7 +1402,9 @@ mod tests {
     async fn test_distributed_exchange_get_worker_endpoint_missing() {
         let runtime = DistributedExchangeRuntime::with_new_pool("test-tenant".to_string());
 
-        let result = runtime.get_worker_endpoint(&WorkerId::from("unknown-worker")).await;
+        let result = runtime
+            .get_worker_endpoint(&WorkerId::from("unknown-worker"))
+            .await;
         assert!(result.is_err());
     }
 
@@ -1509,8 +1524,8 @@ mod tests {
         ]));
 
         let refs = vec![
-            ColumnRef::unqualified("customerid"),  // lowercase
-            ColumnRef::unqualified("ORDERDATE"),   // uppercase
+            ColumnRef::unqualified("customerid"), // lowercase
+            ColumnRef::unqualified("ORDERDATE"),  // uppercase
         ];
 
         let indices = resolve_column_indices(&refs, &schema).unwrap();
@@ -1526,12 +1541,12 @@ mod tests {
 
         let refs = vec![
             ColumnRef::unqualified("id"),
-            ColumnRef::unqualified("nonexistent"),  // This doesn't exist
+            ColumnRef::unqualified("nonexistent"), // This doesn't exist
         ];
 
         let result = resolve_column_indices(&refs, &schema);
         assert!(result.is_err());
-        
+
         if let Err(ExchangeError::ColumnNotFound(msg)) = result {
             assert!(msg.contains("nonexistent"));
             assert!(msg.contains("Available columns"));
@@ -1542,9 +1557,7 @@ mod tests {
 
     #[test]
     fn test_resolve_column_indices_empty() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let refs: Vec<crate::sql::logical_plan::ColumnRef> = vec![];
         let indices = resolve_column_indices(&refs, &schema).unwrap();

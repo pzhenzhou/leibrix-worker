@@ -239,15 +239,11 @@ impl InMemoryMetadata {
 
 impl Metadata for InMemoryMetadata {
     fn get_epoch_stats(&self, epoch_id: &str) -> Option<EpochStats> {
-        self.epochs
-            .get(epoch_id)
-            .map(|entry| entry.0.clone())
+        self.epochs.get(epoch_id).map(|entry| entry.0.clone())
     }
 
     fn get_epoch_worker(&self, epoch_id: &str) -> Option<WorkerId> {
-        self.epochs
-            .get(epoch_id)
-            .map(|entry| entry.1.clone())
+        self.epochs.get(epoch_id).map(|entry| entry.1.clone())
     }
 
     fn get_epochs_for_table(
@@ -268,7 +264,11 @@ impl Metadata for InMemoryMetadata {
         let resolved_name = if self.table_epochs.contains_key(table_name) {
             table_name.to_string()
         } else if let Some(base) = table_name.strip_prefix("scan_") {
-            if self.table_epochs.contains_key(base) { base.to_string() } else { table_name.to_string() }
+            if self.table_epochs.contains_key(base) {
+                base.to_string()
+            } else {
+                table_name.to_string()
+            }
         } else {
             table_name.to_string()
         };
@@ -427,20 +427,26 @@ mod tests {
         let metadata = InMemoryMetadata::new()
             // Epoch 1: time 1000-2000
             .with_epoch_time_range(
-                "e1", "sales",
-                EpochStats::exact(100, 1000), "w1".into(),
+                "e1",
+                "sales",
+                EpochStats::exact(100, 1000),
+                "w1".into(),
                 (1000, 2000),
             )
             // Epoch 2: time 2000-3000
             .with_epoch_time_range(
-                "e2", "sales",
-                EpochStats::exact(200, 2000), "w2".into(),
+                "e2",
+                "sales",
+                EpochStats::exact(200, 2000),
+                "w2".into(),
                 (2000, 3000),
             )
             // Epoch 3: time 3000-4000
             .with_epoch_time_range(
-                "e3", "sales",
-                EpochStats::exact(150, 1500), "w1".into(),
+                "e3",
+                "sales",
+                EpochStats::exact(150, 1500),
+                "w1".into(),
                 (3000, 4000),
             );
 
@@ -473,8 +479,10 @@ mod tests {
             .with_epoch("e1", "sales", EpochStats::exact(100, 1000), "w1".into())
             // Epoch with time range
             .with_epoch_time_range(
-                "e2", "sales",
-                EpochStats::exact(200, 2000), "w2".into(),
+                "e2",
+                "sales",
+                EpochStats::exact(200, 2000),
+                "w2".into(),
                 (2000, 3000),
             );
 
@@ -495,18 +503,24 @@ mod tests {
 
         // Add epochs out of order
         metadata.add_epoch_with_time_range(
-            "e3", "sales",
-            EpochStats::exact(150, 1500), "w1".into(),
+            "e3",
+            "sales",
+            EpochStats::exact(150, 1500),
+            "w1".into(),
             (3000, 4000),
         );
         metadata.add_epoch_with_time_range(
-            "e1", "sales",
-            EpochStats::exact(100, 1000), "w1".into(),
+            "e1",
+            "sales",
+            EpochStats::exact(100, 1000),
+            "w1".into(),
             (1000, 2000),
         );
         metadata.add_epoch_with_time_range(
-            "e2", "sales",
-            EpochStats::exact(200, 2000), "w2".into(),
+            "e2",
+            "sales",
+            EpochStats::exact(200, 2000),
+            "w2".into(),
             (2000, 3000),
         );
 

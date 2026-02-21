@@ -9,12 +9,12 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::engine::duckdb::arrow_utils::register_arrow_batches_persistent;
+use crate::engine::duckdb::DuckDBQueryEngine;
 use crate::ldp::executor::coordinator::LdpCoordinator;
 use crate::ldp::executor::stage::LocalStageExecutor;
 use crate::ldp::planner::PlannerPolicy;
-use crate::ldp::WorkerId;
-use crate::engine::duckdb::DuckDBQueryEngine;
 use crate::ldp::testing::macro_helpers::LogicalDatasetManager;
+use crate::ldp::WorkerId;
 
 /// Test cluster for simulating distributed LDP execution.
 pub struct TestCluster {
@@ -59,9 +59,7 @@ impl TestClusterConfig {
     pub fn with_workers(mut self, count: usize) -> Self {
         self.worker_count = count;
         // Adjust ports based on worker count
-        self.ports = (0..count)
-            .map(|i| 8815 + i as u16)
-            .collect();
+        self.ports = (0..count).map(|i| 8815 + i as u16).collect();
         self
     }
 
@@ -97,11 +95,11 @@ impl TestWorker {
         let config = crate::engine::duckdb::DuckDBConfig::default();
         let shared_db = Arc::new(
             crate::engine::duckdb::SharedDatabase::new(&config)
-                .expect("Failed to create shared database")
+                .expect("Failed to create shared database"),
         );
-        
+
         let query_engine = Arc::new(
-            DuckDBQueryEngine::new(shared_db, 16) // 16 concurrent queries
+            DuckDBQueryEngine::new(shared_db, 16), // 16 concurrent queries
         );
         let executor = Arc::new(LocalStageExecutor::new());
 
@@ -143,17 +141,19 @@ impl TestCluster {
 
         // Create coordinator using cluster policy (including coordinator worker).
         // Use only 1 retry in tests to avoid 60+ second hangs on deterministic failures.
-        let coordinator_config = crate::ldp::executor::coordinator::CoordinatorConfig::new(
-            config.tenant_id.clone(),
-        )
-        .with_policy(config.policy.clone())
-        .with_retries(1);
+        let coordinator_config =
+            crate::ldp::executor::coordinator::CoordinatorConfig::new(config.tenant_id.clone())
+                .with_policy(config.policy.clone())
+                .with_retries(1);
         let metadata = Arc::new(crate::ldp::planner::metadata::InMemoryMetadata::new());
-        
+
         #[allow(clippy::arc_with_non_send_sync)]
         let coordinator = Arc::new(
-            crate::ldp::executor::coordinator::LdpCoordinator::new(coordinator_config, metadata.clone())
-                .map_err(|e| format!("Failed to create coordinator: {:?}", e))?
+            crate::ldp::executor::coordinator::LdpCoordinator::new(
+                coordinator_config,
+                metadata.clone(),
+            )
+            .map_err(|e| format!("Failed to create coordinator: {:?}", e))?,
         );
 
         let cluster = Self {
@@ -192,7 +192,11 @@ impl TestCluster {
 
     /// Get all worker IDs (sorted for deterministic ordering).
     pub fn worker_ids(&self) -> Vec<WorkerId> {
-        let mut ids: Vec<WorkerId> = self.workers.keys().map(|k| WorkerId::from(k.as_str())).collect();
+        let mut ids: Vec<WorkerId> = self
+            .workers
+            .keys()
+            .map(|k| WorkerId::from(k.as_str()))
+            .collect();
         ids.sort();
         ids
     }
@@ -203,7 +207,10 @@ impl TestCluster {
         sql: &str,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error>> {
         // Use the coordinator's execute_query API which handles the full pipeline
-        let result = self.coordinator.execute_query(sql).await
+        let result = self
+            .coordinator
+            .execute_query(sql)
+            .await
             .map_err(|e| format!("Query execution failed: {:?}", e))?;
         Ok(result.batches)
     }
@@ -213,7 +220,8 @@ impl TestCluster {
         &self,
         worker_id: impl AsRef<str>,
         sql: &str,
-    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let worker_id = worker_id.as_ref();
         let worker = self
             .workers
@@ -223,20 +231,19 @@ impl TestCluster {
         // Execute query using the worker's query engine's shared database
         let shared_db = worker.query_engine.shared_db.clone();
         let sql_owned = sql.to_string();
-        
+
         let batches = tokio::task::spawn_blocking(move || -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
             // Get connection inside spawn_blocking to avoid Send issues
             let conn = shared_db.get()?;
             let mut stmt = conn.prepare(&sql_owned)?;
             let arrow_batches = stmt.query_arrow([])?;
-            
             let mut result = Vec::new();
             for batch in arrow_batches {
                 result.push(batch);
             }
             Ok(result)
         }).await.map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)??;
-        
+
         Ok(batches)
     }
 
@@ -255,13 +262,16 @@ impl TestCluster {
 
         let shared_db = worker.query_engine.shared_db.clone();
         let table_name_owned = table_name.to_string();
-        
+
         // Register the table in the worker's DuckDB instance
-        tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let conn = shared_db.get()?;
-            register_arrow_batches_persistent(&conn, &table_name_owned, &data)?;
-            Ok(())
-        }).await??;
+        tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let conn = shared_db.get()?;
+                register_arrow_batches_persistent(&conn, &table_name_owned, &data)?;
+                Ok(())
+            },
+        )
+        .await??;
 
         Ok(())
     }
@@ -273,7 +283,8 @@ impl TestCluster {
         data_chunks: Vec<(String, Vec<arrow::record_batch::RecordBatch>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (worker_id, data) in data_chunks {
-            self.load_data_to_worker(&worker_id, table_name, data).await?;
+            self.load_data_to_worker(&worker_id, table_name, data)
+                .await?;
         }
         Ok(())
     }

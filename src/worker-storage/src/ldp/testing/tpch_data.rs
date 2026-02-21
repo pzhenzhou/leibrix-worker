@@ -4,15 +4,13 @@
 //! and realistic data distributions. Supports epoch-based time partitioning
 //! for fact tables.
 
-use arrow::array::{
-    ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-};
+use arrow::array::{ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use rand::distributions::Alphanumeric;
-use rand::seq::SliceRandom;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 
@@ -71,7 +69,10 @@ impl TpchDataGenerator {
     /// - l_shipinstruct: STRING
     /// - l_shipmode: STRING
     /// - l_comment: STRING
-    pub fn generate_lineitem_epochs(&mut self, epochs: &[EpochSpec]) -> Vec<(EpochSpec, Vec<RecordBatch>)> {
+    pub fn generate_lineitem_epochs(
+        &mut self,
+        epochs: &[EpochSpec],
+    ) -> Vec<(EpochSpec, Vec<RecordBatch>)> {
         epochs
             .iter()
             .map(|epoch| {
@@ -101,7 +102,8 @@ impl TpchDataGenerator {
                 break;
             }
 
-            let batch = self.generate_lineitem_batch(batch_rows, &epoch.start_date, &epoch.end_date);
+            let batch =
+                self.generate_lineitem_batch(batch_rows, &epoch.start_date, &epoch.end_date);
             batches.push(batch);
             remaining -= batch_rows;
         }
@@ -135,7 +137,12 @@ impl TpchDataGenerator {
 
         let returnflags = ["R", "A", "N"];
         let linestatuses = ["O", "F"];
-        let shipinstructs = ["DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"];
+        let shipinstructs = [
+            "DELIVER IN PERSON",
+            "COLLECT COD",
+            "NONE",
+            "TAKE BACK RETURN",
+        ];
         let shipmodes = ["TRUCK", "MAIL", "REG AIR", "SHIP", "FOB", "AIR", "RAIL"];
 
         // Calculate date range in days
@@ -143,13 +150,16 @@ impl TpchDataGenerator {
 
         for i in 0..row_count {
             // Generate realistic order key (based on scale factor)
-            l_orderkey.push((self.rng.gen::<u32>() as i64 % (1500000.0 * self.scale_factor) as i64) + 1);
+            l_orderkey
+                .push((self.rng.gen::<u32>() as i64 % (1500000.0 * self.scale_factor) as i64) + 1);
 
             // Part key (1 to 200,000 * SF)
-            l_partkey.push((self.rng.gen::<u32>() % (200000.0 * self.scale_factor) as u32) as i32 + 1);
+            l_partkey
+                .push((self.rng.gen::<u32>() % (200000.0 * self.scale_factor) as u32) as i32 + 1);
 
             // Supplier key (1 to 10,000 * SF)
-            l_suppkey.push((self.rng.gen::<u32>() % (10000.0 * self.scale_factor) as u32) as i32 + 1);
+            l_suppkey
+                .push((self.rng.gen::<u32>() % (10000.0 * self.scale_factor) as u32) as i32 + 1);
 
             // Line number (1-7 per order)
             l_linenumber.push((i % 7) as i32 + 1);
@@ -282,10 +292,24 @@ impl TpchDataGenerator {
         let mut p_retailprice = Vec::with_capacity(row_count);
         let mut p_comment = Vec::with_capacity(row_count);
 
-        let mfgrs = ["Manufacturer#1", "Manufacturer#2", "Manufacturer#3", "Manufacturer#4", "Manufacturer#5"];
-        let brands = ["Brand#11", "Brand#12", "Brand#13", "Brand#21", "Brand#22", "Brand#23"];
-        let types = ["STANDARD POLISHED TIN", "SMALL PLATED BRASS", "MEDIUM BURNISHED COPPER"];
-        let containers = ["SM CASE", "SM BOX", "SM PACK", "LG CASE", "LG BOX", "LG PACK"];
+        let mfgrs = [
+            "Manufacturer#1",
+            "Manufacturer#2",
+            "Manufacturer#3",
+            "Manufacturer#4",
+            "Manufacturer#5",
+        ];
+        let brands = [
+            "Brand#11", "Brand#12", "Brand#13", "Brand#21", "Brand#22", "Brand#23",
+        ];
+        let types = [
+            "STANDARD POLISHED TIN",
+            "SMALL PLATED BRASS",
+            "MEDIUM BURNISHED COPPER",
+        ];
+        let containers = [
+            "SM CASE", "SM BOX", "SM PACK", "LG CASE", "LG BOX", "LG PACK",
+        ];
 
         for i in 0..row_count {
             p_partkey.push((key_offset + i) as i32 + 1);
@@ -452,7 +476,13 @@ impl TpchDataGenerator {
         let mut c_mktsegment = Vec::with_capacity(row_count);
         let mut c_comment = Vec::with_capacity(row_count);
 
-        let segments = ["AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"];
+        let segments = [
+            "AUTOMOBILE",
+            "BUILDING",
+            "FURNITURE",
+            "MACHINERY",
+            "HOUSEHOLD",
+        ];
 
         for i in 0..row_count {
             c_custkey.push((key_offset + i) as i32 + 1);
@@ -506,7 +536,10 @@ impl TpchDataGenerator {
     /// - o_clerk: STRING
     /// - o_shippriority: INT32
     /// - o_comment: STRING
-    pub fn generate_orders_epochs(&mut self, epochs: &[EpochSpec]) -> Vec<(EpochSpec, Vec<RecordBatch>)> {
+    pub fn generate_orders_epochs(
+        &mut self,
+        epochs: &[EpochSpec],
+    ) -> Vec<(EpochSpec, Vec<RecordBatch>)> {
         epochs
             .iter()
             .map(|epoch| {
@@ -564,8 +597,10 @@ impl TpchDataGenerator {
         let date_range_days = (*end_date - *start_date).num_days() as i32;
 
         for i in 0..row_count {
-            o_orderkey.push((self.rng.gen::<u32>() as i64 % (1500000.0 * self.scale_factor) as i64) + 1);
-            o_custkey.push((self.rng.gen::<u32>() % (150000.0 * self.scale_factor) as u32) as i32 + 1);
+            o_orderkey
+                .push((self.rng.gen::<u32>() as i64 % (1500000.0 * self.scale_factor) as i64) + 1);
+            o_custkey
+                .push((self.rng.gen::<u32>() % (150000.0 * self.scale_factor) as u32) as i32 + 1);
             o_orderstatus.push(statuses.choose(&mut self.rng).unwrap().to_string());
             o_totalprice.push(self.rng.gen_range(1000.0..=500000.0));
 
@@ -634,7 +669,8 @@ fn lineitem_schema() -> Schema {
         Field::new("l_shipdate", DataType::Date32, false),
         Field::new("l_commitdate", DataType::Date32, false),
         Field::new("l_receiptdate", DataType::Date32, false),
-        Field::new("l_shipinstruct", DataType::Utf8, false),Field::new("l_shipmode", DataType::Utf8, false),
+        Field::new("l_shipinstruct", DataType::Utf8, false),
+        Field::new("l_shipmode", DataType::Utf8, false),
         Field::new("l_comment", DataType::Utf8, false),
     ])
 }

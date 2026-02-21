@@ -313,7 +313,9 @@ impl SqlTransformer {
             TableFactor::Derived { subquery, .. } => {
                 self.rewrite_query(subquery, replacements)?;
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.rewrite_table_with_joins(table_with_joins, replacements)?;
             }
             _ => {}
@@ -347,12 +349,21 @@ impl SqlTransformer {
             Expr::Nested(inner) => {
                 self.rewrite_expr_subqueries(inner, replacements)?;
             }
-            Expr::Between { expr: inner, low, high, .. } => {
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
                 self.rewrite_expr_subqueries(inner, replacements)?;
                 self.rewrite_expr_subqueries(low, replacements)?;
                 self.rewrite_expr_subqueries(high, replacements)?;
             }
-            Expr::Case { operand, else_result, .. } => {
+            Expr::Case {
+                operand,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     self.rewrite_expr_subqueries(op, replacements)?;
                 }
@@ -396,7 +407,9 @@ impl SqlTransformer {
         // Create table function factor
         TableFactor::Function {
             lateral: false,
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(&dataset.macro_name))]),
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                &dataset.macro_name,
+            ))]),
             args,
             alias: original_alias,
         }
@@ -477,10 +490,8 @@ mod tests {
     fn create_transformer(datasets: &[(&str, &str)]) -> SqlTransformer {
         let mut transformer = SqlTransformer::new();
         for (id, time_col) in datasets {
-            transformer.register_dataset(RegisteredDataset::new(
-                id.to_string(),
-                time_col.to_string(),
-            ));
+            transformer
+                .register_dataset(RegisteredDataset::new(id.to_string(), time_col.to_string()));
         }
         transformer
     }
@@ -538,10 +549,8 @@ mod tests {
 
     #[test]
     fn test_transform_join() {
-        let transformer = create_transformer(&[
-            ("sales_data", "dt"),
-            ("customer_data", "created_at"),
-        ]);
+        let transformer =
+            create_transformer(&[("sales_data", "dt"), ("customer_data", "created_at")]);
         let sql = "SELECT s.*, c.name FROM sales_data s JOIN customer_data c ON s.cid = c.id \
                    WHERE s.dt >= '2025-01-01' AND c.created_at < '2025-06-01'";
 
@@ -600,10 +609,7 @@ mod tests {
 
     #[test]
     fn test_transform_union() {
-        let transformer = create_transformer(&[
-            ("sales_data", "dt"),
-            ("archive_data", "dt"),
-        ]);
+        let transformer = create_transformer(&[("sales_data", "dt"), ("archive_data", "dt")]);
         let sql = "SELECT * FROM sales_data WHERE dt = '2025-01-15' \
                    UNION ALL SELECT * FROM archive_data WHERE dt = '2024-01-15'";
 

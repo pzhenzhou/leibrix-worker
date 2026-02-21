@@ -3,8 +3,7 @@
 /// between the Master and a Worker in both directions (symmetric).
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct EventStreamMessage {
     /// A unique identifier for the event, used for logging and correlation.
     #[prost(string, tag = "1")]
@@ -21,8 +20,7 @@ pub struct EventStreamMessage {
 pub mod event_stream_message {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
         /// ---- Events initiated by the Worker ----
         #[prost(message, tag = "4")]
@@ -45,8 +43,7 @@ pub mod event_stream_message {
 /// with a flexible structure that can represent any acknowledgment or control command.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct CommonAckEvent {
     /// The server ID of the node sending this acknowledgment
     #[prost(string, tag = "1")]
@@ -64,36 +61,30 @@ pub struct CommonAckEvent {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct Worker {
     #[prost(string, tag = "1")]
     pub node_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub addr: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "3")]
-    pub labels: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct RegisterEvent {
     #[prost(message, optional, tag = "1")]
     pub worker: ::core::option::Option<Worker>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HeartbeatEvent {}
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct DataPullStatusUpdateEvent {
     #[prost(string, tag = "1")]
     pub dataset_id: ::prost::alloc::string::String,
@@ -109,8 +100,9 @@ pub struct DataPullStatusUpdateEvent {
 pub mod data_pull_status_update_event {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
     #[derive(
+        serde::Serialize,
+        serde::Deserialize,
         Clone,
         Copy,
         Debug,
@@ -119,7 +111,7 @@ pub mod data_pull_status_update_event {
         Hash,
         PartialOrd,
         Ord,
-        ::prost::Enumeration
+        ::prost::Enumeration,
     )]
     #[repr(i32)]
     pub enum Status {
@@ -155,8 +147,7 @@ pub mod data_pull_status_update_event {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct DataAssignmentEvent {
     #[prost(string, tag = "1")]
     pub dataset_id: ::prost::alloc::string::String,
@@ -167,8 +158,7 @@ pub struct DataAssignmentEvent {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct LoadPlan {
     #[prost(string, tag = "1")]
     pub plan_id: ::prost::alloc::string::String,
@@ -191,8 +181,7 @@ pub struct LoadPlan {
 /// This is what the Worker needs to generate the table macro constants
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ResolvedPartition {
     /// The time range this epoch represents (REQUIRED)
     /// Used in macro: WHERE (DATE 'start' >= start_dt AND DATE 'start' < end_excl)
@@ -209,17 +198,14 @@ pub struct ResolvedPartition {
     pub time_partition_value: ::prost::alloc::string::String,
     /// Additional dimension partition values (if multi-dimensional)
     #[prost(map = "string, string", tag = "4")]
-    pub dimension_values: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub dimension_values:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 /// DEPRECATED: EventResponse is being phased out in favor of CommonAckEvent within EventStreamMessage
 /// for symmetric bidirectional communication. Kept temporarily for backward compatibility.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct EventResponse {
     #[prost(string, tag = "1")]
     pub server_id: ::prost::alloc::string::String,
@@ -235,10 +221,10 @@ pub mod control_plane_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// ControlPlaneService defines the bidirectional stream for all real-time
     /// communication between a Worker and the Master.
     /// The stream is now symmetric - both sides send and receive EventStreamMessage.
@@ -285,9 +271,8 @@ pub mod control_plane_service_client {
                     <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             ControlPlaneServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -324,33 +309,23 @@ pub mod control_plane_service_client {
         }
         pub async fn coordinate_worker(
             &mut self,
-            request: impl tonic::IntoStreamingRequest<
-                Message = super::EventStreamMessage,
-            >,
+            request: impl tonic::IntoStreamingRequest<Message = super::EventStreamMessage>,
         ) -> std::result::Result<
             tonic::Response<tonic::codec::Streaming<super::EventStreamMessage>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/control_plane.ControlPlaneService/CoordinateWorker",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "control_plane.ControlPlaneService",
-                        "CoordinateWorker",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "control_plane.ControlPlaneService",
+                "CoordinateWorker",
+            ));
             self.inner.streaming(req, path, codec).await
         }
     }
@@ -362,7 +337,7 @@ pub mod control_plane_service_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ControlPlaneServiceServer.
@@ -371,16 +346,12 @@ pub mod control_plane_service_server {
         /// Server streaming response type for the CoordinateWorker method.
         type CoordinateWorkerStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::EventStreamMessage, tonic::Status>,
-            >
-            + std::marker::Send
+            > + std::marker::Send
             + 'static;
         async fn coordinate_worker(
             &self,
             request: tonic::Request<tonic::Streaming<super::EventStreamMessage>>,
-        ) -> std::result::Result<
-            tonic::Response<Self::CoordinateWorkerStream>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<Self::CoordinateWorkerStream>, tonic::Status>;
     }
     /// ControlPlaneService defines the bidirectional stream for all real-time
     /// communication between a Worker and the Master.
@@ -406,10 +377,7 @@ pub mod control_plane_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -464,29 +432,21 @@ pub mod control_plane_service_server {
                 "/control_plane.ControlPlaneService/CoordinateWorker" => {
                     #[allow(non_camel_case_types)]
                     struct CoordinateWorkerSvc<T: ControlPlaneService>(pub Arc<T>);
-                    impl<
-                        T: ControlPlaneService,
-                    > tonic::server::StreamingService<super::EventStreamMessage>
-                    for CoordinateWorkerSvc<T> {
+                    impl<T: ControlPlaneService>
+                        tonic::server::StreamingService<super::EventStreamMessage>
+                        for CoordinateWorkerSvc<T>
+                    {
                         type Response = super::EventStreamMessage;
                         type ResponseStream = T::CoordinateWorkerStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
-                            request: tonic::Request<
-                                tonic::Streaming<super::EventStreamMessage>,
-                            >,
+                            request: tonic::Request<tonic::Streaming<super::EventStreamMessage>>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ControlPlaneService>::coordinate_worker(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
+                                <T as ControlPlaneService>::coordinate_worker(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -513,25 +473,19 @@ pub mod control_plane_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }

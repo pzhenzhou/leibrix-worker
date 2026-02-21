@@ -1,6 +1,6 @@
-use super::DuckDBConfig;
 use super::helper::*;
 use super::memory_duckdb_runtime::*;
+use super::DuckDBConfig;
 use super::SharedDatabase;
 use crate::engine::storage_engine::{EngineMetrics, EpochView, TableMetadata};
 use crate::ldp::{EpochStats, StatsSource};
@@ -25,11 +25,11 @@ impl MemoryDuckDBEngine {
     /// The shared database can be used by QueryEngine for read operations.
     pub fn new(config: DuckDBConfig, shared_db: Arc<SharedDatabase>) -> anyhow::Result<Self> {
         info!("MemoryDuckDBEngine starting with config: {:?}", config);
-        
+
         // Get a pooled connection for the storage engine (writer)
         // This connection will be held for the lifetime of the engine
         let writer_conn = shared_db.get()?;
-        
+
         let (tx, rx) = sync::mpsc::channel(config.channel_capacity);
         let thread_config = config.clone();
         tokio::task::spawn_blocking(move || {
@@ -37,7 +37,10 @@ impl MemoryDuckDBEngine {
                 error!("Engine loop exited with error: {}", e);
             }
         });
-        Ok(Self { com_tx: tx, shared_db })
+        Ok(Self {
+            com_tx: tx,
+            shared_db,
+        })
     }
 
     /// Creates a new engine with a fresh in-memory database.
@@ -163,7 +166,8 @@ impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
 
     fn memory_stats(
         &self,
-    ) -> impl Future<Output = anyhow::Result<crate::engine::storage_engine::MemoryStats>> + Send {
+    ) -> impl Future<Output = anyhow::Result<crate::engine::storage_engine::MemoryStats>> + Send
+    {
         let tx = self.com_tx.clone();
         async move {
             let (resp_tx, resp_rx) = oneshot::channel();
@@ -211,9 +215,10 @@ impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
                 .map_err(|_| anyhow::anyhow!("Response channel closed"))??;
 
             // Find the epoch in the stats
-            let epoch_stat = stats.epochs.iter().find(|e| {
-                e.dataset_id == dataset_id && e.epoch_id == epoch_id
-            });
+            let epoch_stat = stats
+                .epochs
+                .iter()
+                .find(|e| e.dataset_id == dataset_id && e.epoch_id == epoch_id);
 
             Ok(epoch_stat.map(|e| EpochStats {
                 rows: e.rows_count,

@@ -23,9 +23,9 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
-    Cte, Expr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
-    JoinOperator, ObjectName, OrderByKind, Query, Select, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableWithJoins,
+    Cte, Expr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableWithJoins,
 };
 
 use super::logical_plan::{ColumnRef, LogicalPlan, PlanBuildError, PlanContext};
@@ -66,7 +66,10 @@ fn build_from_query(query: &Query) -> Result<BuildResult, PlanBuildError> {
     build_from_query_with_ctes(query, &HashMap::new())
 }
 
-fn build_from_query_with_ctes(query: &Query, outer_ctes: &CteMap<'_>) -> Result<BuildResult, PlanBuildError> {
+fn build_from_query_with_ctes(
+    query: &Query,
+    outer_ctes: &CteMap<'_>,
+) -> Result<BuildResult, PlanBuildError> {
     // 1. Build CTE map: start with outer CTEs, add this query's CTEs.
     // CTEs are ordered so later CTEs can reference earlier ones.
     let mut cte_map = outer_ctes.clone();
@@ -213,10 +216,7 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
         GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
         GroupByExpr::All(_) => true,
     };
-    let has_aggregate_functions = select
-        .projection
-        .iter()
-        .any(select_item_has_aggregate);
+    let has_aggregate_functions = select.projection.iter().any(select_item_has_aggregate);
 
     if has_group_by || has_aggregate_functions {
         let group_keys = extract_group_keys(&select.group_by);
@@ -233,10 +233,7 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
     }
 
     // 4. Projection → Window + Project or just Project.
-    let has_window = select
-        .projection
-        .iter()
-        .any(select_item_has_window);
+    let has_window = select.projection.iter().any(select_item_has_window);
 
     if has_window {
         plan = LogicalPlan::Window {
@@ -257,7 +254,10 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
 // FROM clause builders
 // ---------------------------------------------------------------------------
 
-fn build_from_clause(from: &[TableWithJoins], cte_map: &CteMap<'_>) -> Result<LogicalPlan, PlanBuildError> {
+fn build_from_clause(
+    from: &[TableWithJoins],
+    cte_map: &CteMap<'_>,
+) -> Result<LogicalPlan, PlanBuildError> {
     if from.is_empty() {
         return Err(PlanBuildError::UnsupportedFeature(
             "SELECT without FROM".to_string(),
@@ -282,7 +282,10 @@ fn build_from_clause(from: &[TableWithJoins], cte_map: &CteMap<'_>) -> Result<Lo
     Ok(plan)
 }
 
-fn build_table_with_joins(twj: &TableWithJoins, cte_map: &CteMap<'_>) -> Result<LogicalPlan, PlanBuildError> {
+fn build_table_with_joins(
+    twj: &TableWithJoins,
+    cte_map: &CteMap<'_>,
+) -> Result<LogicalPlan, PlanBuildError> {
     let mut plan = build_table_factor(&twj.relation, cte_map)?;
 
     for join in &twj.joins {
@@ -308,7 +311,10 @@ fn build_table_with_joins(twj: &TableWithJoins, cte_map: &CteMap<'_>) -> Result<
     Ok(plan)
 }
 
-fn build_table_factor(tf: &TableFactor, cte_map: &CteMap<'_>) -> Result<LogicalPlan, PlanBuildError> {
+fn build_table_factor(
+    tf: &TableFactor,
+    cte_map: &CteMap<'_>,
+) -> Result<LogicalPlan, PlanBuildError> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
             let table_name = object_name_to_string(name);
@@ -365,9 +371,7 @@ fn build_table_factor(tf: &TableFactor, cte_map: &CteMap<'_>) -> Result<LogicalP
                 None => Ok(plan),
             }
         }
-        TableFactor::Function {
-            name, alias, ..
-        } => {
+        TableFactor::Function { name, alias, .. } => {
             // Table-valued function, e.g., scan_orders(DATE '2024-02-01', DATE '9999-12-31') AS o.
             // Extract just the function name so metadata lookup works correctly
             // (the metadata module resolves `scan_X` → base table `X`).
@@ -431,7 +435,13 @@ fn extract_equi_keys(
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();
 
-    extract_equi_keys_recursive(expr, left_tables, right_tables, &mut left_keys, &mut right_keys);
+    extract_equi_keys_recursive(
+        expr,
+        left_tables,
+        right_tables,
+        &mut left_keys,
+        &mut right_keys,
+    );
 
     (left_keys, right_keys)
 }
@@ -496,10 +506,9 @@ fn extract_equi_keys_recursive(
 fn expr_to_column_ref(expr: &Expr) -> Option<ColumnRef> {
     match expr {
         Expr::Identifier(ident) => Some(ColumnRef::unqualified(&ident.value)),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(ColumnRef::qualified(
-            &parts[0].value,
-            &parts[1].value,
-        )),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some(ColumnRef::qualified(&parts[0].value, &parts[1].value))
+        }
         // schema.table.column → use table.column
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let len = parts.len();
@@ -534,10 +543,7 @@ fn extract_group_keys(group_by: &GroupByExpr) -> Vec<ColumnRef> {
             // This triggers conservative Singleton requirement.
             vec![]
         }
-        GroupByExpr::Expressions(exprs, _) => exprs
-            .iter()
-            .filter_map(expr_to_column_ref)
-            .collect(),
+        GroupByExpr::Expressions(exprs, _) => exprs.iter().filter_map(expr_to_column_ref).collect(),
     }
 }
 
@@ -570,10 +576,10 @@ fn expr_has_window(expr: &Expr) -> bool {
             ..
         } => {
             operand.as_ref().is_some_and(|e| expr_has_window(e))
-                || conditions.iter().any(|c| expr_has_window(&c.condition) || expr_has_window(&c.result))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| expr_has_window(e))
+                || conditions
+                    .iter()
+                    .any(|c| expr_has_window(&c.condition) || expr_has_window(&c.result))
+                || else_result.as_ref().is_some_and(|e| expr_has_window(e))
         }
         _ => false,
     }
@@ -602,9 +608,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             }
             is_aggregate_function_name(&func.name)
         }
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
         Expr::Nested(inner) => expr_has_aggregate(inner),
         Expr::Case {
@@ -614,10 +618,10 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             ..
         } => {
             operand.as_ref().is_some_and(|e| expr_has_aggregate(e))
-                || conditions.iter().any(|c| expr_has_aggregate(&c.condition) || expr_has_aggregate(&c.result))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| expr_has_aggregate(e))
+                || conditions
+                    .iter()
+                    .any(|c| expr_has_aggregate(&c.condition) || expr_has_aggregate(&c.result))
+                || else_result.as_ref().is_some_and(|e| expr_has_aggregate(e))
         }
         _ => false,
     }
@@ -670,8 +674,15 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "mad",
     "quantile",
     "reservoir_quantile",
-    "regr_avgx", "regr_avgy", "regr_count", "regr_intercept",
-    "regr_r2", "regr_slope", "regr_sxx", "regr_sxy", "regr_syy",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
 ];
 
 fn is_aggregate_function_name(name: &ObjectName) -> bool {
@@ -972,11 +983,9 @@ mod tests {
     use sqlparser::ast::{SetOperator, SetQuantifier};
 
     fn parse_and_build(sql: &str) -> BuildResult {
-        let stmts = sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::GenericDialect {},
-            sql,
-        )
-        .unwrap();
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                .unwrap();
         build_logical_plan(&stmts[0]).unwrap()
     }
 

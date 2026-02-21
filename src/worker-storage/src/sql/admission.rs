@@ -88,7 +88,9 @@ impl From<SqlTransformError> for AdmissionError {
     fn from(err: SqlTransformError) -> Self {
         match err {
             SqlTransformError::ParseError(msg) => AdmissionError::ParseError(msg),
-            SqlTransformError::UnsupportedStatement(msg) => AdmissionError::UnsupportedStatement(msg),
+            SqlTransformError::UnsupportedStatement(msg) => {
+                AdmissionError::UnsupportedStatement(msg)
+            }
             other => AdmissionError::ParseError(other.to_string()),
         }
     }
@@ -260,7 +262,9 @@ impl AdmissionController {
             TableFactor::Derived { subquery, .. } => {
                 self.check_query_for_recursive_cte(subquery)?;
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.check_table_with_joins_for_recursive_cte(table_with_joins)?;
             }
             _ => {}
@@ -392,7 +396,9 @@ impl AdmissionController {
             TableFactor::Derived { subquery, .. } => {
                 tables.extend(self.collect_table_references(subquery));
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.collect_tables_from_table_with_joins(table_with_joins, tables);
             }
             _ => {}
@@ -466,11 +472,9 @@ impl AdmissionController {
             Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column_name),
 
             // Compound identifier like table.column
-            Expr::CompoundIdentifier(parts) => {
-                parts
-                    .last()
-                    .is_some_and(|p| p.value.eq_ignore_ascii_case(column_name))
-            }
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|p| p.value.eq_ignore_ascii_case(column_name)),
 
             // Binary comparison (col = x, col > x, etc.)
             Expr::BinaryOp { left, right, .. } => {
@@ -508,10 +512,8 @@ mod tests {
     fn create_controller(datasets: &[(&str, &str)]) -> AdmissionController {
         let mut controller = AdmissionController::new();
         for (id, time_col) in datasets {
-            controller.register_dataset(RegisteredDataset::new(
-                id.to_string(),
-                time_col.to_string(),
-            ));
+            controller
+                .register_dataset(RegisteredDataset::new(id.to_string(), time_col.to_string()));
         }
         controller
     }
@@ -596,7 +598,8 @@ mod tests {
 
     #[test]
     fn test_reject_join_missing_time_range() {
-        let controller = create_controller(&[("sales_data", "dt"), ("customer_data", "created_at")]);
+        let controller =
+            create_controller(&[("sales_data", "dt"), ("customer_data", "created_at")]);
         let sql = "SELECT * FROM sales_data s JOIN customer_data c ON s.cid = c.id WHERE s.dt >= '2025-01-01'";
 
         // sales_data has time range, but customer_data does not
@@ -613,7 +616,8 @@ mod tests {
 
     #[test]
     fn test_allow_join_with_all_time_ranges() {
-        let controller = create_controller(&[("sales_data", "dt"), ("customer_data", "created_at")]);
+        let controller =
+            create_controller(&[("sales_data", "dt"), ("customer_data", "created_at")]);
         let sql = "SELECT * FROM sales_data s JOIN customer_data c ON s.cid = c.id \
                    WHERE s.dt >= '2025-01-01' AND c.created_at < '2025-06-01'";
 
@@ -625,7 +629,8 @@ mod tests {
     fn test_time_predicate_in_join_on_clause() {
         let controller = create_controller(&[("sales_data", "dt")]);
         // Time predicate in JOIN ON clause should also count
-        let sql = "SELECT * FROM other_table o JOIN sales_data s ON o.id = s.id AND s.dt >= '2025-01-01'";
+        let sql =
+            "SELECT * FROM other_table o JOIN sales_data s ON o.id = s.id AND s.dt >= '2025-01-01'";
 
         let result = controller.check(sql);
         assert!(result.is_ok());

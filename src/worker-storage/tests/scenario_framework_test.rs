@@ -56,7 +56,10 @@ fn test_scenario_builder_multi_table() {
 
     assert_eq!(scenario.tables[1].name, "products");
     assert_eq!(scenario.tables[1].rows, 10_000);
-    assert_eq!(scenario.tables[1].distribution, DistributionSetup::Replicated);
+    assert_eq!(
+        scenario.tables[1].distribution,
+        DistributionSetup::Replicated
+    );
 }
 
 #[test]
@@ -87,7 +90,7 @@ fn test_plan_expectation_descriptions() {
 
 #[test]
 fn test_result_expectation_row_count() {
-    use arrow::array::{Int32Array, ArrayRef};
+    use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;

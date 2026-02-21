@@ -16,7 +16,9 @@ pub fn parse_sql(sql: &str) -> Result<Statement, SqlTransformError> {
     let statements = Parser::parse_sql(&dialect, sql)?;
 
     if statements.is_empty() {
-        return Err(SqlTransformError::ParseError("Empty SQL statement".to_string()));
+        return Err(SqlTransformError::ParseError(
+            "Empty SQL statement".to_string(),
+        ));
     }
 
     if statements.len() > 1 {
@@ -54,7 +56,8 @@ mod tests {
 
     #[test]
     fn test_parse_select_with_cte() {
-        let sql = "WITH recent AS (SELECT * FROM sales WHERE dt > '2025-01-01') SELECT * FROM recent";
+        let sql =
+            "WITH recent AS (SELECT * FROM sales WHERE dt > '2025-01-01') SELECT * FROM recent";
         let result = parse_sql(sql);
         assert!(result.is_ok());
     }

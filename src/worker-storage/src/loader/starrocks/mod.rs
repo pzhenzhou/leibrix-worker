@@ -28,10 +28,7 @@ pub fn select_text(source: Arc<DataSource>, schema: Arc<Schema>) -> String {
         _ => format!("`{}`.`{}`", source.database, source.table),
     };
 
-    let mut sql = format!(
-        "SELECT {} FROM {}",
-        column_list, full_table_name
-    );
+    let mut sql = format!("SELECT {} FROM {}", column_list, full_table_name);
 
     if let Some(filter) = &source.filter {
         sql.push_str(&format!(" WHERE {}", filter));

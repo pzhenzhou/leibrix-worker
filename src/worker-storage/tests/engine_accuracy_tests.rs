@@ -136,7 +136,11 @@ async fn test_list_epochs_empty_dataset() {
         .unwrap();
 
     // Assert
-    assert_eq!(epochs.len(), 0, "Should return empty list for non-existent dataset");
+    assert_eq!(
+        epochs.len(),
+        0,
+        "Should return empty list for non-existent dataset"
+    );
 }
 
 #[tokio::test]
@@ -259,10 +263,16 @@ async fn test_engine_metrics() {
         metrics.total_rows_written >= 15000,
         "Should have written at least 15000 rows"
     );
-    assert!(metrics.total_batches_written > 0, "Should have written batches");
+    assert!(
+        metrics.total_batches_written > 0,
+        "Should have written batches"
+    );
     assert!(metrics.total_flushes > 0, "Should have performed flushes");
     assert_eq!(metrics.committed_epochs, 1, "Should have 1 committed epoch");
-    assert_eq!(metrics.active_epochs, 0, "Should have no in-progress epochs");
+    assert_eq!(
+        metrics.active_epochs, 0,
+        "Should have no in-progress epochs"
+    );
 }
 
 #[tokio::test]

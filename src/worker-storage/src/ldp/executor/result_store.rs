@@ -14,7 +14,6 @@ use tracing::{debug, error};
 
 use super::stage::StageExecutionStats;
 
-
 /// Cached result of a stage execution.
 #[derive(Debug)]
 pub struct CachedStageResult {
@@ -145,7 +144,8 @@ impl StageResultStore {
         tenant_id: &str,
         query_id: &str,
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-        let keys_to_remove: Vec<_> = self.cache
+        let keys_to_remove: Vec<_> = self
+            .cache
             .iter()
             .filter(|entry| {
                 let k = entry.key();
@@ -171,7 +171,8 @@ impl StageResultStore {
     pub async fn cleanup_expired(&self) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let ttl = self.ttl;
 
-        let keys_to_remove: Vec<_> = self.cache
+        let keys_to_remove: Vec<_> = self
+            .cache
             .iter()
             .filter(|entry| entry.value().created_at.elapsed() > ttl)
             .map(|entry| entry.key().clone())
@@ -189,13 +190,15 @@ impl StageResultStore {
     }
 
     /// Start background cleanup task.
-    pub async fn start_cleanup_task(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start_cleanup_task(
+        self: Arc<Self>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cleanup_interval = self.cleanup_interval;
-        
+
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(cleanup_interval).await;
-                
+
                 match self.cleanup_expired().await {
                     Ok(count) => {
                         if count > 0 {
@@ -213,7 +216,9 @@ impl StageResultStore {
     }
 
     /// Get cache statistics.
-    pub async fn stats(&self) -> Result<StageResultStoreStats, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn stats(
+        &self,
+    ) -> Result<StageResultStoreStats, Box<dyn std::error::Error + Send + Sync>> {
         let total_entries = self.cache.len();
 
         let mut valid_count = 0;

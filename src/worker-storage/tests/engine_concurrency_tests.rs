@@ -19,8 +19,7 @@ async fn test_concurrent_epoch_creation_different_datasets() {
         tasks.spawn(async move {
             let dataset_id = format!("dataset_{}", i);
             let epoch_id = "epoch_001";
-            let stream =
-                create_test_stream(vec![create_test_batch(schema_clone, i * 1000, 500)]);
+            let stream = create_test_stream(vec![create_test_batch(schema_clone, i * 1000, 500)]);
             let epoch = create_test_epoch(&dataset_id, epoch_id);
 
             engine_clone
@@ -191,8 +190,7 @@ async fn test_concurrent_epoch_creation_same_dataset() {
         let engine_clone = engine.clone();
         let schema_clone = schema.clone();
         tasks.spawn(async move {
-            let stream =
-                create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
+            let stream = create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
             let epoch = create_test_epoch("same_dataset", &format!("epoch_{:03}", i));
             engine_clone
                 .create_epoch_table("same_dataset".to_string(), epoch, stream)
@@ -213,7 +211,10 @@ async fn test_concurrent_epoch_creation_same_dataset() {
     assert_eq!(success_count, 5, "All 5 epochs should be created");
 
     // Verify all epochs exist
-    let epochs = engine.list_epochs("same_dataset".to_string()).await.unwrap();
+    let epochs = engine
+        .list_epochs("same_dataset".to_string())
+        .await
+        .unwrap();
     assert_eq!(
         epochs.len(),
         5,
@@ -262,7 +263,10 @@ async fn test_concurrent_drop_different_epochs() {
     assert_eq!(success_count, 5, "All 5 drops should succeed");
 
     // Verify remaining epochs
-    let epochs = engine.list_epochs("drop_dataset".to_string()).await.unwrap();
+    let epochs = engine
+        .list_epochs("drop_dataset".to_string())
+        .await
+        .unwrap();
     assert_eq!(
         epochs.len(),
         5,
@@ -305,8 +309,7 @@ async fn test_concurrent_create_and_drop() {
         let engine_clone = engine.clone();
         let schema_clone = schema.clone();
         create_handles.push(tokio::spawn(async move {
-            let stream =
-                create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
+            let stream = create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
             let epoch = create_test_epoch("mixed_ops", &format!("epoch_{:03}", i));
             engine_clone
                 .create_epoch_table("mixed_ops".to_string(), epoch, stream)
@@ -388,7 +391,7 @@ async fn test_concurrent_memory_stats_during_operations() {
     // Arrange
     let engine = Arc::new(create_test_engine());
     let schema = create_test_schema();
-    
+
     // Start multiple epoch creations
     let mut create_handles = Vec::new();
     for i in 0..5 {
@@ -396,8 +399,7 @@ async fn test_concurrent_memory_stats_during_operations() {
         let schema_clone = schema.clone();
         create_handles.push(tokio::spawn(async move {
             let dataset_id = format!("stats_dataset_{}", i);
-            let stream =
-                create_test_stream(vec![create_test_batch(schema_clone, i * 1000, 1000)]);
+            let stream = create_test_stream(vec![create_test_batch(schema_clone, i * 1000, 1000)]);
             let epoch = create_test_epoch(&dataset_id, "epoch_001");
             engine_clone
                 .create_epoch_table(dataset_id, epoch, stream)
@@ -409,18 +411,20 @@ async fn test_concurrent_memory_stats_during_operations() {
     let mut stats_handles = Vec::new();
     for _ in 0..10 {
         let engine_clone = engine.clone();
-        stats_handles.push(tokio::spawn(async move { engine_clone.memory_stats().await }));
+        stats_handles.push(tokio::spawn(
+            async move { engine_clone.memory_stats().await },
+        ));
     }
 
     // Assert - All operations should complete
     let mut success_count = 0;
-    
+
     for handle in create_handles {
         if handle.await.expect("Task should not panic").is_ok() {
             success_count += 1;
         }
     }
-    
+
     for handle in stats_handles {
         if handle.await.expect("Task should not panic").is_ok() {
             success_count += 1;
@@ -461,8 +465,7 @@ async fn test_sequential_vs_concurrent_performance() {
         let engine = concurrent_engine.clone();
         let schema_clone = schema.clone();
         tasks.spawn(async move {
-            let stream =
-                create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
+            let stream = create_test_stream(vec![create_test_batch(schema_clone, i * 100, 100)]);
             let epoch = create_test_epoch("concurrent_dataset", &format!("epoch_{:03}", i));
             engine
                 .create_epoch_table("concurrent_dataset".to_string(), epoch, stream)

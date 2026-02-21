@@ -230,9 +230,7 @@ where
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(FlightServerError::Bind)?;
-        let bound_addr = listener
-            .local_addr()
-            .map_err(FlightServerError::Bind)?;
+        let bound_addr = listener.local_addr().map_err(FlightServerError::Bind)?;
 
         info!(
             bind_addr = %bound_addr,

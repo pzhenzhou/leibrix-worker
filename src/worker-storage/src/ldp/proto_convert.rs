@@ -9,8 +9,8 @@
 //! - Converting between internal and wire formats
 
 use crate::ldp::types::{
-    Distribution, Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId,
-    StageInput, StageLimits, StageOutput, WorkerId,
+    Distribution, Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId, StageInput,
+    StageLimits, StageOutput, WorkerId,
 };
 use crate::sql::logical_plan::ColumnRef;
 use prost::Message;
@@ -75,14 +75,15 @@ impl From<&Distribution> for proto::Distribution {
                     worker_id: worker.0.clone(),
                 })
             }
-            Distribution::HashPartitioned { column_refs, workers } => {
-                proto::distribution::DistributionType::HashPartitioned(
-                    proto::HashPartitionedDistribution {
-                        column_refs: column_refs_to_proto(column_refs),
-                        worker_ids: workers.iter().map(|w| w.0.clone()).collect(),
-                    },
-                )
-            }
+            Distribution::HashPartitioned {
+                column_refs,
+                workers,
+            } => proto::distribution::DistributionType::HashPartitioned(
+                proto::HashPartitionedDistribution {
+                    column_refs: column_refs_to_proto(column_refs),
+                    worker_ids: workers.iter().map(|w| w.0.clone()).collect(),
+                },
+            ),
             Distribution::EpochPartitioned { workers } => {
                 proto::distribution::DistributionType::EpochPartitioned(
                     proto::EpochPartitionedDistribution {
@@ -175,7 +176,12 @@ impl TryFrom<&proto::Exchange> for Exchange {
                 target: WorkerId::from(g.target_worker_id.clone()),
             }),
             Some(proto::exchange::ExchangeType::Broadcast(b)) => Ok(Exchange::Broadcast {
-                targets: b.target_worker_ids.iter().cloned().map(WorkerId::from).collect(),
+                targets: b
+                    .target_worker_ids
+                    .iter()
+                    .cloned()
+                    .map(WorkerId::from)
+                    .collect(),
             }),
             Some(proto::exchange::ExchangeType::HashPartition(h)) => Ok(Exchange::HashPartition {
                 column_refs: proto_to_column_refs(&h.column_refs),
@@ -233,15 +239,14 @@ impl TryFrom<&proto::StageInput> for StageInput {
 impl From<&StageOutput> for proto::StageOutput {
     fn from(output: &StageOutput) -> Self {
         let output_type = match output {
-            StageOutput::Stream => {
-                proto::stage_output::OutputType::Stream(proto::StreamOutput {})
-            }
-            StageOutput::Partitioned { partitions, column_refs } => {
-                proto::stage_output::OutputType::Partitioned(proto::PartitionedOutput {
-                    partitions: *partitions,
-                    column_refs: column_refs_to_proto(column_refs),
-                })
-            }
+            StageOutput::Stream => proto::stage_output::OutputType::Stream(proto::StreamOutput {}),
+            StageOutput::Partitioned {
+                partitions,
+                column_refs,
+            } => proto::stage_output::OutputType::Partitioned(proto::PartitionedOutput {
+                partitions: *partitions,
+                column_refs: column_refs_to_proto(column_refs),
+            }),
         };
 
         proto::StageOutput {
@@ -256,12 +261,10 @@ impl TryFrom<&proto::StageOutput> for StageOutput {
     fn try_from(proto: &proto::StageOutput) -> ConversionResult<Self> {
         match &proto.output_type {
             Some(proto::stage_output::OutputType::Stream(_)) => Ok(StageOutput::Stream),
-            Some(proto::stage_output::OutputType::Partitioned(p)) => {
-                Ok(StageOutput::Partitioned {
-                    partitions: p.partitions,
-                    column_refs: proto_to_column_refs(&p.column_refs),
-                })
-            }
+            Some(proto::stage_output::OutputType::Partitioned(p)) => Ok(StageOutput::Partitioned {
+                partitions: p.partitions,
+                column_refs: proto_to_column_refs(&p.column_refs),
+            }),
             None => Err(ConversionError::MissingField("output_type")),
         }
     }
@@ -314,11 +317,8 @@ impl TryFrom<&proto::Stage> for Stage {
     type Error = ConversionError;
 
     fn try_from(proto: &proto::Stage) -> ConversionResult<Self> {
-        let inputs: ConversionResult<Vec<StageInput>> = proto
-            .inputs
-            .iter()
-            .map(StageInput::try_from)
-            .collect();
+        let inputs: ConversionResult<Vec<StageInput>> =
+            proto.inputs.iter().map(StageInput::try_from).collect();
 
         let output = proto
             .output
@@ -335,7 +335,12 @@ impl TryFrom<&proto::Stage> for Stage {
 
         Ok(Stage {
             stage_id: StageId(proto.stage_id),
-            target_workers: proto.target_worker_ids.iter().cloned().map(WorkerId::from).collect(),
+            target_workers: proto
+                .target_worker_ids
+                .iter()
+                .cloned()
+                .map(WorkerId::from)
+                .collect(),
             inputs: inputs?,
             output,
             stage_sql: proto.stage_sql.clone(),
@@ -355,7 +360,11 @@ impl From<&ExchangeEdge> for proto::ExchangeEdge {
             kind: Some(proto::Exchange::from(&edge.kind)),
             from_stage_id: edge.from_stage.0,
             to_stage_id: edge.to_stage.0,
-            partition_to_worker: edge.partition_to_worker.iter().map(|w| w.0.clone()).collect(),
+            partition_to_worker: edge
+                .partition_to_worker
+                .iter()
+                .map(|w| w.0.clone())
+                .collect(),
         }
     }
 }
@@ -374,7 +383,12 @@ impl TryFrom<&proto::ExchangeEdge> for ExchangeEdge {
             kind: Exchange::try_from(kind)?,
             from_stage: StageId(proto.from_stage_id),
             to_stage: StageId(proto.to_stage_id),
-            partition_to_worker: proto.partition_to_worker.iter().cloned().map(WorkerId::from).collect(),
+            partition_to_worker: proto
+                .partition_to_worker
+                .iter()
+                .cloned()
+                .map(WorkerId::from)
+                .collect(),
         })
     }
 }
@@ -451,7 +465,7 @@ pub fn serialize_submit_stage_request(
 
     // Serialize each exchange input table to Arrow IPC format
     let mut serialized_inputs = Vec::new();
-    
+
     for (table_name, batches) in exchange_inputs {
         if batches.is_empty() {
             // Register table with empty schema placeholder
@@ -465,24 +479,21 @@ pub fn serialize_submit_stage_request(
         // Serialize batches to Arrow IPC stream
         let schema = batches[0].schema();
         let mut buffer = Cursor::new(Vec::new());
-        
+
         {
-            let mut writer = StreamWriter::try_new(&mut buffer, &schema)
-                .map_err(|e| ConversionError::Custom(
-                    format!("Failed to create Arrow IPC writer: {}", e)
-                ))?;
-            
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema).map_err(|e| {
+                ConversionError::Custom(format!("Failed to create Arrow IPC writer: {}", e))
+            })?;
+
             for batch in batches {
-                writer.write(batch)
-                    .map_err(|e| ConversionError::Custom(
-                        format!("Failed to write batch: {}", e)
-                    ))?;
+                writer.write(batch).map_err(|e| {
+                    ConversionError::Custom(format!("Failed to write batch: {}", e))
+                })?;
             }
-            
-            writer.finish()
-                .map_err(|e| ConversionError::Custom(
-                    format!("Failed to finish Arrow IPC stream: {}", e)
-                ))?;
+
+            writer.finish().map_err(|e| {
+                ConversionError::Custom(format!("Failed to finish Arrow IPC stream: {}", e))
+            })?;
         }
 
         serialized_inputs.push(proto::ExchangeInputRegistration {
@@ -563,17 +574,21 @@ pub fn deserialize_exchange_inputs(
 
         // Deserialize Arrow IPC stream
         let cursor = Cursor::new(&input_reg.arrow_ipc_stream);
-        let reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| ConversionError::DecodeError(
-                prost::DecodeError::new(format!("Failed to create Arrow IPC reader: {}", e))
-            ))?;
+        let reader = StreamReader::try_new(cursor, None).map_err(|e| {
+            ConversionError::DecodeError(prost::DecodeError::new(format!(
+                "Failed to create Arrow IPC reader: {}",
+                e
+            )))
+        })?;
 
         let mut batches = Vec::new();
         for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| ConversionError::DecodeError(
-                    prost::DecodeError::new(format!("Failed to read batch: {}", e))
-                ))?;
+            let batch = batch_result.map_err(|e| {
+                ConversionError::DecodeError(prost::DecodeError::new(format!(
+                    "Failed to read batch: {}",
+                    e
+                )))
+            })?;
             batches.push(batch);
         }
 
@@ -725,8 +740,12 @@ mod tests {
     #[test]
     fn test_ldp_plan_roundtrip() {
         let mut plan = LdpPlan::new(QueryId::from("query-123"), WorkerId::from("coordinator"));
-        plan.stages.push(Stage::new(StageId(0), "SELECT * FROM t1".to_string()));
-        plan.stages.push(Stage::new(StageId(1), "SELECT * FROM __exchange_0".to_string()));
+        plan.stages
+            .push(Stage::new(StageId(0), "SELECT * FROM t1".to_string()));
+        plan.stages.push(Stage::new(
+            StageId(1),
+            "SELECT * FROM __exchange_0".to_string(),
+        ));
         plan.edges.push(ExchangeEdge {
             exchange_id: ExchangeId(0),
             kind: Exchange::Gather {
@@ -752,9 +771,9 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
-        
+
         let limits = StageLimits::default();
-        
+
         // Create a simple RecordBatch for exchange input
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = arrow::record_batch::RecordBatch::try_new(
@@ -762,7 +781,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
-        
+
         let mut exchange_inputs = std::collections::HashMap::new();
         exchange_inputs.insert("__exchange_0".to_string(), vec![batch]);
 
@@ -786,13 +805,8 @@ mod tests {
 
     #[test]
     fn test_submit_stage_response_roundtrip() {
-        let bytes = serialize_submit_stage_response(
-            true,
-            "",
-            &[7, 8, 9],
-            Some((1000, 4096, 50)),
-        )
-        .unwrap();
+        let bytes =
+            serialize_submit_stage_response(true, "", &[7, 8, 9], Some((1000, 4096, 50))).unwrap();
 
         let response = deserialize_submit_stage_response(&bytes).unwrap();
         assert!(response.success);

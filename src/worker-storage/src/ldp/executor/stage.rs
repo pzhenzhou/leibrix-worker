@@ -3,8 +3,8 @@
 //! This module handles submitting stages to workers and executing them locally.
 
 use crate::engine::duckdb::SharedDatabase;
-use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 use crate::ldp::executor::monitor::StageExecutionMonitor;
+use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -44,7 +44,12 @@ impl StageTicket {
     }
 
     /// Create a partitioned stage ticket.
-    pub fn partitioned(query_id: String, stage_id: StageId, worker_id: WorkerId, partition: u32) -> Self {
+    pub fn partitioned(
+        query_id: String,
+        stage_id: StageId,
+        worker_id: WorkerId,
+        partition: u32,
+    ) -> Self {
         let ticket_id = format!("stage_{}_worker_{}_p{}", stage_id, worker_id, partition);
         Self {
             query_id,
@@ -172,10 +177,7 @@ pub enum StageExecutionError {
     StageNotFound(StageId),
     /// Worker not available or unreachable.
     #[error("Worker {worker_id} unavailable: {detail}")]
-    WorkerUnavailable {
-        worker_id: WorkerId,
-        detail: String,
-    },
+    WorkerUnavailable { worker_id: WorkerId, detail: String },
     /// SQL/stage execution failed.
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
@@ -238,7 +240,10 @@ pub trait StageExecutor: Send + Sync {
     ///
     /// # Returns
     /// Arrow record batches from the stage output.
-    async fn fetch_output(&self, ticket: &StageTicket) -> Result<Vec<RecordBatch>, StageExecutionError>;
+    async fn fetch_output(
+        &self,
+        ticket: &StageTicket,
+    ) -> Result<Vec<RecordBatch>, StageExecutionError>;
 }
 
 /// Local stage executor using DuckDB.
@@ -312,8 +317,9 @@ impl LocalStageExecutor {
                     worker_id
                 )));
             }
-            let conn = Connection::open_in_memory()
-                .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+            let conn = Connection::open_in_memory().map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
+            })?;
             Self::run_sql_with_inputs(&conn, stage_sql, inputs)
         };
 
@@ -326,18 +332,21 @@ impl LocalStageExecutor {
                     .iter()
                     .map(|b| b.get_array_memory_size() as u64)
                     .sum();
-                
+
                 monitor.increment_rows_produced(rows_produced);
                 monitor.increment_bytes_produced(bytes_produced);
-                
+
                 // Check limits
-                monitor.check_limits().map_err(|e| StageExecutionError::ExecutionFailed(
-                    format!("Limit exceeded during execution: {}", e)
-                ))?;
-                
+                monitor.check_limits().map_err(|e| {
+                    StageExecutionError::ExecutionFailed(format!(
+                        "Limit exceeded during execution: {}",
+                        e
+                    ))
+                })?;
+
                 Ok(batches)
-            },
-            Err(e) => Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -480,25 +489,37 @@ impl StageExecutor for LocalStageExecutor {
             // Create ticket and store output
             match &stage.output {
                 StageOutput::Stream => {
-                    let ticket = StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone());
-                    
+                    let ticket =
+                        StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone());
+
                     // Store output for later retrieval
                     self.outputs.insert(ticket.ticket_id.clone(), output);
 
                     tickets.add(ticket);
                 }
-                StageOutput::Partitioned { partitions, column_refs } => {
+                StageOutput::Partitioned {
+                    partitions,
+                    column_refs,
+                } => {
                     // Partition the output data by hash
-                    let partitioned_data = Self::partition_batches(&output, *partitions, column_refs)?;
-                    
+                    let partitioned_data =
+                        Self::partition_batches(&output, *partitions, column_refs)?;
+
                     // Create tickets and store each partition
-                    for (partition_id, partition_batches) in partitioned_data.into_iter().enumerate() {
-                        let part_ticket =
-                            StageTicket::partitioned(query_id.to_string(), stage.stage_id, worker_id.clone(), partition_id as u32);
+                    for (partition_id, partition_batches) in
+                        partitioned_data.into_iter().enumerate()
+                    {
+                        let part_ticket = StageTicket::partitioned(
+                            query_id.to_string(),
+                            stage.stage_id,
+                            worker_id.clone(),
+                            partition_id as u32,
+                        );
                         tickets.add(part_ticket.clone());
 
                         // Store partitioned output
-                        self.outputs.insert(part_ticket.ticket_id.clone(), partition_batches);
+                        self.outputs
+                            .insert(part_ticket.ticket_id.clone(), partition_batches);
                     }
                 }
             };
@@ -566,7 +587,10 @@ impl StageExecutor for LocalStageExecutor {
         Ok(RecordBatchStream::new(rx, schema))
     }
 
-    async fn fetch_output(&self, ticket: &StageTicket) -> Result<Vec<RecordBatch>, StageExecutionError> {
+    async fn fetch_output(
+        &self,
+        ticket: &StageTicket,
+    ) -> Result<Vec<RecordBatch>, StageExecutionError> {
         self.outputs
             .get(&ticket.ticket_id)
             .map(|v| v.clone())
@@ -579,9 +603,7 @@ async fn execute_stage_batches(
     stage: &Stage,
     inputs: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Vec<RecordBatch>, StageExecutionError> {
-    use crate::engine::duckdb::arrow_utils::{
-        drop_temp_table, register_arrow_batches,
-    };
+    use crate::engine::duckdb::arrow_utils::{drop_temp_table, register_arrow_batches};
     use duckdb::Connection;
 
     // Handle empty SQL
@@ -590,17 +612,20 @@ async fn execute_stage_batches(
     }
 
     // Create DuckDB connection
-    let conn = Connection::open_in_memory()
-        .map_err(|e| StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e)))?;
+    let conn = Connection::open_in_memory().map_err(|e| {
+        StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
+    })?;
 
     // Register all exchange inputs as temporary tables
     let mut registered_tables = Vec::new();
     for (table_name, batches) in inputs {
         if !batches.is_empty() {
-            register_arrow_batches(&conn, table_name, batches)
-                .map_err(|e| StageExecutionError::ExecutionFailed(
-                    format!("Failed to register table '{}': {:#}", table_name, e)
-                ))?;
+            register_arrow_batches(&conn, table_name, batches).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!(
+                    "Failed to register table '{}': {:#}",
+                    table_name, e
+                ))
+            })?;
             registered_tables.push(table_name.clone());
         } else {
             // Exchange returned a truly empty Vec — skip table registration.
@@ -618,16 +643,13 @@ async fn execute_stage_batches(
     // returns from the closure, not from `execute_stage_batches`.  This
     // guarantees the cleanup loop below always runs even when SQL fails.
     let result: Result<Vec<RecordBatch>, StageExecutionError> = (|| {
-        let mut stmt = conn.prepare(&stage.stage_sql)
-            .map_err(|e| StageExecutionError::ExecutionFailed(
-                format!("Failed to prepare SQL: {}", e)
-            ))?;
+        let mut stmt = conn.prepare(&stage.stage_sql).map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!("Failed to prepare SQL: {}", e))
+        })?;
 
-        let rows = stmt
-            .query_arrow([])
-            .map_err(|e| StageExecutionError::ExecutionFailed(
-                format!("Failed to execute SQL: {}", e)
-            ))?;
+        let rows = stmt.query_arrow([]).map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!("Failed to execute SQL: {}", e))
+        })?;
         let schema = rows.get_schema();
 
         let batches: Vec<RecordBatch> = rows.collect();
@@ -647,7 +669,7 @@ async fn execute_stage_batches(
 }
 
 /// Helper function to partition record batches by hash.
-/// 
+///
 /// This implements a simple round-robin partitioning strategy.
 /// In production, this would hash based on partition keys, but for now
 /// we distribute rows evenly across partitions.
@@ -659,7 +681,7 @@ impl LocalStageExecutor {
     ) -> Result<Vec<Vec<RecordBatch>>, StageExecutionError> {
         use crate::ldp::executor::exchange::{hash_partition_batch, resolve_column_indices};
         use arrow::compute::concat_batches;
-        
+
         if batches.is_empty() {
             // Return empty partitions
             return Ok(vec![vec![]; num_partitions as usize]);
@@ -670,10 +692,12 @@ impl LocalStageExecutor {
         let combined = if batches.len() == 1 {
             batches[0].clone()
         } else {
-            concat_batches(&schema, batches)
-                .map_err(|e| StageExecutionError::ExecutionFailed(
-                    format!("Failed to concatenate batches for partitioning: {}", e)
-                ))?
+            concat_batches(&schema, batches).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!(
+                    "Failed to concatenate batches for partitioning: {}",
+                    e
+                ))
+            })?
         };
 
         let total_rows = combined.num_rows();
@@ -682,22 +706,31 @@ impl LocalStageExecutor {
         }
 
         // Resolve column references to field indices
-        let field_indices = resolve_column_indices(column_refs, &schema)
-            .map_err(|e| StageExecutionError::ExecutionFailed(
-                format!("Failed to resolve column references: {}", e)
-            ))?;
+        let field_indices = resolve_column_indices(column_refs, &schema).map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!(
+                "Failed to resolve column references: {}",
+                e
+            ))
+        })?;
 
         // Use the same hash partitioning logic as exchanges to keep consistency.
         let partitions = hash_partition_batch(&combined, &field_indices, num_partitions)
-            .map_err(|e| StageExecutionError::ExecutionFailed(format!("Partitioning failed: {}", e)))?
+            .map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Partitioning failed: {}", e))
+            })?
             .into_iter()
-            .map(|batch| if batch.num_rows() > 0 { vec![batch] } else { vec![] })
+            .map(|batch| {
+                if batch.num_rows() > 0 {
+                    vec![batch]
+                } else {
+                    vec![]
+                }
+            })
             .collect();
 
         Ok(partitions)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -757,10 +790,28 @@ mod tests {
     fn test_stage_tickets() {
         let mut tickets = StageTickets::new();
 
-        tickets.add(StageTicket::new("test_query".to_string(), StageId(0), "w1".into()));
-        tickets.add(StageTicket::new("test_query".to_string(), StageId(0), "w2".into()));
-        tickets.add(StageTicket::partitioned("test_query".to_string(), StageId(1), "coordinator".into(), 0));
-        tickets.add(StageTicket::partitioned("test_query".to_string(), StageId(1), "coordinator".into(), 1));
+        tickets.add(StageTicket::new(
+            "test_query".to_string(),
+            StageId(0),
+            "w1".into(),
+        ));
+        tickets.add(StageTicket::new(
+            "test_query".to_string(),
+            StageId(0),
+            "w2".into(),
+        ));
+        tickets.add(StageTicket::partitioned(
+            "test_query".to_string(),
+            StageId(1),
+            "coordinator".into(),
+            0,
+        ));
+        tickets.add(StageTicket::partitioned(
+            "test_query".to_string(),
+            StageId(1),
+            "coordinator".into(),
+            1,
+        ));
 
         assert_eq!(tickets.all().len(), 4);
         assert_eq!(tickets.for_worker(&WorkerId::from("w1")).len(), 1);
@@ -817,14 +868,18 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("__exchange_0".to_string(), vec![batch]);
 
-        let result =
-            LocalStageExecutor::run_sql_with_inputs(&conn, "SELECT id FROM \"__exchange_0\"", &inputs);
+        let result = LocalStageExecutor::run_sql_with_inputs(
+            &conn,
+            "SELECT id FROM \"__exchange_0\"",
+            &inputs,
+        );
 
         assert!(result.is_ok(), "SQL execution should have succeeded");
 
         // The temp table must be gone so the pooled connection is clean.
         assert!(
-            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1")
+                .is_err(),
             "Temp table __exchange_0 must be cleaned up after successful execution"
         );
     }
@@ -839,11 +894,8 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
 
         let mut inputs = HashMap::new();
         inputs.insert("__exchange_0".to_string(), vec![batch]);
@@ -857,7 +909,8 @@ mod tests {
 
         // Despite the error, the temp table must be cleaned up.
         assert!(
-            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1")
+                .is_err(),
             "Temp table __exchange_0 must be cleaned up even after a failed execution"
         );
     }
@@ -918,11 +971,8 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
 
         let stage = Stage {
             stage_id: StageId(0),

@@ -23,8 +23,7 @@ use worker_storage::ldp::{
 use worker_storage::sql::logical_plan::{ColumnRef, LogicalPlan};
 
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
-    TableFactor,
+    Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, TableFactor,
 };
 
 // ============================================================================
@@ -638,7 +637,8 @@ fn test_filter_preserves_distribution_no_exchange() {
 
     let total: usize = inspector.count_exchanges().values().sum();
     assert_eq!(
-        total, 0,
+        total,
+        0,
         "Filter should not insert any exchanges, got {:?}",
         inspector.count_exchanges()
     );
@@ -668,7 +668,8 @@ fn test_single_worker_sort_no_gather() {
 
     let total: usize = inspector.count_exchanges().values().sum();
     assert_eq!(
-        total, 0,
+        total,
+        0,
         "Sort on single-worker data should NOT insert any exchange, got {:?}",
         inspector.count_exchanges()
     );
@@ -689,7 +690,11 @@ fn test_unknown_table_falls_back_gracefully() {
     );
 
     let ldp = result.unwrap();
-    assert_eq!(ldp.stages.len(), 1, "Unknown table plan should have 1 stage");
+    assert_eq!(
+        ldp.stages.len(),
+        1,
+        "Unknown table plan should have 1 stage"
+    );
 }
 
 #[test]
@@ -726,8 +731,7 @@ fn test_join_both_sides_need_redistribution() {
     let right = scan("items");
     let plan = join_plan(left, right, &[("orders", "id")], &[("items", "id")]);
 
-    let ldp =
-        plan_ldp_from_logical_plan(&plan, &metadata, &policy, "q_both_shuffle").unwrap();
+    let ldp = plan_ldp_from_logical_plan(&plan, &metadata, &policy, "q_both_shuffle").unwrap();
     let inspector = PlanInspector::new(&ldp);
 
     let total: usize = inspector.count_exchanges().values().sum();

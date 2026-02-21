@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use worker_storage::ldp::executor::{LocalStageExecutor, LdpCoordinator};
+use worker_storage::ldp::executor::{LdpCoordinator, LocalStageExecutor};
 use worker_storage::ldp::planner::metadata::InMemoryMetadata;
 use worker_storage::ldp::planner::policy::PlannerPolicy;
 use worker_storage::ldp::planner::ClusterMetadata;
@@ -33,8 +33,7 @@ async fn create_streaming_coordinator() -> LdpCoordinator<InMemoryMetadata> {
 /// Helper function to create a test coordinator with streaming disabled.
 async fn create_batch_coordinator() -> LdpCoordinator<InMemoryMetadata> {
     let metadata = Arc::new(InMemoryMetadata::new());
-    let policy = PlannerPolicy::default()
-        .with_streaming_pipeline(false);
+    let policy = PlannerPolicy::default().with_streaming_pipeline(false);
 
     let config = worker_storage::ldp::executor::coordinator::CoordinatorConfig::new("test_tenant")
         .with_policy(policy);
@@ -56,9 +55,7 @@ async fn test_streaming_pipeline_basic_query() {
         Field::new("order_id", DataType::Int32, false),
         Field::new("amount", DataType::Int32, false),
     ]));
-    let _ = coordinator
-        .register_dataset_schema("orders", schema)
-        .await;
+    let _ = coordinator.register_dataset_schema("orders", schema).await;
 
     // Execute a simple query
     // Note: This will fall back to batch execution since we don't have actual data loaded
@@ -165,8 +162,7 @@ async fn test_buffer_capacity_calculation() {
     const DEFAULT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 
     // Expected capacity
-    let expected_capacity = (target_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .clamp(2, 64) as usize;
+    let expected_capacity = (target_buffer_bytes / DEFAULT_BATCH_BYTES).clamp(2, 64) as usize;
 
     // For 32MB / 4MB = 8 batches
     assert_eq!(expected_capacity, 8);
@@ -195,9 +191,7 @@ async fn test_coordinator_fallback_to_batch() {
     coordinator.register_dataset(dataset).await;
 
     // Register schema
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let _ = coordinator
         .register_dataset_schema("fallback_test", schema)
         .await;
@@ -268,7 +262,10 @@ async fn test_concurrent_stage_execution() {
             // with streaming configuration.
         }
         Err(e) => {
-            println!("Multi-worker cluster creation failed (may be expected): {}", e);
+            println!(
+                "Multi-worker cluster creation failed (may be expected): {}",
+                e
+            );
         }
     }
 }
@@ -288,27 +285,24 @@ async fn test_streaming_buffer_bounds() {
     // Test buffer capacity bounds (min 2, max 64)
 
     // Very small buffer: 1MB / 4MB = 0.25 → should be clamped to 2
-    let policy_small = PlannerPolicy::default()
-        .with_pipeline_buffer_bytes(1024 * 1024);
+    let policy_small = PlannerPolicy::default().with_pipeline_buffer_bytes(1024 * 1024);
 
     const DEFAULT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
-    let capacity_small = (policy_small.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .clamp(2, 64) as usize;
+    let capacity_small =
+        (policy_small.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES).clamp(2, 64) as usize;
     assert_eq!(capacity_small, 2);
 
     // Very large buffer: 512MB / 4MB = 128 → should be clamped to 64
-    let policy_large = PlannerPolicy::default()
-        .with_pipeline_buffer_bytes(512 * 1024 * 1024);
+    let policy_large = PlannerPolicy::default().with_pipeline_buffer_bytes(512 * 1024 * 1024);
 
-    let capacity_large = (policy_large.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .clamp(2, 64) as usize;
+    let capacity_large =
+        (policy_large.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES).clamp(2, 64) as usize;
     assert_eq!(capacity_large, 64);
 
     // Normal buffer: 32MB / 4MB = 8 (within bounds)
-    let policy_normal = PlannerPolicy::default()
-        .with_pipeline_buffer_bytes(32 * 1024 * 1024);
+    let policy_normal = PlannerPolicy::default().with_pipeline_buffer_bytes(32 * 1024 * 1024);
 
-    let capacity_normal = (policy_normal.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES)
-        .clamp(2, 64) as usize;
+    let capacity_normal =
+        (policy_normal.pipeline_buffer_bytes / DEFAULT_BATCH_BYTES).clamp(2, 64) as usize;
     assert_eq!(capacity_normal, 8);
 }

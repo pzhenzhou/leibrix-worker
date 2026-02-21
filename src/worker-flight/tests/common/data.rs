@@ -112,9 +112,13 @@ impl DataSeeder {
         )
         .expect("create orders schema view (single epoch)");
 
-        self.sql_transformer.write().await.register_dataset(
-            RegisteredDataset::new("orders".to_string(), "order_date".to_string()),
-        );
+        self.sql_transformer
+            .write()
+            .await
+            .register_dataset(RegisteredDataset::new(
+                "orders".to_string(),
+                "order_date".to_string(),
+            ));
     }
 
     /// Create two epoch tables (`20250101` + `20250201`, 10 rows each) and
@@ -183,9 +187,13 @@ impl DataSeeder {
         )
         .expect("create orders schema view (multi epoch)");
 
-        self.sql_transformer.write().await.register_dataset(
-            RegisteredDataset::new("orders".to_string(), "order_date".to_string()),
-        );
+        self.sql_transformer
+            .write()
+            .await
+            .register_dataset(RegisteredDataset::new(
+                "orders".to_string(),
+                "order_date".to_string(),
+            ));
     }
 
     /// Create `customers` dimension table (5 rows, no epoch / no macro).

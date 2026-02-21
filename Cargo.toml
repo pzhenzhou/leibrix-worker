@@ -30,6 +30,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 anyhow = { version = "1.0" }
 tokio = { version = "1", features = ["full"] }
 dashmap = { version = "6" }
+async-trait = { version = "0.1" }
+tokio-util = { version = "0.7", features = ["rt", "time"] }
+tokio-stream = { version = "0.1" }
+backoff = { version = "0.4", features = ["tokio"] }
+uuid = { version = "1", features = ["v4"] }
 
 tonic-health = { version = "0.13" }
 tonic-reflection = { version = "0.13" }

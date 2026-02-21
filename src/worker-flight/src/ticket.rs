@@ -59,7 +59,9 @@ impl QueryTicket {
     /// Encode the ticket to Arrow Flight Ticket format (JSON bytes).
     pub fn encode(&self) -> Result<Ticket, TicketError> {
         let json = serde_json::to_vec(self).map_err(TicketError::SerializationFailed)?;
-        Ok(Ticket { ticket: json.into() })
+        Ok(Ticket {
+            ticket: json.into(),
+        })
     }
 
     /// Decode a QueryTicket from Arrow Flight Ticket.
@@ -137,7 +139,9 @@ impl StageResultTicket {
     /// Encode the ticket to Arrow Flight Ticket format (JSON bytes).
     pub fn encode(&self) -> Result<Ticket, TicketError> {
         let json = serde_json::to_vec(self).map_err(TicketError::SerializationFailed)?;
-        Ok(Ticket { ticket: json.into() })
+        Ok(Ticket {
+            ticket: json.into(),
+        })
     }
 
     /// Decode a StageResultTicket from Arrow Flight Ticket.
@@ -192,7 +196,9 @@ impl FlightTicket {
     /// Encode the ticket to Arrow Flight Ticket format.
     pub fn encode(&self) -> Result<Ticket, TicketError> {
         let json = serde_json::to_vec(self).map_err(TicketError::SerializationFailed)?;
-        Ok(Ticket { ticket: json.into() })
+        Ok(Ticket {
+            ticket: json.into(),
+        })
     }
 
     /// Decode a FlightTicket from Arrow Flight Ticket.
@@ -276,11 +282,7 @@ mod tests {
 
     #[test]
     fn test_stage_result_ticket_roundtrip() {
-        let ticket = StageResultTicket::new(
-            "tenant-123".to_string(),
-            "query-456".to_string(),
-            5,
-        );
+        let ticket = StageResultTicket::new("tenant-123".to_string(), "query-456".to_string(), 5);
 
         let encoded = ticket.encode().unwrap();
         let decoded = StageResultTicket::decode(&encoded).unwrap();
@@ -313,10 +315,8 @@ mod tests {
 
     #[test]
     fn test_flight_ticket_query_roundtrip() {
-        let ticket = FlightTicket::query(
-            "SELECT * FROM test".to_string(),
-            "tenant-123".to_string(),
-        );
+        let ticket =
+            FlightTicket::query("SELECT * FROM test".to_string(), "tenant-123".to_string());
 
         let encoded = ticket.encode().unwrap();
         let decoded = FlightTicket::decode(&encoded).unwrap();
@@ -332,11 +332,8 @@ mod tests {
 
     #[test]
     fn test_flight_ticket_stage_result_roundtrip() {
-        let ticket = FlightTicket::stage_result(
-            "tenant-123".to_string(),
-            "query-789".to_string(),
-            42,
-        );
+        let ticket =
+            FlightTicket::stage_result("tenant-123".to_string(), "query-789".to_string(), 42);
 
         let encoded = ticket.encode().unwrap();
         let decoded = FlightTicket::decode(&encoded).unwrap();
@@ -354,12 +351,8 @@ mod tests {
 
     #[test]
     fn test_flight_ticket_stage_result_partition_roundtrip() {
-        let ticket = FlightTicket::stage_result_partition(
-            "tenant-1".to_string(),
-            "q-1".to_string(),
-            1,
-            15,
-        );
+        let ticket =
+            FlightTicket::stage_result_partition("tenant-1".to_string(), "q-1".to_string(), 1, 15);
 
         let encoded = ticket.encode().unwrap();
         let decoded = FlightTicket::decode(&encoded).unwrap();
@@ -375,10 +368,7 @@ mod tests {
     #[test]
     fn test_flight_ticket_backward_compatibility() {
         // Legacy QueryTicket format (without "type" field)
-        let legacy_ticket = QueryTicket::new(
-            "SELECT 1".to_string(),
-            "legacy-tenant".to_string(),
-        );
+        let legacy_ticket = QueryTicket::new("SELECT 1".to_string(), "legacy-tenant".to_string());
         let encoded = legacy_ticket.encode().unwrap();
 
         // FlightTicket::decode should handle legacy format

@@ -14,7 +14,10 @@
 //!   5. Return annotated node with any inserted exchanges
 //! ```
 
-    use crate::ldp::planner::exchange::{determine_exchange, determine_join_exchanges, ExchangeDecision, JoinExchangeContext, RejectReason};
+use crate::ldp::planner::exchange::{
+    determine_exchange, determine_join_exchanges, ExchangeDecision, JoinExchangeContext,
+    RejectReason,
+};
 use crate::ldp::planner::metadata::Metadata;
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::requirements::get_logical_plan_requirements;
@@ -50,7 +53,11 @@ pub struct AnnotatedPlan {
 
 impl AnnotatedPlan {
     /// Create a new annotated plan without exchange.
-    pub fn new(plan: LogicalPlan, annotation: DistributionAnnotation, children: Vec<AnnotatedPlan>) -> Self {
+    pub fn new(
+        plan: LogicalPlan,
+        annotation: DistributionAnnotation,
+        children: Vec<AnnotatedPlan>,
+    ) -> Self {
         Self {
             plan,
             annotation,
@@ -78,8 +85,7 @@ impl AnnotatedPlan {
 
     /// Check if this node or any descendant has an exchange.
     pub fn has_any_exchange(&self) -> bool {
-        self.exchange_before.is_some()
-            || self.children.iter().any(|c| c.has_any_exchange())
+        self.exchange_before.is_some() || self.children.iter().any(|c| c.has_any_exchange())
     }
 
     /// Count total exchanges in this tree.
@@ -175,7 +181,11 @@ fn annotate_recursive<M: Metadata>(
         }
     } else {
         // Standard requirement checking
-        for (i, (child, required)) in annotated_children.iter().zip(requirements.iter()).enumerate() {
+        for (i, (child, required)) in annotated_children
+            .iter()
+            .zip(requirements.iter())
+            .enumerate()
+        {
             let actual = &child.annotation.distribution;
 
             if required.is_satisfied_by(actual) {
@@ -204,7 +214,10 @@ fn annotate_recursive<M: Metadata>(
     }
 
     // 5. Apply exchanges to children
-    for (child, exchange_opt) in annotated_children.iter_mut().zip(exchanges_to_insert.into_iter()) {
+    for (child, exchange_opt) in annotated_children
+        .iter_mut()
+        .zip(exchanges_to_insert.into_iter())
+    {
         if let Some(exchange) = exchange_opt {
             // Save the pre-exchange distribution so stage cutting can assign
             // the correct target workers to the stage that runs BEFORE the exchange.
@@ -212,11 +225,8 @@ fn annotate_recursive<M: Metadata>(
 
             // Update child's annotation to reflect post-exchange distribution
             // (this is what the parent operator sees).
-            let new_distribution = compute_post_exchange_distribution(
-                &exchange,
-                policy,
-                pre_exchange_dist.workers(),
-            );
+            let new_distribution =
+                compute_post_exchange_distribution(&exchange, policy, pre_exchange_dist.workers());
             child.annotation.distribution = new_distribution;
             child.exchange_before = Some(exchange);
             child.pre_exchange_distribution = Some(pre_exchange_dist);
@@ -230,7 +240,13 @@ fn annotate_recursive<M: Metadata>(
         .collect();
 
     let (output_distribution, output_rows, output_bytes, output_stats_source) =
-        compute_output_distribution(plan, &child_distributions, &annotated_children, policy, metadata)?;
+        compute_output_distribution(
+            plan,
+            &child_distributions,
+            &annotated_children,
+            policy,
+            metadata,
+        )?;
 
     let annotation = DistributionAnnotation::with_source(
         output_distribution,
@@ -239,7 +255,11 @@ fn annotate_recursive<M: Metadata>(
         output_stats_source,
     );
 
-    Ok(AnnotatedPlan::new(plan.clone(), annotation, annotated_children))
+    Ok(AnnotatedPlan::new(
+        plan.clone(),
+        annotation,
+        annotated_children,
+    ))
 }
 
 /// Handle exchange determination for join operators.
@@ -252,7 +272,11 @@ fn handle_join_exchanges(
 ) -> Result<(ExchangeDecision, ExchangeDecision), PlanningError> {
     // Extract join keys from LogicalPlan::Join
     let (left_keys, right_keys) = match plan {
-        LogicalPlan::Join { left_keys, right_keys, .. } => {
+        LogicalPlan::Join {
+            left_keys,
+            right_keys,
+            ..
+        } => {
             if left_keys.is_empty() || right_keys.is_empty() {
                 //Cross join - no hash partitioning
                 return Ok((ExchangeDecision::None, ExchangeDecision::None));
@@ -351,7 +375,9 @@ fn compute_output_distribution<M: Metadata>(
             // ExchangeRead nodes are only used during stage cutting.
             // At planning time, they shouldn't appear.
             Ok((
-                Distribution::Singleton { worker: policy.coordinator.clone() },
+                Distribution::Singleton {
+                    worker: policy.coordinator.clone(),
+                },
                 0,
                 0,
                 StatsSource::Unknown,
@@ -374,7 +400,9 @@ fn compute_output_distribution<M: Metadata>(
                 ))
             } else {
                 Ok((
-                    Distribution::Singleton { worker: policy.coordinator.clone() },
+                    Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
                     0,
                     0,
                     StatsSource::Unknown,
@@ -393,7 +421,9 @@ fn compute_output_distribution<M: Metadata>(
                 ))
             } else {
                 Ok((
-                    Distribution::Singleton { worker: policy.coordinator.clone() },
+                    Distribution::Singleton {
+                        worker: policy.coordinator.clone(),
+                    },
                     0,
                     0,
                     StatsSource::Unknown,
@@ -432,10 +462,8 @@ fn compute_output_distribution<M: Metadata>(
                     (1, 100, child.annotation.stats_source)
                 } else {
                     // Grouped aggregate: estimate based on NDV (heuristic)
-                    let estimated_groups = estimate_group_cardinality(
-                        child.annotation.est_rows,
-                        group_keys.len(),
-                    );
+                    let estimated_groups =
+                        estimate_group_cardinality(child.annotation.est_rows, group_keys.len());
                     let bytes_per_row = if child.annotation.est_rows > 0 {
                         child.annotation.est_bytes / child.annotation.est_rows
                     } else {
@@ -536,9 +564,11 @@ fn compute_output_distribution<M: Metadata>(
                     worker: policy.coordinator.clone(),
                 });
 
-            let source = annotated_children.iter().fold(StatsSource::Exact, |acc, c| {
-                combine_stats_sources(acc, c.annotation.stats_source)
-            });
+            let source = annotated_children
+                .iter()
+                .fold(StatsSource::Exact, |acc, c| {
+                    combine_stats_sources(acc, c.annotation.stats_source)
+                });
 
             Ok((dist, total_rows, total_bytes, source))
         }

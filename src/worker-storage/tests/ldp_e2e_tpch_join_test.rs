@@ -41,7 +41,7 @@ fn generate_lineitem_data(
 ) -> Vec<RecordBatch> {
     // Use deterministic seed for reproducible tests
     let mut rng = StdRng::seed_from_u64(12345);
-    
+
     let date_range_days = (end_date - start_date).num_days() as usize;
     if date_range_days == 0 {
         panic!("Date range must be at least 1 day");
@@ -58,19 +58,19 @@ fn generate_lineitem_data(
     for i in 0..row_count {
         // 2-3 lineitems per order on average
         l_orderkeys.push((i / 2) as i64);
-        
+
         // 200 unique parts
         l_partkeys.push((i % 200) as i64);
-        
+
         // Quantity: 1-50
         l_quantities.push(((i % 50) + 1) as i32);
-        
+
         // Extended price: 100-1090
         l_extendedprices.push(((i % 100) * 10) as f64 + 100.0);
-        
+
         // Discount: 0-9%
         l_discounts.push((i % 10) as f64 / 100.0);
-        
+
         // Ship date: within the specified range
         let day_offset = rng.gen_range(0..date_range_days);
         let ship_date = start_date + chrono::Duration::days(day_offset as i64);
@@ -132,7 +132,7 @@ fn generate_orders_data(
 ) -> Vec<RecordBatch> {
     // Use deterministic seed for reproducible tests
     let mut rng = StdRng::seed_from_u64(54321);
-    
+
     let date_range_days = (end_date - start_date).num_days() as usize;
     if date_range_days == 0 {
         panic!("Date range must be at least 1 day");
@@ -150,18 +150,18 @@ fn generate_orders_data(
     for i in 0..row_count {
         // Order key matches lineitem l_orderkey range
         o_orderkeys.push(i as i64);
-        
+
         // 50 unique customers
         o_custkeys.push((i % 50) as i64);
-        
+
         // Order date: within the specified range
         let day_offset = rng.gen_range(0..date_range_days);
         let order_date = start_date + chrono::Duration::days(day_offset as i64);
         o_orderdates.push(order_date);
-        
+
         // Order status
         o_orderstatuses.push(statuses[i % 3]);
-        
+
         // Shipping priority: 0-4
         o_shippriorities.push((i % 5) as i32);
     }
@@ -318,8 +318,7 @@ fn format_column_value(
         DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = arr.value(index);
-            let date = NaiveDate::from_num_days_from_ce_opt(days + 719163)
-                .ok_or("Invalid date")?;
+            let date = NaiveDate::from_num_days_from_ce_opt(days + 719163).ok_or("Invalid date")?;
             Ok(format!("DATE '{}'", date))
         }
         _ => Err(format!("Unsupported data type: {:?}", array.data_type()).into()),
@@ -387,19 +386,25 @@ async fn test_tpch_inspired_join_two_large_tables() {
     println!("\nRegistering datasets with SQL transformer...");
     {
         use worker_storage::sql::RegisteredDataset;
-        
+
         // Register lineitem dataset
-        cluster.coordinator.register_dataset(RegisteredDataset::new(
-            "lineitem".to_string(),
-            "l_shipdate".to_string(),
-        )).await;
+        cluster
+            .coordinator
+            .register_dataset(RegisteredDataset::new(
+                "lineitem".to_string(),
+                "l_shipdate".to_string(),
+            ))
+            .await;
         println!("  Registered lineitem dataset (time_column: l_shipdate)");
-        
+
         // Register orders dataset
-        cluster.coordinator.register_dataset(RegisteredDataset::new(
-            "orders".to_string(),
-            "o_orderdate".to_string(),
-        )).await;
+        cluster
+            .coordinator
+            .register_dataset(RegisteredDataset::new(
+                "orders".to_string(),
+                "o_orderdate".to_string(),
+            ))
+            .await;
         println!("  Registered orders dataset (time_column: o_orderdate)");
     }
 
@@ -408,7 +413,7 @@ async fn test_tpch_inspired_join_two_large_tables() {
     {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
-        
+
         // Create lineitem schema
         let lineitem_schema = Arc::new(Schema::new(vec![
             Field::new("l_orderkey", DataType::Int64, false),
@@ -418,12 +423,14 @@ async fn test_tpch_inspired_join_two_large_tables() {
             Field::new("l_discount", DataType::Float64, false),
             Field::new("l_shipdate", DataType::Date32, false),
         ]));
-        
-        cluster.coordinator.register_dataset_schema("lineitem", lineitem_schema)
+
+        cluster
+            .coordinator
+            .register_dataset_schema("lineitem", lineitem_schema)
             .await
             .expect("Failed to register lineitem schema");
         println!("  Created scan_lineitem() planning macro on coordinator");
-        
+
         // Create orders schema
         let orders_schema = Arc::new(Schema::new(vec![
             Field::new("o_orderkey", DataType::Int64, false),
@@ -432,8 +439,10 @@ async fn test_tpch_inspired_join_two_large_tables() {
             Field::new("o_orderstatus", DataType::Utf8, false),
             Field::new("o_shippriority", DataType::Int32, false),
         ]));
-        
-        cluster.coordinator.register_dataset_schema("orders", orders_schema)
+
+        cluster
+            .coordinator
+            .register_dataset_schema("orders", orders_schema)
             .await
             .expect("Failed to register orders schema");
         println!("  Created scan_orders() planning macro on coordinator");
@@ -444,14 +453,14 @@ async fn test_tpch_inspired_join_two_large_tables() {
     {
         use worker_storage::sql::SqlTransformer;
         let test_sql = "SELECT * FROM lineitem WHERE l_shipdate >= DATE '2024-01-01'";
-        
+
         // Create a test transformer with same configuration
         let mut test_transformer = SqlTransformer::new();
         test_transformer.register_dataset(worker_storage::sql::RegisteredDataset::new(
             "lineitem".to_string(),
             "l_shipdate".to_string(),
         ));
-        
+
         match test_transformer.transform(test_sql) {
             Ok(result) => {
                 println!("  ✓ SQL transformation works!");
@@ -468,7 +477,6 @@ async fn test_tpch_inspired_join_two_large_tables() {
             }
         }
     }
-
 
     // 5. Setup reference worker with all data for comparison
     println!("\nSetting up reference worker...");
@@ -535,11 +543,11 @@ async fn test_tpch_inspired_join_two_large_tables() {
 
     // 9. Verify results match
     println!("\n=== Verifying Results ===");
-    
+
     // Print results for debugging
     println!("\nDistributed Results:");
     TestVerifier::print_results(&distributed_result, "Distributed");
-    
+
     println!("\nReference Results:");
     TestVerifier::print_results(&reference_result, "Reference");
 
@@ -548,7 +556,7 @@ async fn test_tpch_inspired_join_two_large_tables() {
         .expect("Results mismatch between distributed and reference execution");
 
     println!("\n✓ Results match! Test PASSED");
-    
+
     // 10. Additional verification assertions
     assert!(
         !distributed_result.is_empty(),
@@ -566,11 +574,13 @@ async fn test_tpch_inspired_join_two_large_tables() {
     );
 
     println!("\n=== Test Summary ===");
-    println!("✓ SQL Transformation: Query transformed with scan_lineitem() and scan_orders() macros");
+    println!(
+        "✓ SQL Transformation: Query transformed with scan_lineitem() and scan_orders() macros"
+    );
     println!("✓ Epoch Pruning: Only relevant epochs scanned based on date predicates");
     println!("✓ Distributed Join: Hash partition join executed across workers");
     println!("✓ Result Correctness: Distributed result matches reference execution");
     println!("✓ Schema Validation: Output schema matches expected structure");
-    
+
     println!("\n=== Test PASSED ===\n");
 }

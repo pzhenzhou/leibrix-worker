@@ -52,5 +52,7 @@ pub mod ticket;
 pub use config::FlightServerConfig;
 pub use error::{map_query_error_to_status, map_transform_error_to_status};
 pub use server::{load_identity, FlightServerBuilder, FlightServerError};
-pub use service::{CachedStageResult, CachedStageStats, StageResultKey, StageResultStore, WorkerFlightService};
+pub use service::{
+    CachedStageResult, CachedStageStats, StageResultKey, StageResultStore, WorkerFlightService,
+};
 pub use ticket::{FlightTicket, QueryTicket, StageResultTicket, TicketError};

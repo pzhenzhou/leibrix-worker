@@ -410,11 +410,9 @@ mod tests {
 
     /// Parse SQL → build LogicalPlan → generate SQL → verify it parses again.
     fn round_trip(input_sql: &str) -> String {
-        let stmts = sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::GenericDialect {},
-            input_sql,
-        )
-        .unwrap();
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, input_sql)
+                .unwrap();
         let result = build_logical_plan(&stmts[0]).unwrap();
         let generated = generate_stage_sql(&result.plan, &result.context);
 
@@ -459,8 +457,9 @@ mod tests {
 
     #[test]
     fn test_aggregate_with_having() {
-        let sql =
-            round_trip("SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 100");
+        let sql = round_trip(
+            "SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 100",
+        );
         assert!(sql.contains("HAVING"));
     }
 
@@ -474,9 +473,8 @@ mod tests {
 
     #[test]
     fn test_join() {
-        let sql = round_trip(
-            "SELECT o.id, l.price FROM orders o JOIN lineitem l ON o.id = l.order_id",
-        );
+        let sql =
+            round_trip("SELECT o.id, l.price FROM orders o JOIN lineitem l ON o.id = l.order_id");
         assert!(sql.contains("JOIN"));
         assert!(sql.contains("ON"));
     }
@@ -513,9 +511,7 @@ mod tests {
 
     #[test]
     fn test_left_join() {
-        let sql = round_trip(
-            "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id",
-        );
+        let sql = round_trip("SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id");
         assert!(sql.contains("LEFT JOIN"), "SQL: {}", sql);
     }
 

@@ -32,10 +32,7 @@ async fn test_list_actions_returns_expected_actions() {
         .expect("list_actions RPC failed")
         .into_inner();
 
-    let actions: Vec<_> = stream
-        .try_collect()
-        .await
-        .expect("collect action stream");
+    let actions: Vec<_> = stream.try_collect().await.expect("collect action stream");
 
     let names: Vec<&str> = actions.iter().map(|a| a.r#type.as_str()).collect();
     assert!(
@@ -77,10 +74,7 @@ async fn test_list_flights_returns_registered_dataset() {
         .expect("list_flights RPC failed")
         .into_inner();
 
-    let infos: Vec<_> = stream
-        .try_collect()
-        .await
-        .expect("collect flight stream");
+    let infos: Vec<_> = stream.try_collect().await.expect("collect flight stream");
 
     assert_eq!(infos.len(), 1, "expected exactly 1 registered dataset");
 

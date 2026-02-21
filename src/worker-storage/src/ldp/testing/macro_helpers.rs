@@ -25,7 +25,10 @@ impl LogicalDatasetManager {
     }
 
     pub async fn get_dataset_tables(&self, dataset_name: &str) -> Vec<String> {
-        self.datasets.get(dataset_name).map(|v| v.clone()).unwrap_or_default()
+        self.datasets
+            .get(dataset_name)
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     pub async fn register_table(&self, dataset_name: &str, table_name: String) {
@@ -221,7 +224,9 @@ mod tests {
         // Cast dt to VARCHAR because the DuckDB Rust driver does not implement
         // FromSql for Date32 directly; casting avoids InvalidColumnType errors.
         let mut stmt = conn
-            .prepare("SELECT id, CAST(dt AS VARCHAR) FROM scan_test_dataset('2022-01-01', '2022-02-01')")
+            .prepare(
+                "SELECT id, CAST(dt AS VARCHAR) FROM scan_test_dataset('2022-01-01', '2022-02-01')",
+            )
             .unwrap();
         let rows: Vec<(i32, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))

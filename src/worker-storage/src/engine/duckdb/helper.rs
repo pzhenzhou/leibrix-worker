@@ -1,6 +1,6 @@
 use anyhow::Context;
 use arrow::datatypes::{DataType, Schema};
-use duckdb::{Connection, params};
+use duckdb::{params, Connection};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};

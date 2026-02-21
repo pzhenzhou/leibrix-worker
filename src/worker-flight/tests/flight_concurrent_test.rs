@@ -47,9 +47,7 @@ async fn test_concurrent_identical_queries() {
         .map(|_| {
             let mut client = h.client.clone();
             let sql = sql.to_string();
-            tokio::spawn(async move {
-                execute_via_flight(&mut client, &sql, TENANT).await
-            })
+            tokio::spawn(async move { execute_via_flight(&mut client, &sql, TENANT).await })
         })
         .collect();
 
@@ -164,7 +162,9 @@ async fn test_queries_and_schema_discovery_concurrent() {
         })
         .collect();
 
-    let results = try_join_all(tasks).await.expect("mixed tasks did not panic");
+    let results = try_join_all(tasks)
+        .await
+        .expect("mixed tasks did not panic");
 
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|e| panic!("mixed task {i} failed: {e}"));

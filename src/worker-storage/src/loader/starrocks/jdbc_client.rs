@@ -6,25 +6,25 @@ use crate::loader::types::{Catalog, SourceError};
 
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::{
-    ArrayRef, RecordBatch,
     builder::{
         BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int32Builder,
         Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
     },
+    ArrayRef, RecordBatch,
 };
 
 use futures_util::stream::StreamExt;
 use std::future::Future;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
-use sqlx::Row;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::Row;
 
 // Connection Pool Sizing Guidelines:
 // - For I/O-bound workloads (network latency > computation): max_connections should be
@@ -224,7 +224,7 @@ impl StarRocksJdbcClient {
                 source: Box::new(e),
             })?;
             drop(test_conn); // Return connection to pool
-            // Setup graceful shutdown channel
+                             // Setup graceful shutdown channel
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             let state = Arc::new(Mutex::new(ClientState {
                 pool,

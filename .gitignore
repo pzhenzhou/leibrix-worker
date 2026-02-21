@@ -6,6 +6,7 @@ Cargo.lock
 .cursorrules
 # Visual Studio Code
 .vscode/
+.claude/
 .qoder/
 .devcontainer/
 #*.json

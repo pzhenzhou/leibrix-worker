@@ -10,19 +10,21 @@ use tokio::time::timeout;
 use worker_storage::ldp::planner::policy::PlannerPolicy;
 use worker_storage::ldp::testing::cluster::TestCluster;
 use worker_storage::ldp::testing::data_loader::TestDataLoader;
-use worker_storage::ldp::testing::verifier::TestVerifier;
 use worker_storage::ldp::testing::macro_helpers::register_dataset_with_macros;
+use worker_storage::ldp::testing::verifier::TestVerifier;
 
 #[tokio::test]
 async fn test_gather_exchange_e2e() {
     // Create a test cluster with 2 workers
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(2)
-        .tenant_id("test-tenant".to_string())
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(2)
+            .tenant_id("test-tenant".to_string())
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load test data distributed across workers
     let data_loader = TestDataLoader::new(cluster.clone());
@@ -33,19 +35,21 @@ async fn test_gather_exchange_e2e() {
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // Execute a query that should trigger a gather exchange
     // (aggregation that needs to collect data from multiple workers)
     let sql = "SELECT COUNT(*) as total_orders FROM orders";
-    
+
     // Execute with distributed coordinator
     let distributed_result = cluster.execute_query(sql).await.unwrap();
-    
+
     // Execute reference query on single worker for comparison
     let reference_result = cluster.execute_query_on_worker("w1", sql).await.unwrap();
-    
+
     // Verify results are equivalent
     TestVerifier::assert_results_equal(&distributed_result, &reference_result, false)
         .expect("Distributed and reference results should match for gather exchange");
@@ -55,29 +59,36 @@ async fn test_gather_exchange_e2e() {
 async fn test_broadcast_exchange_e2e() {
     // Create a test cluster with 2 workers
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(2)
-        .tenant_id("test-tenant".to_string())
-        .policy(PlannerPolicy::default().with_broadcast_enabled(true)) // Enable broadcast
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(2)
+            .tenant_id("test-tenant".to_string())
+            .policy(PlannerPolicy::default().with_broadcast_enabled(true)) // Enable broadcast
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load orders data distributed across workers
     let data_loader = TestDataLoader::new(cluster.clone());
     data_loader.load_standard_test_data().await.unwrap();
-    
+
     // Load small customers table on one worker (candidate for broadcast)
     let customers = TestDataLoader::generate_customers(10); // Small table
-    data_loader.load_customers_on_worker("w1", customers).await.unwrap();
+    data_loader
+        .load_customers_on_worker("w1", customers)
+        .await
+        .unwrap();
 
     // Register epoch macros
     register_dataset_with_macros(
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // Execute a join query that should trigger a broadcast exchange
     // (joining large table with small table should broadcast small table)
@@ -85,10 +96,10 @@ async fn test_broadcast_exchange_e2e() {
 
     // Execute with distributed coordinator
     let distributed_result = cluster.execute_query(sql).await.unwrap();
-    
+
     // Execute reference query on single worker for comparison
     let reference_result = cluster.execute_query_on_worker("w1", sql).await.unwrap();
-    
+
     // Verify results are equivalent
     TestVerifier::assert_results_equal(&distributed_result, &reference_result, false)
         .expect("Distributed and reference results should match for broadcast exchange");
@@ -98,16 +109,18 @@ async fn test_broadcast_exchange_e2e() {
 async fn test_hash_partition_exchange_e2e() {
     // Create a test cluster with 3 workers
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(3)
-        .tenant_id("test-tenant".to_string())
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(3)
+            .tenant_id("test-tenant".to_string())
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load test data with multiple workers to enable hash partitioning
     let data_loader = TestDataLoader::new(cluster.clone());
-    
+
     // Generate larger dataset to make hash partitioning beneficial
     let orders = TestDataLoader::generate_orders(3000);
     data_loader.load_orders_distributed(orders).await.unwrap();
@@ -117,8 +130,10 @@ async fn test_hash_partition_exchange_e2e() {
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // Execute a query that should trigger a hash partition exchange
     // (group by operation that redistributes data by grouping key)
@@ -126,10 +141,10 @@ async fn test_hash_partition_exchange_e2e() {
 
     // Execute with distributed coordinator
     let distributed_result = cluster.execute_query(sql).await.unwrap();
-    
+
     // Execute reference query on single worker for comparison
     let reference_result = cluster.execute_query_on_worker("w1", sql).await.unwrap();
-    
+
     // Verify results are equivalent (order matters for this query)
     TestVerifier::assert_results_equal(&distributed_result, &reference_result, true)
         .expect("Distributed and reference results should match for hash partition exchange");
@@ -139,12 +154,14 @@ async fn test_hash_partition_exchange_e2e() {
 async fn test_parallel_stage_execution_e2e() {
     // Create a test cluster with 3 workers
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(3)
-        .tenant_id("test-tenant".to_string())
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(3)
+            .tenant_id("test-tenant".to_string())
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load test data
     let data_loader = TestDataLoader::new(cluster.clone());
@@ -156,8 +173,10 @@ async fn test_parallel_stage_execution_e2e() {
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // Execute a complex query that should result in multiple stages executing in parallel
     let sql = "
@@ -180,14 +199,16 @@ async fn test_parallel_stage_execution_e2e() {
     // Execute with timeout to catch hanging queries
     let result = timeout(
         std::time::Duration::from_secs(30),
-        cluster.execute_query(sql)
-    ).await.expect("Query timed out");
+        cluster.execute_query(sql),
+    )
+    .await
+    .expect("Query timed out");
 
     let distributed_result = result.unwrap();
-    
+
     // Execute reference query
     let reference_result = cluster.execute_query_on_worker("w1", sql).await.unwrap();
-    
+
     // Verify results are equivalent
     TestVerifier::assert_results_equal(&distributed_result, &reference_result, false)
         .expect("Distributed and reference results should match for parallel execution");
@@ -197,12 +218,14 @@ async fn test_parallel_stage_execution_e2e() {
 async fn test_exchange_with_runtime_limits() {
     // Create a test cluster with limits enabled
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(2)
-        .tenant_id("test-tenant".to_string())
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(2)
+            .tenant_id("test-tenant".to_string())
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load a moderate amount of data
     let data_loader = TestDataLoader::new(cluster.clone());
@@ -214,18 +237,20 @@ async fn test_exchange_with_runtime_limits() {
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // Execute a query that performs aggregation (triggers exchanges)
     let sql = "SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id HAVING total > 100 ORDER BY total DESC";
 
     // Execute with distributed coordinator
     let distributed_result = cluster.execute_query(sql).await.unwrap();
-    
+
     // Execute reference query
     let reference_result = cluster.execute_query_on_worker("w1", sql).await.unwrap();
-    
+
     // Verify results are equivalent
     TestVerifier::assert_results_equal(&distributed_result, &reference_result, false)
         .expect("Distributed and reference results should match with runtime limits");
@@ -235,12 +260,14 @@ async fn test_exchange_with_runtime_limits() {
 async fn test_query_cancellation_during_exchange() {
     // Create a test cluster
     #[allow(clippy::arc_with_non_send_sync)]
-    let cluster = Arc::new(TestCluster::builder()
-        .workers(2)
-        .tenant_id("test-tenant".to_string())
-        .build()
-        .await
-        .expect("Failed to create test cluster"));
+    let cluster = Arc::new(
+        TestCluster::builder()
+            .workers(2)
+            .tenant_id("test-tenant".to_string())
+            .build()
+            .await
+            .expect("Failed to create test cluster"),
+    );
 
     // Load test data
     let data_loader = TestDataLoader::new(cluster.clone());
@@ -252,8 +279,10 @@ async fn test_query_cancellation_during_exchange() {
         &cluster.coordinator,
         &cluster.dataset_manager,
         "orders",
-        "order_date"
-    ).await.unwrap();
+        "order_date",
+    )
+    .await
+    .unwrap();
 
     // We can't easily test cancellation in this synchronous test framework,
     // but we can at least verify that the infrastructure supports it
@@ -262,9 +291,9 @@ async fn test_query_cancellation_during_exchange() {
     // Execute query normally
     let result = cluster.execute_query(sql).await.unwrap();
     assert!(!result.is_empty(), "Query should return results");
-    
+
     // Verify the coordinator has cancellation capability
     let _query_id = "test_query_for_cancellation"; // This would be auto-generated in real usage
-    // Note: We can't actually test cancellation here without a more complex async setup
-    // But the infrastructure is in place as verified by our implementation
+                                                   // Note: We can't actually test cancellation here without a more complex async setup
+                                                   // But the infrastructure is in place as verified by our implementation
 }

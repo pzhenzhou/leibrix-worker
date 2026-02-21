@@ -6,9 +6,13 @@ use futures_util::stream;
 use std::collections::HashMap;
 use std::sync::Arc;
 use worker_storage::engine::duckdb::DuckDBQueryEngine;
-use worker_storage::engine::duckdb::{DuckDBConfig, SharedDatabase, storage_engine_impl::MemoryDuckDBEngine};
+use worker_storage::engine::duckdb::{
+    storage_engine_impl::MemoryDuckDBEngine, DuckDBConfig, SharedDatabase,
+};
 use worker_storage::engine::query_engine::QueryError;
-use worker_storage::engine::storage_engine::{EpochView, RecordBatchStream, StorageError, StorageEngine};
+use worker_storage::engine::storage_engine::{
+    EpochView, RecordBatchStream, StorageEngine, StorageError,
+};
 
 use std::sync::Once;
 
@@ -26,7 +30,9 @@ fn init_tracing() {
 /// Creates a shared in-memory database for tests
 pub fn create_shared_database() -> Arc<SharedDatabase> {
     init_tracing();
-    Arc::new(SharedDatabase::new(&DuckDBConfig::default()).expect("Failed to create shared database"))
+    Arc::new(
+        SharedDatabase::new(&DuckDBConfig::default()).expect("Failed to create shared database"),
+    )
 }
 
 /// Creates a lightweight test engine with reduced memory limits for faster tests
@@ -61,7 +67,8 @@ pub fn create_test_engine_with_memory(memory_mb: u64) -> MemoryDuckDBEngine {
         pool_size: 10,
         max_pool_size: 50,
     };
-    MemoryDuckDBEngine::new_with_fresh_db(config).expect("Failed to create test engine with custom memory")
+    MemoryDuckDBEngine::new_with_fresh_db(config)
+        .expect("Failed to create test engine with custom memory")
 }
 
 /// Creates a simple test schema
@@ -92,9 +99,7 @@ pub fn create_test_batch(schema: Arc<Schema>, start_id: i64, row_count: usize) -
 
 /// Creates a test Arrow stream from batches
 pub fn create_test_stream(batches: Vec<RecordBatch>) -> RecordBatchStream {
-    Box::pin(stream::iter(
-        batches.into_iter().map(Ok::<_, StorageError>),
-    ))
+    Box::pin(stream::iter(batches.into_iter().map(Ok::<_, StorageError>)))
 }
 
 /// Creates a test EpochView
@@ -156,7 +161,10 @@ pub fn create_failing_stream(
 
 /// Creates a QueryEngine that shares the same database as the StorageEngine.
 /// Uses the SharedDatabase handle for read-write separation.
-pub fn create_test_query_engine(shared_db: Arc<SharedDatabase>, max_concurrent_queries: usize) -> DuckDBQueryEngine {
+pub fn create_test_query_engine(
+    shared_db: Arc<SharedDatabase>,
+    max_concurrent_queries: usize,
+) -> DuckDBQueryEngine {
     DuckDBQueryEngine::new(shared_db, max_concurrent_queries)
 }
 
@@ -177,10 +185,10 @@ impl QueryEngineTestFixture {
     pub async fn new(dataset_id: &str, epoch_id: &str, row_count: usize) -> Self {
         // Create a shared database
         let shared_db = create_shared_database();
-        
+
         // Create storage engine (writer) using the shared database
         let storage_engine = create_test_engine_with_shared_db(shared_db.clone());
-        
+
         // Create query engine (reader) using the same shared database
         let query_engine = create_test_query_engine(shared_db.clone(), 10);
 
@@ -206,13 +214,17 @@ impl QueryEngineTestFixture {
     }
 
     /// Creates a fixture with multiple tables for the same dataset.
-    pub async fn with_multiple_epochs(dataset_id: &str, epoch_count: usize, rows_per_epoch: usize) -> Self {
+    pub async fn with_multiple_epochs(
+        dataset_id: &str,
+        epoch_count: usize,
+        rows_per_epoch: usize,
+    ) -> Self {
         // Create a shared database
         let shared_db = create_shared_database();
-        
+
         // Create storage engine (writer) using the shared database
         let storage_engine = create_test_engine_with_shared_db(shared_db.clone());
-        
+
         // Create query engine (reader) using the same shared database
         let query_engine = create_test_query_engine(shared_db.clone(), 10);
 
@@ -308,7 +320,11 @@ pub fn assert_valid_metadata(
     assert_eq!(metadata.total_rows, expected_rows, "Row count should match");
     assert!(metadata.total_bytes > 0, "Total bytes should be positive");
     assert!(metadata.create_at > 0, "Create timestamp should be set");
-    assert_eq!(metadata.schema.fields().len(), 3, "Schema should have 3 fields");
+    assert_eq!(
+        metadata.schema.fields().len(),
+        3,
+        "Schema should have 3 fields"
+    );
 }
 
 /// Asserts that two schemas are equivalent.
@@ -320,7 +336,12 @@ pub fn assert_schemas_equal(schema1: &Schema, schema2: &Schema) {
     );
     for (i, field) in schema1.fields().iter().enumerate() {
         let other_field = schema2.field(i);
-        assert_eq!(field.name(), other_field.name(), "Field names should match at index {}", i);
+        assert_eq!(
+            field.name(),
+            other_field.name(),
+            "Field names should match at index {}",
+            i
+        );
         assert_eq!(
             field.data_type(),
             other_field.data_type(),
@@ -343,10 +364,10 @@ impl MultiDatasetFixture {
     pub async fn new(dataset_configs: Vec<(&str, usize)>, rows_per_epoch: usize) -> Self {
         // Create a shared database
         let shared_db = create_shared_database();
-        
+
         // Create storage engine (writer) using the shared database
         let storage_engine = create_test_engine_with_shared_db(shared_db.clone());
-        
+
         // Create query engine (reader) using the same shared database
         let query_engine = create_test_query_engine(shared_db.clone(), 10);
 

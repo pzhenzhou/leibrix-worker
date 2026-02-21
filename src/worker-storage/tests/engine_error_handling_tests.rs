@@ -181,20 +181,20 @@ async fn test_error_operations_after_shutdown() {
 async fn test_error_create_after_channel_closed() {
     // Arrange - Create and immediately shutdown
     let engine = create_test_engine();
-    
+
     // Shutdown consumes the engine, so we need to test with a separate instance
     // that we intentionally break by shutting down the backing thread
     engine.shutdown().await.unwrap();
-    
+
     // Create a new engine for testing operations after shutdown
     let engine2 = create_test_engine();
-    
+
     // Shutdown this one too
     engine2.shutdown().await.unwrap();
-    
+
     // Now create a third engine and try to use it after the pattern is established
     let engine3 = create_test_engine();
-    
+
     // Use the engine while it's still valid
     let schema = create_test_schema();
     let stream = create_test_stream(vec![create_test_batch(schema, 0, 100)]);
@@ -202,7 +202,7 @@ async fn test_error_create_after_channel_closed() {
     let result = engine3
         .create_epoch_table("dataset_test".to_string(), epoch, stream)
         .await;
-    
+
     // This should succeed since we haven't shut down engine3
     assert!(result.is_ok(), "Operation on valid engine should succeed");
 }
@@ -240,11 +240,7 @@ async fn test_error_stream_fails_midway() {
         .list_epochs("dataset_fail".to_string())
         .await
         .unwrap();
-    assert_eq!(
-        epochs.len(),
-        0,
-        "Failed epoch should not be committed"
-    );
+    assert_eq!(epochs.len(), 0, "Failed epoch should not be committed");
 }
 
 #[tokio::test]
@@ -380,11 +376,8 @@ async fn test_error_concurrent_duplicate_creation() {
     // Due to the nature of concurrent operations, either:
     // 1. One succeeds and one fails (ideal)
     // 2. Both succeed if they created separate engine instances
-    assert!(
-        success_count >= 1,
-        "At least one creation should succeed"
-    );
-    
+    assert!(success_count >= 1, "At least one creation should succeed");
+
     if error_count > 0 {
         println!("Concurrent duplicate creation correctly detected");
     } else {

@@ -27,10 +27,6 @@ use duckdb::Connection;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// Register Arrow record batches as a temporary table in DuckDB.
 ///
 /// This allows exchange inputs to be queried as tables within stage SQL.
@@ -137,12 +133,7 @@ fn arrow_type_to_duckdb(arrow_type: &DataType) -> Result<String> {
         DataType::Decimal256(p, s) => return Ok(format!("DECIMAL({}, {})", p, s)),
         DataType::List(_) => "JSON",
         DataType::Struct(_) => "JSON",
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported Arrow type: {:?}",
-                arrow_type
-            ))
-        }
+        _ => return Err(anyhow::anyhow!("Unsupported Arrow type: {:?}", arrow_type)),
     };
 
     Ok(duckdb_type.to_string())

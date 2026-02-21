@@ -1,20 +1,18 @@
 #![allow(dead_code, unused)]
 
 use crate::engine::storage_engine::{RecordBatchStream, StorageError};
-use crate::loader::types::{Catalog, DataSource, SourceError};
 use crate::loader::starrocks::select_text;
+use crate::loader::types::{Catalog, DataSource, SourceError};
 use arrow_array::RecordBatch;
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use base64::Engine;
-use futures_util::{TryStreamExt, StreamExt};
+use futures_util::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
-
-
 
 const DEFAULT_MAX_CONCURRENCY: usize = 16;
 
@@ -61,7 +59,7 @@ impl StarRocksAdbcClient {
             } else {
                 DEFAULT_MAX_CONCURRENCY
             };
-            
+
             // Get runtime handle: provided, current, or fail
             let runtime_handle = match runtime_handle {
                 Some(handle) => handle,
@@ -72,7 +70,7 @@ impl StarRocksAdbcClient {
                     })
                 })?,
             };
-            
+
             Ok(StarRocksAdbcClient {
                 catalog_name,
                 host,
@@ -102,7 +100,7 @@ impl StarRocksAdbcClient {
     /// automatically released when the stream is dropped or completes.
     async fn query(&self, sql: &str) -> anyhow::Result<RecordBatchStream> {
         let catalog = self.catalog_name.clone();
-        
+
         // 1. Acquire semaphore permit to enforce concurrent query limits
         let permit = self.limiter.clone().acquire_owned().await.map_err(|e| {
             SourceError::EngineUnavailable {
@@ -113,7 +111,7 @@ impl StarRocksAdbcClient {
 
         // 2. Create channel for streaming results from blocking task
         let (tx, rx) = mpsc::channel::<Result<RecordBatch, SourceError>>(100);
-        
+
         // Clone data needed for the blocking task
         let sql = sql.to_string();
         let client = StarRocksAdbcClient {
@@ -132,7 +130,7 @@ impl StarRocksAdbcClient {
         tokio::task::spawn_blocking(move || {
             // Hold permit for the duration of the blocking operation
             let _permit = permit;
-            
+
             // Execute blocking query
             if let Err(e) = client.run_query_blocking(&sql, tx.clone()) {
                 // Log error but don't panic - error will be propagated via channel
@@ -214,23 +212,27 @@ impl StarRocksAdbcClient {
             for endpoint in flight_info.endpoint {
                 if let Some(ticket) = endpoint.ticket {
                     // Get stream for this endpoint
-                    let mut stream: FlightRecordBatchStream = client
-                        .do_get(ticket)
-                        .await
-                        .map_err(|e| SourceError::Protocol {
-                            catalog: catalog.clone(),
-                            message: format!("failed to fetch results: {}", e),
-                            source: Some(Box::new(e)),
-                        })?;
+                    let mut stream: FlightRecordBatchStream =
+                        client
+                            .do_get(ticket)
+                            .await
+                            .map_err(|e| SourceError::Protocol {
+                                catalog: catalog.clone(),
+                                message: format!("failed to fetch results: {}", e),
+                                source: Some(Box::new(e)),
+                            })?;
 
                     // Stream record batches through the channel
-                    while let Some(batch_result) = stream.try_next().await.map_err(|e: FlightError| {
-                        SourceError::Protocol {
-                            catalog: catalog.clone(),
-                            message: format!("error reading result stream: {}", e),
-                            source: Some(Box::new(e)),
-                        }
-                    })? {
+                    while let Some(batch_result) =
+                        stream
+                            .try_next()
+                            .await
+                            .map_err(|e: FlightError| SourceError::Protocol {
+                                catalog: catalog.clone(),
+                                message: format!("error reading result stream: {}", e),
+                                source: Some(Box::new(e)),
+                            })?
+                    {
                         // Send batch to channel
                         if tx.send(Ok(batch_result)).await.is_err() {
                             // Channel closed, receiver dropped
@@ -256,10 +258,12 @@ impl crate::loader::adapter::SourceAdapter for StarRocksAdbcClient {
         &self,
         source: Arc<DataSource>,
         schema: Arc<arrow::datatypes::Schema>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecordBatchStream, StorageError>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RecordBatchStream, StorageError>> + Send>,
+    > {
         let sql = select_text(source.clone(), schema.clone());
         let client = self.clone();
-        
+
         Box::pin(async move {
             client.query(&sql).await.map_err(|e| StorageError::Backend {
                 backend: "starrocks-adbc",

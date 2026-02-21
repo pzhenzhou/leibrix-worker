@@ -20,6 +20,7 @@
 //!               └── HashPartition (redistribute by hash)
 //! ```
 
+pub mod adaptive;
 pub mod coordinator;
 pub mod exchange;
 pub mod flight;
@@ -30,25 +31,23 @@ pub mod result_store;
 pub mod skew;
 pub mod stage;
 
+pub use coordinator::{
+    CancellationResult, CoordinatorConfig, CoordinatorError, LdpCoordinator, QueryResult,
+    QueryStats, StageStatus,
+};
 pub use exchange::{
     concat_record_batches, hash_partition_batch, DistributedExchangeRuntime, ExchangeError,
     ExchangeRuntime, RemoteTicket,
 };
 pub use flight::{FlightStageExecutor, LdpFlightClient, WorkerConnection, WorkerConnectionPool};
+pub use result_store::{CachedStageResult, StageResultStore, StageResultStoreStats};
 pub use stage::{
     LocalStageExecutor, StageExecutionError, StageExecutionStats, StageExecutor, StageResult,
     StageTicket, StageTickets,
 };
-pub use coordinator::{
-    CancellationResult, CoordinatorConfig, CoordinatorError, LdpCoordinator, QueryResult, QueryStats, StageStatus,
-};
-pub use result_store::{
-    CachedStageResult, StageResultStore, StageResultStoreStats,
-};
 
-
-use crate::ldp::{LdpPlan, StageId};
 use crate::ldp::executor::performance::PerformanceOptimizer;
+use crate::ldp::{LdpPlan, StageId};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,9 +68,9 @@ impl<E: StageExecutor> LdpExecutor<E> {
         let exchange_runtime = ExchangeRuntime::new(stage_executor.clone());
         let metrics_registry = Arc::new(crate::ldp::executor::metrics::LdpMetricsRegistry::new());
         let performance_optimizer = Arc::new(
-            crate::ldp::executor::performance::PerformanceOptimizer::new(metrics_registry)
+            crate::ldp::executor::performance::PerformanceOptimizer::new(metrics_registry),
         );
-        
+
         Self {
             stage_executor,
             exchange_runtime,
