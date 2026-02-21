@@ -264,7 +264,18 @@ async fn build_channel_with_backoff(
     config: &ControlPlaneConfig,
     _status_tx: &watch::Sender<SessionStatus>,
 ) -> Result<tonic::transport::Channel, SessionError> {
-    let addr = config.master_addr.clone();
+    // Normalize the address: tonic requires an absolute URI with a scheme.
+    // Accept bare `host:port` (or `host`) and prepend `http://` so that a
+    // common CLI value like `master:9090` works without forcing operators to
+    // know about URI syntax.
+    let addr = {
+        let raw = config.master_addr.as_str();
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            config.master_addr.clone()
+        } else {
+            format!("http://{raw}")
+        }
+    };
 
     // Validate the address once upfront; a parse failure is permanent.
     let base_endpoint = tonic::transport::Endpoint::from_shared(addr.clone()).map_err(|e| {

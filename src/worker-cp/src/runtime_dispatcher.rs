@@ -75,10 +75,15 @@ pub struct WorkerRuntimeDispatcher<E: StorageEngine> {
     /// Initialised via [`Self::init_sender`] after the session is started.  The
     /// split is necessary because the dispatcher is constructed before the
     /// session (which internally creates the outgoing channel), yet the session
-    /// needs the dispatcher to handle inbound events.  In practice `init_sender`
-    /// is called milliseconds after construction, long before any assignment
-    /// could complete and attempt to report status.
-    outgoing_tx: OnceLock<mpsc::Sender<OutgoingPayload>>,
+    /// needs the dispatcher to handle inbound events.
+    ///
+    /// Stored behind `Arc` so that `handle_command` can clone the `Arc` and
+    /// call `.get()` **lazily** inside the spawned load task — by which time
+    /// `init_sender` is guaranteed to have run.  Capturing `.get().cloned()`
+    /// eagerly at command-entry time would race against `init_sender` and
+    /// could yield `None` for assignments that arrive immediately after
+    /// registration.
+    outgoing_tx: Arc<OnceLock<mpsc::Sender<OutgoingPayload>>>,
 }
 
 impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
@@ -100,7 +105,7 @@ impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
             storage_engine,
             semaphore: Arc::new(Semaphore::new(max_concurrent_loads)),
             epoch_phases: Arc::new(DashMap::new()),
-            outgoing_tx: OnceLock::new(),
+            outgoing_tx: Arc::new(OnceLock::new()),
         }
     }
 
@@ -129,7 +134,13 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
         let storage_engine = Arc::clone(&self.storage_engine);
         let semaphore = Arc::clone(&self.semaphore);
         let epoch_phases = Arc::clone(&self.epoch_phases);
-        let outgoing_tx = self.outgoing_tx.get().cloned();
+        // Capture the Arc — *not* `.get().cloned()` — so every use-site
+        // resolves the sender lazily.  This eliminates the race where a
+        // command arrives before `init_sender` is called (possible because
+        // the Receive Task starts running while `ControlPlaneSession::start`
+        // is still on the stack) and the spawned task would hold a stale
+        // `None` even after initialization completes.
+        let outgoing_tx = Arc::clone(&self.outgoing_tx);
 
         async move {
             match command {
@@ -157,7 +168,7 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                                 "LoadAssignment → LoadRequest conversion failed; reporting FAILED"
                             );
                             epoch_phases.remove(&key);
-                            if let Some(tx) = &outgoing_tx {
+                            if let Some(tx) = outgoing_tx.get() {
                                 report_status(
                                     tx,
                                     dataset_id,
@@ -182,7 +193,7 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                         };
 
                         info!(%dataset_id, %epoch_id, "epoch load starting");
-                        if let Some(tx) = &outgoing_tx {
+                        if let Some(tx) = outgoing_tx.get() {
                             report_status(
                                 tx,
                                 dataset_id.clone(),
@@ -221,7 +232,7 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                                     epoch_phases.insert(key, EpochPhase::Active);
                                 }
 
-                                if let Some(tx) = &outgoing_tx {
+                                if let Some(tx) = outgoing_tx.get() {
                                     report_status(
                                         tx,
                                         dataset_id,
@@ -235,7 +246,7 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                             Err(e) => {
                                 error!(%dataset_id, %epoch_id, error = %e, "epoch load failed");
                                 epoch_phases.remove(&key);
-                                if let Some(tx) = &outgoing_tx {
+                                if let Some(tx) = outgoing_tx.get() {
                                     report_status(
                                         tx,
                                         dataset_id,
@@ -330,10 +341,19 @@ fn into_load_request(assignment: LoadAssignment) -> anyhow::Result<LoadRequest> 
     // Build a SQL filter from the resolved partition value so the source
     // adapter can push down the time predicate to StarRocks/Iceberg.
     // Example: "dt = '2025-01-15'"
-    let filter = Some(format!(
-        "{} = '{}'",
-        assignment.time_column_name, assignment.time_partition_value
-    ));
+    //
+    // Only construct the filter when *both* fields are non-empty.  Assignments
+    // that omit `resolved_partition` arrive with empty strings for both; the
+    // unconditional `Some(format!(...))` would produce `" = ''"`, which is
+    // invalid SQL and causes the load to fail instead of degrading to an
+    // unfiltered read.
+    let filter = match (
+        assignment.time_column_name.as_str(),
+        assignment.time_partition_value.as_str(),
+    ) {
+        ("", _) | (_, "") => None,
+        (col, val) => Some(format!("{col} = '{val}'")),
+    };
 
     let source = into_data_source(assignment.source, filter);
 
