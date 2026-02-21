@@ -27,7 +27,11 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
 }
 
 /// Generate orders test data
-fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_orders_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut o_orderkeys = Vec::with_capacity(row_count);
     let mut o_custkeys = Vec::with_capacity(row_count);
     let mut o_totalprice = Vec::with_capacity(row_count);
@@ -41,12 +45,17 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
         o_orderkeys.push(i as i64);
         o_custkeys.push((i % 50) as i32); // 50 unique customers
         o_totalprice.push(1000.0 + (i % 100) as f64 * 1000.0); // 1000-100000
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let order_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         o_orderdate.push(days_since_epoch as i32);
-        
+
         o_orderstatus.push(statuses[i % 3].to_string());
     }
 
@@ -72,7 +81,11 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
 }
 
 /// Generate lineitem test data
-fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_lineitem_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut l_orderkeys = Vec::with_capacity(row_count);
     let mut l_partkey = Vec::with_capacity(row_count);
     let mut l_quantity = Vec::with_capacity(row_count);
@@ -88,10 +101,15 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
         l_quantity.push((i % 50 + 1) as i32);
         l_extendedprice.push(100.0 + (i % 100) as f64 * 10.0);
         l_discount.push((i % 10) as f64 / 100.0); // 0-9%
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let ship_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         l_shipdate.push(days_since_epoch as i32);
     }
 
@@ -154,15 +172,21 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
         .map_err(|e| anyhow!("{}", e))?;
 
     // Register datasets
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "orders".to_string(),
-        "o_orderdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "orders".to_string(),
+            "o_orderdate".to_string(),
+        ))
+        .await;
 
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "lineitem".to_string(),
-        "l_shipdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "lineitem".to_string(),
+            "l_shipdate".to_string(),
+        ))
+        .await;
 
     Ok(cluster)
 }
@@ -187,13 +211,17 @@ async fn test_simple_cte_with_filter() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 1, "Should have 1 column");
-    
-    let count_col = result[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+
+    let count_col = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     let count = count_col.value(0);
-    
+
     println!("✓ CTE with filter executed successfully: count = {}", count);
     assert!(count > 0, "Should have some high-value orders");
 }
@@ -221,10 +249,10 @@ async fn test_cte_with_aggregation() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 2, "Should have 2 columns");
-    
+
     println!("✓ CTE with aggregation executed successfully");
 }
 
@@ -255,9 +283,9 @@ async fn test_multiple_ctes() {
     println!("Executing query:\n{}", sql);
 
     let _result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully - result can be empty or non-empty
-    
+
     println!("✓ Multiple CTEs executed successfully");
 }
 
@@ -323,13 +351,13 @@ async fn test_cte_with_join() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     let row_count = TestVerifier::count_total_rows(&result);
     assert!(row_count <= 10, "Should respect LIMIT 10");
-    
+
     println!("✓ CTE with join executed successfully: {} rows", row_count);
 }
 
@@ -362,9 +390,9 @@ async fn test_nested_cte() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ Nested CTE executed successfully");
 }
 
@@ -398,10 +426,10 @@ async fn test_cte_with_window_function() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ CTE with window function executed successfully");
 }
 
@@ -424,9 +452,12 @@ async fn test_cte_admission_control_rejects_recursive() {
     println!("Attempting to execute recursive CTE:\n{}", sql);
 
     let result = cluster.execute_query(sql).await;
-    
-    assert!(result.is_err(), "Recursive CTE should be rejected by admission control");
-    
+
+    assert!(
+        result.is_err(),
+        "Recursive CTE should be rejected by admission control"
+    );
+
     println!("✓ Recursive CTE correctly rejected by admission control");
 }
 
@@ -460,9 +491,9 @@ async fn test_cte_with_complex_expression() {
     println!("Executing query:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ CTE with complex expressions executed successfully");
 }

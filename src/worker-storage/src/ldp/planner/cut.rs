@@ -78,7 +78,10 @@ fn get_column_alias(expr: &Expr) -> String {
         // Qualified identifier: e.g., "o.o_totalprice" -> "o_totalprice" (dequalified)
         Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
             // Take the last part (column name)
-            parts.last().map(|p| p.value.clone()).unwrap_or_else(|| "col".to_string())
+            parts
+                .last()
+                .map(|p| p.value.clone())
+                .unwrap_or_else(|| "col".to_string())
         }
         // For other expressions, return a placeholder
         _ => "order_by_col".to_string(),
@@ -104,7 +107,12 @@ fn extract_all_columns_from_expr(expr: &Expr, columns: &mut Vec<Expr>) {
         Expr::Nested(inner) => {
             extract_all_columns_from_expr(inner, columns);
         }
-        Expr::Case { operand, conditions, else_result, .. } => {
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             // For CASE expressions, extract columns from all branches
             if let Some(op) = operand {
                 extract_all_columns_from_expr(op, columns);
@@ -190,13 +198,17 @@ fn add_columns_to_plan(mut plan: LogicalPlan, columns: Vec<Expr>) -> LogicalPlan
             }
             plan
         }
-        LogicalPlan::Aggregate { aggr_exprs, input: _, .. } => {
+        LogicalPlan::Aggregate {
+            aggr_exprs,
+            input: _,
+            ..
+        } => {
             // Add the ORDER BY columns to the aggregate's SELECT
             for col in columns {
                 let col_str = format!("{}", col);
-                let already_exists = aggr_exprs.iter().any(|item| {
-                    format!("{}", item).contains(&col_str)
-                });
+                let already_exists = aggr_exprs
+                    .iter()
+                    .any(|item| format!("{}", item).contains(&col_str));
                 if !already_exists {
                     aggr_exprs.push(SelectItem::UnnamedExpr(col));
                 }
@@ -211,7 +223,7 @@ fn add_columns_to_plan(mut plan: LogicalPlan, columns: Vec<Expr>) -> LogicalPlan
         LogicalPlan::Join { .. } => {
             // For Join, wrap the Join in a Project that selects * plus the ORDER BY columns.
             // This ensures the exchange output has both original columns AND ORDER BY columns.
-            let mut new_items = vec![SelectItem::Wildcard(Default::default())];  // SELECT *
+            let mut new_items = vec![SelectItem::Wildcard(Default::default())]; // SELECT *
             for col in columns {
                 let alias = get_column_alias(&col);
                 new_items.push(SelectItem::ExprWithAlias {
@@ -247,10 +259,7 @@ fn add_columns_to_plan(mut plan: LogicalPlan, columns: Vec<Expr>) -> LogicalPlan
         _ => {
             // For other plan types (Scan, ExchangeRead), wrap in a new Project
             LogicalPlan::Project {
-                items: columns
-                    .into_iter()
-                    .map(SelectItem::UnnamedExpr)
-                    .collect(),
+                items: columns.into_iter().map(SelectItem::UnnamedExpr).collect(),
                 input: Box::new(plan),
             }
         }
@@ -289,10 +298,7 @@ fn has_exchange_in_descendants(annotated: &AnnotatedPlan) -> bool {
 /// This function only modifies the plan for nodes that are already Project or
 /// Aggregate (where we can safely add columns without changing structure).
 /// For other node types, we recurse to find Project/Aggregate descendants with exchanges.
-fn add_order_by_columns_to_exchange_children(
-    annotated: &mut AnnotatedPlan,
-    columns: &[Expr],
-) {
+fn add_order_by_columns_to_exchange_children(annotated: &mut AnnotatedPlan, columns: &[Expr]) {
     for child in &mut annotated.children {
         if child.exchange_before.is_some() {
             // Only modify if it's safe to do so without changing structure
@@ -356,7 +362,11 @@ pub fn cut_into_stages(
     // The root stage produces the final output for the client.
     // It must use Stream output regardless of its distribution annotation,
     // because there is no downstream exchange that would consume partitioned data.
-    if let Some(root_stage) = plan.stages.iter_mut().find(|s| s.stage_id == plan.root_stage) {
+    if let Some(root_stage) = plan
+        .stages
+        .iter_mut()
+        .find(|s| s.stage_id == plan.root_stage)
+    {
         root_stage.output = StageOutput::Stream;
     }
 
@@ -417,9 +427,7 @@ fn cut_recursive(
 
     // If this node is a Sort (or Limit wrapping Sort), extract ORDER BY columns to add to exchange outputs
     let sort_order_by_columns = match &annotated.plan {
-        LogicalPlan::Sort { order_by, .. } => {
-            extract_order_by_columns(order_by)
-        }
+        LogicalPlan::Sort { order_by, .. } => extract_order_by_columns(order_by),
         LogicalPlan::Limit { input, .. } => {
             if let LogicalPlan::Sort { order_by, .. } = input.as_ref() {
                 extract_order_by_columns(order_by)
@@ -440,14 +448,19 @@ fn cut_recursive(
             // to ensure they're included in the exchange output
             let mut child_to_process = child.clone();
             if needs_order_by_columns {
-                child_to_process.plan = add_columns_to_plan(child.plan.clone(), sort_order_by_columns.clone());
+                child_to_process.plan =
+                    add_columns_to_plan(child.plan.clone(), sort_order_by_columns.clone());
             }
 
             let from_stage = cut_recursive(&child_to_process, plan, ctx, policy);
             let exchange_id = ctx.alloc_exchange_id();
 
             // Defer edge creation until we know our own stage_id
-            pending_edges.push((exchange_id, from_stage, child.exchange_before.clone().unwrap()));
+            pending_edges.push((
+                exchange_id,
+                from_stage,
+                child.exchange_before.clone().unwrap(),
+            ));
 
             // Replace child with ExchangeRead placeholder
             let exchange_table_name = format!("__exchange_{}", exchange_id);
@@ -478,7 +491,8 @@ fn cut_recursive(
                 );
             }
 
-            let (child_plan, child_edges) = extract_stage_plan(&child_to_process, plan, ctx, policy);
+            let (child_plan, child_edges) =
+                extract_stage_plan(&child_to_process, plan, ctx, policy);
             pending_edges.extend(child_edges);
             child_plans_for_stage.push(child_plan);
         }
@@ -494,9 +508,8 @@ fn cut_recursive(
             let wrapper_items: Vec<SelectItem> = original_items
                 .iter()
                 .filter_map(|item| {
-                    get_output_column_name(item).map(|name| {
-                        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name)))
-                    })
+                    get_output_column_name(item)
+                        .map(|name| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))))
                 })
                 .collect();
             // Only wrap if we could resolve all column names
@@ -596,7 +609,11 @@ fn extract_stage_plan(
             let exchange_id = ctx.alloc_exchange_id();
 
             // Defer edge creation – caller will set the correct to_stage
-            pending_edges.push((exchange_id, from_stage, child.exchange_before.clone().unwrap()));
+            pending_edges.push((
+                exchange_id,
+                from_stage,
+                child.exchange_before.clone().unwrap(),
+            ));
 
             // Create placeholder
             let exchange_table_name = format!("__exchange_{}", exchange_id);
@@ -620,7 +637,10 @@ fn extract_stage_plan(
         }
     }
 
-    (reconstruct_plan_with_children(&annotated.plan, new_children), pending_edges)
+    (
+        reconstruct_plan_with_children(&annotated.plan, new_children),
+        pending_edges,
+    )
 }
 
 /// Reconstruct a LogicalPlan with new children.
@@ -645,7 +665,10 @@ fn reconstruct_plan_with_children(
                 table_factor: table_factor.clone(),
             }
         }
-        Filter { predicate, input: _ } => Filter {
+        Filter {
+            predicate,
+            input: _,
+        } => Filter {
             predicate: predicate.clone(),
             input: Box::new(new_children[0].clone()),
         },
@@ -714,10 +737,7 @@ fn reconstruct_plan_with_children(
             alias: alias.clone(),
             input: Box::new(new_children[0].clone()),
         },
-        ExchangeRead {
-            exchange_id,
-            alias,
-        } => {
+        ExchangeRead { exchange_id, alias } => {
             // ExchangeRead has no children
             ExchangeRead {
                 exchange_id: *exchange_id,
@@ -764,8 +784,7 @@ fn is_purely_exchange_backed(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Window { input, .. } => is_purely_exchange_backed(input),
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SetOp { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             is_purely_exchange_backed(left) && is_purely_exchange_backed(right)
         }
     }
@@ -926,10 +945,10 @@ fn determine_stage_output(annotated: &AnnotatedPlan) -> StageOutput {
     // If this annotated node has an exchange_before, it will produce partitioned output
     // for hash partition exchanges
     if let Some(Exchange::HashPartition {
-            partitions,
-            column_refs,
-            ..
-        }) = &annotated.exchange_before
+        partitions,
+        column_refs,
+        ..
+    }) = &annotated.exchange_before
     {
         return StageOutput::Partitioned {
             partitions: *partitions,
@@ -947,11 +966,7 @@ fn policy_default_partitions() -> u32 {
 }
 
 /// Assign target workers to stages based on distribution annotations.
-fn assign_stage_workers(
-    plan: &mut LdpPlan,
-    _root_annotated: &AnnotatedPlan,
-    ctx: &CutContext,
-) {
+fn assign_stage_workers(plan: &mut LdpPlan, _root_annotated: &AnnotatedPlan, ctx: &CutContext) {
     for stage in &mut plan.stages {
         if let Some(ann_ref) = ctx.stage_annotations.get(&stage.stage_id) {
             let mut workers = ann_ref.distribution.workers().to_vec();
@@ -1033,8 +1048,8 @@ mod tests {
     use super::*;
     use crate::ldp::planner::annotate::AnnotatedPlan;
     use crate::ldp::planner::policy::PlannerPolicy;
-    use crate::ldp::{Distribution, DistributionAnnotation, StatsSource};
     use crate::ldp::types::WorkerId;
+    use crate::ldp::{Distribution, DistributionAnnotation, StatsSource};
     use crate::sql::logical_plan::{ColumnRef, LogicalPlan};
     use sqlparser::ast::Expr;
 
@@ -1192,10 +1207,7 @@ mod tests {
 
         // Single stage should have LocalCatalog input
         assert_eq!(plan.stages[0].inputs.len(), 1);
-        assert!(matches!(
-            plan.stages[0].inputs[0],
-            StageInput::LocalCatalog
-        ));
+        assert!(matches!(plan.stages[0].inputs[0], StageInput::LocalCatalog));
     }
 
     #[test]

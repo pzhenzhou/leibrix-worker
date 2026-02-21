@@ -102,7 +102,7 @@ impl PredicateAnalyzer {
     ) -> Result<(), SqlTransformError> {
         // Collect table names/aliases that are actually in THIS SELECT's FROM clause
         let local_table_refs = self.collect_local_table_refs(select);
-        
+
         // Filter to only tables that appear in this SELECT's FROM clause
         let scope_tables: Vec<_> = tables
             .iter()
@@ -119,11 +119,8 @@ impl PredicateAnalyzer {
         if let Some(selection) = &select.selection {
             for table in &scope_tables {
                 if let Some(time_col) = self.time_columns.get(&table.dataset_id) {
-                    let range = self.extract_range_from_expr(
-                        selection,
-                        table.effective_name(),
-                        time_col,
-                    );
+                    let range =
+                        self.extract_range_from_expr(selection, table.effective_name(), time_col);
                     if !range.is_empty() {
                         if let Some(existing) = ranges.get_mut(&table.dataset_id) {
                             existing.merge(range);
@@ -183,16 +180,16 @@ impl PredicateAnalyzer {
                     refs.insert(a.name.value.to_lowercase());
                 }
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.collect_table_refs_from_factor(&table_with_joins.relation, refs);
                 for join in &table_with_joins.joins {
                     self.collect_table_refs_from_factor(&join.relation, refs);
                 }
             }
             // Derived tables (subqueries) don't expose their inner tables to outer scope
-            TableFactor::Derived {
-                alias: Some(a), ..
-            } => {
+            TableFactor::Derived { alias: Some(a), .. } => {
                 refs.insert(a.name.value.to_lowercase());
             }
             _ => {}
@@ -200,25 +197,14 @@ impl PredicateAnalyzer {
     }
 
     /// Extract date range from an expression.
-    fn extract_range_from_expr(
-        &self,
-        expr: &Expr,
-        table_name: &str,
-        time_col: &str,
-    ) -> DateRange {
+    fn extract_range_from_expr(&self, expr: &Expr, table_name: &str, time_col: &str) -> DateRange {
         let mut range = DateRange::default();
         self.walk_expr(expr, table_name, time_col, &mut range);
         range
     }
 
     /// Recursively walk an expression looking for date predicates.
-    fn walk_expr(
-        &self,
-        expr: &Expr,
-        table_name: &str,
-        time_col: &str,
-        range: &mut DateRange,
-    ) {
+    fn walk_expr(&self, expr: &Expr, table_name: &str, time_col: &str, range: &mut DateRange) {
         match expr {
             // BETWEEN: dt BETWEEN '2025-01-01' AND '2025-12-31'
             Expr::Between {
@@ -326,15 +312,13 @@ impl PredicateAnalyzer {
     fn is_time_column_ref(&self, expr: &Expr, table_name: &str, time_col: &str) -> bool {
         match expr {
             // Simple identifier: dt
-            Expr::Identifier(ident) => {
-                ident.value.eq_ignore_ascii_case(time_col)
-            }
+            Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(time_col),
             // Compound identifier: s.dt or schema.table.dt
             Expr::CompoundIdentifier(parts) => {
                 if parts.len() >= 2 {
                     let col_name = &parts.last().unwrap().value;
                     let qualifier = &parts[parts.len() - 2].value;
-                    col_name.eq_ignore_ascii_case(time_col) 
+                    col_name.eq_ignore_ascii_case(time_col)
                         && qualifier.eq_ignore_ascii_case(table_name)
                 } else if parts.len() == 1 {
                     parts[0].value.eq_ignore_ascii_case(time_col)
@@ -383,7 +367,11 @@ impl PredicateAnalyzer {
                 }
             }
             // Cast expression: CAST('2025-01-01' AS DATE)
-            Expr::Cast { expr: inner, data_type, .. } => {
+            Expr::Cast {
+                expr: inner,
+                data_type,
+                ..
+            } => {
                 if matches!(data_type, DataType::Date) {
                     self.extract_date_bound(inner)
                 } else {
@@ -403,8 +391,8 @@ fn is_valid_date_format(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::parser::parse_sql;
     use crate::sql::discovery::TableDiscovery;
+    use crate::sql::parser::parse_sql;
     use std::collections::HashSet;
 
     fn setup_analyzer(datasets: &[(&str, &str)]) -> PredicateAnalyzer {
@@ -431,8 +419,14 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
-        assert_eq!(range.end, Some(DateBound::Literal("2025-12-31".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
+        assert_eq!(
+            range.end,
+            Some(DateBound::Literal("2025-12-31".to_string()))
+        );
         assert!(range.end_inclusive);
     }
 
@@ -445,8 +439,14 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
-        assert_eq!(range.end, Some(DateBound::Literal("2025-02-01".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
+        assert_eq!(
+            range.end,
+            Some(DateBound::Literal("2025-02-01".to_string()))
+        );
         assert!(!range.end_inclusive);
     }
 
@@ -459,8 +459,14 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-15".to_string())));
-        assert_eq!(range.end, Some(DateBound::Literal("2025-01-15".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-15".to_string()))
+        );
+        assert_eq!(
+            range.end,
+            Some(DateBound::Literal("2025-01-15".to_string()))
+        );
         assert!(range.end_inclusive);
     }
 
@@ -473,7 +479,10 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
     }
 
     #[test]
@@ -481,18 +490,21 @@ mod tests {
         let sql = "SELECT * FROM sales_data s JOIN customer_data c ON s.cid = c.id \
                    WHERE s.dt >= '2025-01-01' AND c.created_at < '2025-06-01'";
         let (stmt, tables) = discover_tables(sql, &["sales_data", "customer_data"]);
-        let analyzer = setup_analyzer(&[
-            ("sales_data", "dt"),
-            ("customer_data", "created_at"),
-        ]);
+        let analyzer = setup_analyzer(&[("sales_data", "dt"), ("customer_data", "created_at")]);
 
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let sales_range = ranges.get("sales_data").unwrap();
-        assert_eq!(sales_range.start, Some(DateBound::Literal("2025-01-01".to_string())));
+        assert_eq!(
+            sales_range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
 
         let customer_range = ranges.get("customer_data").unwrap();
-        assert_eq!(customer_range.end, Some(DateBound::Literal("2025-06-01".to_string())));
+        assert_eq!(
+            customer_range.end,
+            Some(DateBound::Literal("2025-06-01".to_string()))
+        );
     }
 
     #[test]
@@ -516,7 +528,10 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-15".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-15".to_string()))
+        );
     }
 
     #[test]
@@ -528,7 +543,10 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
     }
 
     #[test]
@@ -540,8 +558,14 @@ mod tests {
         let ranges = analyzer.extract_date_ranges(&stmt, &tables).unwrap();
 
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
-        assert_eq!(range.end, Some(DateBound::Literal("2025-02-01".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
+        assert_eq!(
+            range.end,
+            Some(DateBound::Literal("2025-02-01".to_string()))
+        );
     }
 
     #[test]
@@ -556,7 +580,10 @@ mod tests {
         // sales_data is in the CTE, but the predicate dt = '2025-01-15' is in outer query
         // referencing 'recent', not 'sales_data'. Should NOT be extracted.
         let range = ranges.get("sales_data").unwrap();
-        assert!(range.is_empty(), "Outer query predicate should not apply to CTE inner table");
+        assert!(
+            range.is_empty(),
+            "Outer query predicate should not apply to CTE inner table"
+        );
     }
 
     #[test]
@@ -570,7 +597,10 @@ mod tests {
 
         // sales_data has predicate in CTE, should extract '2025-01-01', not '2025-01-15'
         let range = ranges.get("sales_data").unwrap();
-        assert_eq!(range.start, Some(DateBound::Literal("2025-01-01".to_string())));
+        assert_eq!(
+            range.start,
+            Some(DateBound::Literal("2025-01-01".to_string()))
+        );
     }
 
     #[test]
@@ -584,6 +614,9 @@ mod tests {
 
         // Invalid date should result in empty range (wide scan)
         let range = ranges.get("sales_data").unwrap();
-        assert!(range.is_empty(), "Invalid date format should not be extracted");
+        assert!(
+            range.is_empty(),
+            "Invalid date format should not be extracted"
+        );
     }
 }

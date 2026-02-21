@@ -92,7 +92,10 @@ async fn main() -> anyhow::Result<()> {
     println!("\n🛫 Starting Arrow Flight server...");
     println!("   Address: {}", config.bind_addr);
     println!("   Tenant: test-tenant");
-    println!("   Max message size: {} MB", config.max_message_size / 1024 / 1024);
+    println!(
+        "   Max message size: {} MB",
+        config.max_message_size / 1024 / 1024
+    );
     println!();
     println!("📡 Server ready to accept connections!");
     println!();
@@ -102,7 +105,9 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("Try queries like:");
     println!("  SELECT * FROM sales_data WHERE dt = '2025-01-01'");
-    println!("  SELECT country, SUM(amount) FROM sales_data WHERE dt = '2025-01-01' GROUP BY country");
+    println!(
+        "  SELECT country, SUM(amount) FROM sales_data WHERE dt = '2025-01-01' GROUP BY country"
+    );
     println!();
     println!("Press Ctrl+C to stop the server");
     println!();
@@ -126,5 +131,3 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ Server stopped");
     Ok(())
 }
-
-

@@ -180,16 +180,16 @@ mod tests {
         let limits = StageLimits {
             max_bytes_output: 1000,
             max_rows_output: 100,
-            timeout_ms: 1000, // 1 second
+            timeout_ms: 1000,          // 1 second
             memory_bytes: 1024 * 1024, // 1 MB
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Simulate some work within limits
         monitor.increment_rows_produced(50);
         monitor.increment_bytes_produced(500);
-        
+
         // Should pass limit check
         assert!(monitor.check_limits().is_ok());
     }
@@ -204,10 +204,10 @@ mod tests {
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Sleep briefly to exceed the timeout
         std::thread::sleep(Duration::from_millis(10));
-        
+
         // Should fail timeout check
         match monitor.check_limits() {
             Err(LimitExceededError::Timeout { .. }) => (),
@@ -225,10 +225,10 @@ mod tests {
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Exceed row limit
         monitor.increment_rows_produced(15);
-        
+
         // Should fail row limit check
         match monitor.check_limits() {
             Err(LimitExceededError::RowsOutput { produced, limit }) => {
@@ -249,10 +249,10 @@ mod tests {
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Exceed bytes limit
         monitor.increment_bytes_produced(150);
-        
+
         // Should fail bytes limit check
         match monitor.check_limits() {
             Err(LimitExceededError::BytesOutput { produced, limit }) => {
@@ -273,10 +273,10 @@ mod tests {
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Cancel execution
         monitor.cancel();
-        
+
         // Should fail with timeout error due to cancellation
         assert!(monitor.check_limits().is_err());
         assert!(monitor.is_cancelled());
@@ -292,12 +292,12 @@ mod tests {
         };
 
         let monitor = StageExecutionMonitor::new(limits);
-        
+
         // Update counters
         monitor.increment_rows_scanned(10);
         monitor.increment_rows_produced(20);
         monitor.increment_bytes_produced(30);
-        
+
         let stats = monitor.stats();
         assert_eq!(stats.rows_scanned, 10);
         assert_eq!(stats.rows_produced, 20);

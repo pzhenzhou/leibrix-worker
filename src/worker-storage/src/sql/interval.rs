@@ -8,7 +8,7 @@
 //! - Conservative extraction for correctness
 
 use chrono::NaiveDate;
-use std::cmp::{Ordering, max, min};
+use std::cmp::{max, min, Ordering};
 
 /// A date bound used in interval endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +18,6 @@ pub enum DateBound {
     /// A parameter placeholder
     Parameter(String),
 }
-
 
 impl PartialOrd for DateBound {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -32,7 +31,10 @@ impl Ord for DateBound {
         match (self, other) {
             (DateBound::Literal(a), DateBound::Literal(b)) => {
                 // Compare literals by parsed date value
-                match (NaiveDate::parse_from_str(a, "%Y-%m-%d"), NaiveDate::parse_from_str(b, "%Y-%m-%d")) {
+                match (
+                    NaiveDate::parse_from_str(a, "%Y-%m-%d"),
+                    NaiveDate::parse_from_str(b, "%Y-%m-%d"),
+                ) {
                     (Ok(date_a), Ok(date_b)) => date_a.cmp(&date_b),
                     _ => a.cmp(b), // Fallback to string comparison for invalid dates
                 }
@@ -75,16 +77,14 @@ impl Interval {
     pub fn point(date: DateBound) -> Self {
         // Convert to [date, date+1) for half-open representation
         let next_date = match &date {
-            DateBound::Literal(s) => {
-                NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|d| d.succ_opt())
-                    .map(|d| DateBound::Literal(d.format("%Y-%m-%d").to_string()))
-                    .unwrap_or_else(|| date.clone())
-            }
+            DateBound::Literal(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.succ_opt())
+                .map(|d| DateBound::Literal(d.format("%Y-%m-%d").to_string()))
+                .unwrap_or_else(|| date.clone()),
             DateBound::Parameter(_) => date.clone(),
         };
-        
+
         Self {
             start: Some(date),
             end: Some(next_date),
@@ -104,8 +104,10 @@ impl Interval {
         match (&self.start, &self.end) {
             (Some(DateBound::Literal(s)), Some(DateBound::Literal(e))) => {
                 // Only compare concrete dates
-                match (NaiveDate::parse_from_str(s, "%Y-%m-%d"), 
-                       NaiveDate::parse_from_str(e, "%Y-%m-%d")) {
+                match (
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d"),
+                    NaiveDate::parse_from_str(e, "%Y-%m-%d"),
+                ) {
                     (Ok(start_date), Ok(end_date)) => start_date >= end_date,
                     _ => false, // If we can't parse, assume not empty
                 }
@@ -228,17 +230,17 @@ mod tests {
     fn test_intersect_basic() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
         let i2 = Interval::from_bounds(Some(lit("2025-01-15")), Some(lit("2025-03-01")));
-        
+
         let result = i1.intersect(&i2);
         assert_eq!(result.start, Some(lit("2025-01-15"))); // max of starts
-        assert_eq!(result.end, Some(lit("2025-02-01")));   // min of ends
+        assert_eq!(result.end, Some(lit("2025-02-01"))); // min of ends
     }
 
     #[test]
     fn test_intersect_disjoint() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-01-31")));
         let i2 = Interval::from_bounds(Some(lit("2025-06-01")), Some(lit("2025-06-30")));
-        
+
         let result = i1.intersect(&i2);
         assert!(result.is_empty()); // Disjoint → empty
     }
@@ -247,7 +249,7 @@ mod tests {
     fn test_intersect_with_empty() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
         let empty = Interval::empty();
-        
+
         let result = i1.intersect(&empty);
         assert!(result.is_empty());
     }
@@ -256,7 +258,7 @@ mod tests {
     fn test_intersect_with_universe() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
         let univ = Interval::universe();
-        
+
         let result = i1.intersect(&univ);
         assert_eq!(result, i1); // X ∩ Universe = X
     }
@@ -265,18 +267,18 @@ mod tests {
     fn test_union_basic() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-01-31")));
         let i2 = Interval::from_bounds(Some(lit("2025-06-01")), Some(lit("2025-06-30")));
-        
+
         let result = i1.union(&i2);
         assert_eq!(result.start, Some(lit("2025-01-01"))); // min of starts
-        assert_eq!(result.end, Some(lit("2025-06-30")));   // max of ends
-        // Note: This covers Feb-May even though they weren't in original intervals
+        assert_eq!(result.end, Some(lit("2025-06-30"))); // max of ends
+                                                         // Note: This covers Feb-May even though they weren't in original intervals
     }
 
     #[test]
     fn test_union_overlapping() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-15")));
         let i2 = Interval::from_bounds(Some(lit("2025-01-15")), Some(lit("2025-03-01")));
-        
+
         let result = i1.union(&i2);
         assert_eq!(result.start, Some(lit("2025-01-01")));
         assert_eq!(result.end, Some(lit("2025-03-01")));
@@ -286,7 +288,7 @@ mod tests {
     fn test_union_with_empty() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
         let empty = Interval::empty();
-        
+
         let result = i1.union(&empty);
         assert_eq!(result, i1); // X ∪ Empty = X
     }
@@ -295,7 +297,7 @@ mod tests {
     fn test_union_with_universe() {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
         let univ = Interval::universe();
-        
+
         let result = i1.union(&univ);
         assert!(result.is_universe()); // X ∪ Universe = Universe
     }
@@ -306,19 +308,16 @@ mod tests {
         let i1 = Interval::from_bounds(Some(lit("2025-01-01")), None);
         let i2 = Interval::from_bounds(None, Some(lit("2025-02-01")));
         let i3 = Interval::from_bounds(Some(lit("2025-01-15")), None);
-        
+
         let result = i1.intersect(&i2).intersect(&i3);
         assert_eq!(result.start, Some(lit("2025-01-15"))); // Tightest lower bound
-        assert_eq!(result.end, Some(lit("2025-02-01")));   // Tightest upper bound
+        assert_eq!(result.end, Some(lit("2025-02-01"))); // Tightest upper bound
     }
 
     #[test]
     fn test_to_macro_params() {
-        let interval = Interval::from_bounds(
-            Some(lit("2025-01-01")),
-            Some(lit("2025-02-01"))
-        );
-        
+        let interval = Interval::from_bounds(Some(lit("2025-01-01")), Some(lit("2025-02-01")));
+
         let (start, end) = interval.to_macro_params();
         assert_eq!(start, "2025-01-01");
         assert_eq!(end, "2025-02-01");
@@ -327,7 +326,7 @@ mod tests {
     #[test]
     fn test_to_macro_params_unbounded() {
         let interval = Interval::universe();
-        
+
         let (start, end) = interval.to_macro_params();
         assert_eq!(start, "1970-01-01");
         assert_eq!(end, "9999-12-31");
@@ -338,7 +337,7 @@ mod tests {
         let d1 = lit("2025-01-01");
         let d2 = lit("2025-01-15");
         let d3 = lit("2025-02-01");
-        
+
         assert!(d1 < d2);
         assert!(d2 < d3);
         assert!(d1 < d3);
@@ -350,7 +349,7 @@ mod tests {
         let p1 = DateBound::Parameter("?p1".to_string());
         let p2 = DateBound::Parameter("?p2".to_string());
         let p3 = DateBound::Parameter("?p1".to_string());
-        
+
         // Different parameters must have consistent ordering
         assert_ne!(p1.cmp(&p2), Ordering::Equal);
         // Same parameter names are equal
@@ -363,7 +362,7 @@ mod tests {
     fn test_datebound_ordering_mixed() {
         let lit_date = lit("2025-01-01");
         let param = DateBound::Parameter("?p1".to_string());
-        
+
         // Literals always compare less than parameters (by design)
         assert!(lit_date < param);
         assert!(param > lit_date);
@@ -372,15 +371,9 @@ mod tests {
     #[test]
     fn test_intersect_with_parameters() {
         // Simulate: (dt >= ?p1) AND (dt < '2025-02-01')
-        let i1 = Interval::from_bounds(
-            Some(DateBound::Parameter("?p1".to_string())),
-            None
-        );
-        let i2 = Interval::from_bounds(
-            None,
-            Some(lit("2025-02-01"))
-        );
-        
+        let i1 = Interval::from_bounds(Some(DateBound::Parameter("?p1".to_string())), None);
+        let i2 = Interval::from_bounds(None, Some(lit("2025-02-01")));
+
         let result = i1.intersect(&i2);
         // Should preserve both bounds
         assert_eq!(result.start, Some(DateBound::Parameter("?p1".to_string())));
@@ -391,15 +384,9 @@ mod tests {
     #[test]
     fn test_intersect_different_parameters() {
         // (dt >= ?p1) AND (dt >= ?p2)
-        let i1 = Interval::from_bounds(
-            Some(DateBound::Parameter("?p1".to_string())),
-            None
-        );
-        let i2 = Interval::from_bounds(
-            Some(DateBound::Parameter("?p2".to_string())),
-            None
-        );
-        
+        let i1 = Interval::from_bounds(Some(DateBound::Parameter("?p1".to_string())), None);
+        let i2 = Interval::from_bounds(Some(DateBound::Parameter("?p2".to_string())), None);
+
         let result = i1.intersect(&i2);
         // Should take max, which is now deterministic
         // Since "?p1" < "?p2" lexicographically, max is ?p2
@@ -410,15 +397,9 @@ mod tests {
     #[test]
     fn test_union_with_parameters() {
         // (dt >= ?p1) OR (dt >= '2025-01-01')
-        let i1 = Interval::from_bounds(
-            Some(DateBound::Parameter("?p1".to_string())),
-            None
-        );
-        let i2 = Interval::from_bounds(
-            Some(lit("2025-01-01")),
-            None
-        );
-        
+        let i1 = Interval::from_bounds(Some(DateBound::Parameter("?p1".to_string())), None);
+        let i2 = Interval::from_bounds(Some(lit("2025-01-01")), None);
+
         let result = i1.union(&i2);
         // Should take min, which is the literal (since Literal < Parameter)
         assert_eq!(result.start, Some(lit("2025-01-01")));
@@ -428,22 +409,21 @@ mod tests {
     #[test]
     fn test_max_min_correctness() {
         use std::cmp::{max, min};
-        
+
         let d1 = lit("2025-01-01");
         let d2 = lit("2025-01-15");
-        
+
         // Test max/min work correctly with fixed Ord
         assert_eq!(max(&d1, &d2), &d2);
         assert_eq!(min(&d1, &d2), &d1);
-        
+
         // Test with parameters
         let p1 = DateBound::Parameter("?a".to_string());
         let p2 = DateBound::Parameter("?b".to_string());
-        
+
         // Should be consistent and not treat as equal
         let max_result = max(&p1, &p2);
         let min_result = min(&p1, &p2);
         assert_ne!(max_result, min_result); // They're different parameters!
     }
 }
-

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use duckdb::Connection;
 use deadpool::managed::{Manager, Pool, PoolConfig, QueueMode, RecycleResult};
+use duckdb::Connection;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
@@ -79,28 +79,37 @@ impl Manager for DuckDbConnectionManager {
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         let conn = Connection::open_in_memory()?;
-        
+
         // Apply memory limits if specified
         if let Some(memory_limit_mb) = self.config.memory_limit_mb {
             let _ = conn.execute(&format!("SET max_memory = '{}MB'", memory_limit_mb), []);
         }
-        
+
         // Set statement timeout
         let _ = conn.execute(
-            &format!("SET statement_timeout = '{}s'", self.config.statement_timeout.as_secs()), 
-            []
+            &format!(
+                "SET statement_timeout = '{}s'",
+                self.config.statement_timeout.as_secs()
+            ),
+            [],
         );
-        
+
         Ok(conn)
     }
 
-    async fn recycle(&self, obj: &mut Self::Type, _metrics: &deadpool::managed::Metrics) -> RecycleResult<Self::Error> {
+    async fn recycle(
+        &self,
+        obj: &mut Self::Type,
+        _metrics: &deadpool::managed::Metrics,
+    ) -> RecycleResult<Self::Error> {
         // Reset connection state before recycling
         if let Err(e) = obj.execute_batch("RESET ALL") {
             warn!("Failed to reset connection: {}", e);
-            return Err(deadpool::managed::RecycleError::Message("Reset failed".into()));
+            return Err(deadpool::managed::RecycleError::Message(
+                "Reset failed".into(),
+            ));
         }
-        
+
         Ok(())
     }
 }
@@ -123,9 +132,7 @@ impl DuckDbConnectionPool {
             queue_mode: QueueMode::Fifo,
         };
 
-        let pool = Pool::builder(manager)
-            .config(pool_config)
-            .build()?;
+        let pool = Pool::builder(manager).config(pool_config).build()?;
 
         // Pre-populate the pool by holding connections simultaneously, then
         // releasing them all at once.  Acquiring one at a time and immediately
@@ -155,10 +162,17 @@ impl DuckDbConnectionPool {
 
     /// Get a connection from the pool.
     pub async fn acquire(&self) -> anyhow::Result<DuckDbPooledConnection> {
-        let permit = self.query_semaphore.clone().acquire_owned().await
+        let permit = self
+            .query_semaphore
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to acquire query permit: {}", e))?;
 
-        let conn = self.pool.get().await
+        let conn = self
+            .pool
+            .get()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))?;
 
         Ok(DuckDbPooledConnection {
@@ -169,7 +183,7 @@ impl DuckDbConnectionPool {
     }
 
     /// Execute a Substrait plan using a connection from the pool.
-    /// 
+    ///
     /// **Note**: This is a placeholder. Full Substrait execution requires integration
     /// with DuckDB's Substrait extension.
     pub async fn execute_substrait(
@@ -209,16 +223,16 @@ impl DuckDbPooledConnection {
     }
 
     /// Execute a raw SQL query.
-    pub fn execute(&mut self, sql: &str, params: &[&dyn duckdb::ToSql]) -> Result<usize, duckdb::Error> {
+    pub fn execute(
+        &mut self,
+        sql: &str,
+        params: &[&dyn duckdb::ToSql],
+    ) -> Result<usize, duckdb::Error> {
         self.as_conn_mut().execute(sql, params)
     }
 
     /// Prepare and execute a statement, returning rows that can be collected.
-    pub fn prepare_execute<T, F>(
-        &mut self,
-        sql: &str,
-        mapper: F,
-    ) -> Result<Vec<T>, duckdb::Error>
+    pub fn prepare_execute<T, F>(&mut self, sql: &str, mapper: F) -> Result<Vec<T>, duckdb::Error>
     where
         F: FnMut(&duckdb::Row) -> Result<T, duckdb::Error>,
     {
@@ -255,7 +269,7 @@ mod tests {
     async fn test_pool_creation() {
         let config = DuckDbPoolConfig::default();
         let pool = DuckDbConnectionPool::new(config).await.unwrap();
-        
+
         assert_eq!(pool.status().await.size, 4); // initial size
         assert_eq!(pool.config().max_size, 32);
     }
@@ -289,17 +303,17 @@ mod tests {
     async fn test_basic_query() {
         let config = DuckDbPoolConfig::default();
         let pool = DuckDbConnectionPool::new(config).await.unwrap();
-        
+
         let mut conn = pool.acquire().await.unwrap();
         conn.execute("CREATE TABLE numbers (id INTEGER, name TEXT)", &[])
             .unwrap();
         conn.execute("INSERT INTO numbers VALUES (1, 'one'), (2, 'two')", &[])
             .unwrap();
-        
-        let results: Vec<i32> = conn.prepare_execute("SELECT id FROM numbers ORDER BY id", |row| {
-            row.get(0)
-        }).unwrap();
-        
+
+        let results: Vec<i32> = conn
+            .prepare_execute("SELECT id FROM numbers ORDER BY id", |row| row.get(0))
+            .unwrap();
+
         assert_eq!(results, vec![1, 2]);
     }
 }

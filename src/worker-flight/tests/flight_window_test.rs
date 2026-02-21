@@ -10,7 +10,10 @@
 mod common;
 
 use common::{
-    assertions::{assert_flight_matches_reference, assert_flight_matches_reference_ordered, assert_flight_row_count},
+    assertions::{
+        assert_flight_matches_reference, assert_flight_matches_reference_ordered,
+        assert_flight_row_count,
+    },
     data::DataSeeder,
     harness::FlightTestHarness,
     init_tracing,

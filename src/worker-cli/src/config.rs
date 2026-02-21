@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use worker_cp::ControlPlaneConfig;
 use worker_storage::engine::duckdb::DuckDBConfig;
 
 /// Type alias proving `worker-cli` is wired to the control-plane API surface.
@@ -11,7 +12,7 @@ use worker_storage::engine::duckdb::DuckDBConfig;
 /// cleanly map into the generated client types.
 #[allow(dead_code)]
 pub type ControlPlaneClient =
-    worker_cp::proto::control_plane::control_plane_service_client::ControlPlaneServiceClient<
+    worker_proto::control_plane::control_plane_service_client::ControlPlaneServiceClient<
         tonic::transport::Channel,
     >;
 
@@ -46,6 +47,10 @@ pub struct LeibrixWorkerConfig {
     pub query_listen_addr: Option<SocketAddr>,
     pub tls: TlsConfig,
     pub duckdb: DuckDBConfig,
+    /// Capacity of the domain-level outgoing event channel (worker → CP).
+    pub cp_outgoing_capacity: usize,
+    /// Max concurrent `DataLoader::load_epoch` operations.
+    pub cp_max_concurrent_loads: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,6 +211,26 @@ pub struct RunArgs {
         long_help = "Override expected server name for TLS verification (optional).\n\nCan be provided via $LEIBRIX_TLS_SERVER_NAME."
     )]
     pub tls_server_name: Option<String>,
+
+    /// Outgoing CP event channel capacity.
+    #[arg(
+        long,
+        env = "LEIBRIX_CP_OUTGOING_CAPACITY",
+        default_value_t = 64usize,
+        value_parser = clap::value_parser!(usize),
+        help = "Outgoing CP channel capacity (default: 64)"
+    )]
+    pub cp_outgoing_capacity: usize,
+
+    /// Max concurrent epoch loads.
+    #[arg(
+        long,
+        env = "LEIBRIX_CP_MAX_CONCURRENT_LOADS",
+        default_value_t = 4usize,
+        value_parser = clap::value_parser!(usize),
+        help = "Max concurrent DataLoader::load_epoch operations (default: 4)"
+    )]
+    pub cp_max_concurrent_loads: usize,
 }
 
 impl LeibrixWorkerConfig {
@@ -213,6 +238,13 @@ impl LeibrixWorkerConfig {
         validate_non_empty("tenant-id", &args.tenant_id)?;
         validate_non_empty("worker-id", &args.worker_id)?;
         validate_non_empty("master-endpoint", &args.master_endpoint)?;
+
+        if args.cp_outgoing_capacity == 0 {
+            anyhow::bail!("cp-outgoing-capacity must be at least 1");
+        }
+        if args.cp_max_concurrent_loads == 0 {
+            anyhow::bail!("cp-max-concurrent-loads must be at least 1");
+        }
 
         // TLS: either all (ca/cert/key) are present, or none.
         let tls_any = args.tls_ca.is_some() || args.tls_cert.is_some() || args.tls_key.is_some();
@@ -252,7 +284,20 @@ impl LeibrixWorkerConfig {
                 server_name: args.tls_server_name,
             },
             duckdb,
+            cp_outgoing_capacity: args.cp_outgoing_capacity,
+            cp_max_concurrent_loads: args.cp_max_concurrent_loads,
         })
+    }
+
+    /// Build a [`ControlPlaneConfig`] from this runtime configuration.
+    pub fn cp_config(&self) -> ControlPlaneConfig {
+        ControlPlaneConfig {
+            master_addr: self.master_endpoint.clone(),
+            worker_id: self.worker_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            outgoing_channel_capacity: self.cp_outgoing_capacity,
+            ..ControlPlaneConfig::default()
+        }
     }
 }
 
@@ -348,4 +393,3 @@ mod tests {
         assert_eq!(cfg.duckdb.max_identifiers, 42);
     }
 }
-

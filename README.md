@@ -3,6 +3,11 @@
 
 **High-performance, memory-centric data plane for the Leibrix distributed acceleration layer.**
 
+## Support
+
+If this project is useful to your work, a GitHub star would mean a lot.
+It helps more people discover Leibrix Worker and motivates continued development.
+
 ## What is Leibrix Worker?
 
 Leibrix Worker is the Data Plane component of a distributed in-memory acceleration system for interactive analytics. It

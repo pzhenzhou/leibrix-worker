@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, Float64Array, StringArray, Date32Array};
+use arrow::array::{ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{NaiveDate, Datelike};
+use chrono::{Datelike, NaiveDate};
 use rand::Rng;
 
 use super::cluster::TestCluster;
@@ -81,10 +81,7 @@ impl DataDistribution {
 
     /// Get worker IDs that have data
     pub fn workers(&self) -> Vec<String> {
-        self.placements
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect()
+        self.placements.iter().map(|(id, _)| id.clone()).collect()
     }
 }
 
@@ -360,7 +357,10 @@ impl TestDataLoader {
                 spec.table_name, macro_body
             );
 
-            println!("    Registering macro on {}: scan_{}", worker_id, spec.table_name);
+            println!(
+                "    Registering macro on {}: scan_{}",
+                worker_id, spec.table_name
+            );
 
             self.cluster
                 .execute_query_on_worker(&worker_id, &macro_sql)
@@ -400,10 +400,14 @@ impl TestDataLoader {
                 .await;
 
             // Register with InMemoryMetadata so the planner knows distribution
-            let start_ms = epoch.start_date.and_hms_opt(0, 0, 0)
+            let start_ms = epoch
+                .start_date
+                .and_hms_opt(0, 0, 0)
                 .map(|dt| dt.and_utc().timestamp_millis() as u64)
                 .unwrap_or(0);
-            let end_ms = epoch.end_date.and_hms_opt(23, 59, 59)
+            let end_ms = epoch
+                .end_date
+                .and_hms_opt(23, 59, 59)
                 .map(|dt| dt.and_utc().timestamp_millis() as u64)
                 .unwrap_or(u64::MAX);
             let estimated_bytes = epoch.row_count as u64 * 100; // rough estimate
@@ -478,7 +482,7 @@ impl TestDataLoader {
             order_ids.push(i as i32);
             customer_ids.push((i % 100) as i32); // 100 customers
             amounts.push(rng.gen_range(10.0..1000.0));
-            
+
             // Generate dates in a range (e.g., last year)
             let day_offset = rng.gen_range(0..365);
             let base_date = chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
@@ -491,7 +495,10 @@ impl TestDataLoader {
         let customer_id_array = Arc::new(Int32Array::from(customer_ids));
         let amount_array = Arc::new(Float64Array::from(amounts));
         let date_array = Arc::new(Date32Array::from(
-            dates.iter().map(|d| d.num_days_from_ce() - 719163).collect::<Vec<i32>>() // Convert to days since Unix epoch
+            dates
+                .iter()
+                .map(|d| d.num_days_from_ce() - 719163)
+                .collect::<Vec<i32>>(), // Convert to days since Unix epoch
         ));
 
         // Create schema
@@ -505,13 +512,9 @@ impl TestDataLoader {
         // Create record batch
         let batch = RecordBatch::try_new(
             schema,
-            vec![
-                order_id_array,
-                customer_id_array,
-                amount_array,
-                date_array,
-            ],
-        ).expect("Failed to create record batch");
+            vec![order_id_array, customer_id_array, amount_array, date_array],
+        )
+        .expect("Failed to create record batch");
 
         vec![batch]
     }
@@ -541,14 +544,8 @@ impl TestDataLoader {
         ]));
 
         // Create record batch
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                customer_id_array,
-                name_array,
-                city_array,
-            ],
-        ).expect("Failed to create record batch");
+        let batch = RecordBatch::try_new(schema, vec![customer_id_array, name_array, city_array])
+            .expect("Failed to create record batch");
 
         vec![batch]
     }
@@ -584,19 +581,18 @@ impl TestDataLoader {
         // Create record batch
         let batch = RecordBatch::try_new(
             schema,
-            vec![
-                product_id_array,
-                name_array,
-                category_array,
-                price_array,
-            ],
-        ).expect("Failed to create record batch");
+            vec![product_id_array, name_array, category_array, price_array],
+        )
+        .expect("Failed to create record batch");
 
         vec![batch]
     }
 
     /// Load orders data distributed across all workers in the cluster.
-    pub async fn load_orders_distributed(&self, orders: Vec<RecordBatch>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_orders_distributed(
+        &self,
+        orders: Vec<RecordBatch>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let worker_ids = self.cluster.worker_ids();
         if worker_ids.is_empty() {
             return Err("No workers in cluster".into());
@@ -605,17 +601,18 @@ impl TestDataLoader {
         // Distribute batches across workers in round-robin fashion
         for (i, batch) in orders.iter().enumerate() {
             let worker_id = &worker_ids[i % worker_ids.len()];
-            
+
             // Create table if it doesn't exist
             self.cluster.execute_query_on_worker(
                 worker_id,
                 "CREATE TABLE IF NOT EXISTS orders (order_id INTEGER, customer_id INTEGER, amount DOUBLE, order_date DATE)"
             ).await?;
-            
+
             // Insert the batch data
             // Note: For simplicity, we're using DuckDB's insert mechanism
             // In a real scenario, this would involve more sophisticated batch loading
-            self.insert_batch_to_worker(worker_id, "orders", batch).await?;
+            self.insert_batch_to_worker(worker_id, "orders", batch)
+                .await?;
         }
 
         Ok(())
@@ -625,9 +622,14 @@ impl TestDataLoader {
     pub async fn load_customers_on_worker(
         &self,
         worker_id: &str,
-        customers: Vec<RecordBatch>
+        customers: Vec<RecordBatch>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.cluster.worker_ids().iter().any(|w| w.as_ref() == worker_id) {
+        if !self
+            .cluster
+            .worker_ids()
+            .iter()
+            .any(|w| w.as_ref() == worker_id)
+        {
             return Err(format!("Worker {} not found in cluster", worker_id).into());
         }
 
@@ -637,16 +639,20 @@ impl TestDataLoader {
                 worker_id,
                 "CREATE TABLE IF NOT EXISTS customers (customer_id INTEGER, customer_name VARCHAR, city VARCHAR)"
             ).await?;
-            
+
             // Insert the batch data
-            self.insert_batch_to_worker(worker_id, "customers", batch).await?;
+            self.insert_batch_to_worker(worker_id, "customers", batch)
+                .await?;
         }
 
         Ok(())
     }
 
     /// Load products data distributed across all workers in the cluster.
-    pub async fn load_products_distributed(&self, products: Vec<RecordBatch>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_products_distributed(
+        &self,
+        products: Vec<RecordBatch>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let worker_ids = self.cluster.worker_ids();
         if worker_ids.is_empty() {
             return Err("No workers in cluster".into());
@@ -655,15 +661,16 @@ impl TestDataLoader {
         // Distribute batches across workers in round-robin fashion
         for (i, batch) in products.iter().enumerate() {
             let worker_id = &worker_ids[i % worker_ids.len()];
-            
+
             // Create table if it doesn't exist
             self.cluster.execute_query_on_worker(
                 worker_id,
                 "CREATE TABLE IF NOT EXISTS products (product_id INTEGER, product_name VARCHAR, category VARCHAR, price DOUBLE)"
             ).await?;
-            
+
             // Insert the batch data
-            self.insert_batch_to_worker(worker_id, "products", batch).await?;
+            self.insert_batch_to_worker(worker_id, "products", batch)
+                .await?;
         }
 
         Ok(())
@@ -681,74 +688,88 @@ impl TestDataLoader {
         // In a real scenario, we'd use bulk insert mechanisms
         for row_idx in 0..batch.num_rows() {
             let mut values = Vec::new();
-            
+
             for col_idx in 0..batch.num_columns() {
                 let col = batch.column(col_idx);
                 let value = self.format_column_value(col, row_idx)?;
                 values.push(value);
             }
-            
+
             let values_str = values.join(", ");
             let sql = format!("INSERT INTO {} VALUES ({})", table_name, values_str);
-            
-            self.cluster.execute_query_on_worker(worker_id, &sql).await?;
+
+            self.cluster
+                .execute_query_on_worker(worker_id, &sql)
+                .await?;
         }
-        
+
         Ok(())
     }
 
     /// Format a column value for SQL insertion.
-    fn format_column_value(&self, array: &ArrayRef, index: usize) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    fn format_column_value(
+        &self,
+        array: &ArrayRef,
+        index: usize,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use arrow::array::*;
-        
+
         match array.data_type() {
             DataType::Int32 => {
                 let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
                 Ok(arr.value(index).to_string())
-            },
+            }
             DataType::Int64 => {
                 let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
                 Ok(arr.value(index).to_string())
-            },
+            }
             DataType::Float64 => {
                 let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
                 Ok(arr.value(index).to_string())
-            },
+            }
             DataType::Utf8 => {
                 let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
                 Ok(format!("'{}'", arr.value(index)))
-            },
+            }
             DataType::Date32 => {
                 let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
                 let days = arr.value(index);
-                let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
-                    .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from("Invalid date"))?;
+                let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163).ok_or_else(
+                    || Box::<dyn std::error::Error + Send + Sync>::from("Invalid date"),
+                )?;
                 Ok(format!("DATE '{}'", date))
-            },
+            }
             _ => Err(format!("Unsupported data type: {:?}", array.data_type()).into()),
         }
     }
 
     /// Generate and load standard test data into the cluster.
     /// This creates orders and customers tables distributed appropriately.
-    pub async fn load_standard_test_data(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_standard_test_data(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("Loading standard test data...");
-        
+
         // Generate orders data (distributed across workers)
         let orders = Self::generate_orders(1000);
         self.load_orders_distributed(orders).await?;
         println!("Loaded orders data (1000 records) distributed across workers");
-        
+
         // Generate customers data (could be replicated or on specific workers)
         let customers = Self::generate_customers(100);
-        // Load customers on first worker for simplicity (in real test scenarios, 
+        // Load customers on first worker for simplicity (in real test scenarios,
         // you might want to replicate this table across all workers for broadcast joins)
         let worker_ids = self.cluster.worker_ids();
-        let first_worker = worker_ids.first()
-            .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from("No workers available"))?;
-        self.load_customers_on_worker(first_worker.as_ref(), customers).await?;
-        println!("Loaded customers data (100 records) on worker {}", first_worker);
-        
+        let first_worker = worker_ids.first().ok_or_else(|| {
+            Box::<dyn std::error::Error + Send + Sync>::from("No workers available")
+        })?;
+        self.load_customers_on_worker(first_worker.as_ref(), customers)
+            .await?;
+        println!(
+            "Loaded customers data (100 records) on worker {}",
+            first_worker
+        );
+
         Ok(())
     }
 }
@@ -762,7 +783,7 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].num_rows(), 5);
         assert_eq!(orders[0].num_columns(), 4);
-        
+
         // Check schema
         let schema = orders[0].schema();
         assert_eq!(schema.field(0).name(), "order_id");
@@ -777,7 +798,7 @@ mod tests {
         assert_eq!(customers.len(), 1);
         assert_eq!(customers[0].num_rows(), 3);
         assert_eq!(customers[0].num_columns(), 3);
-        
+
         // Check schema
         let schema = customers[0].schema();
         assert_eq!(schema.field(0).name(), "customer_id");

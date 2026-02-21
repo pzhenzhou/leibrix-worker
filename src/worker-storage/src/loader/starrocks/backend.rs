@@ -21,9 +21,8 @@ impl SourceAdapter for StarRocksBackend {
         &self,
         source: Arc<DataSource>,
         schema: Arc<Schema>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<RecordBatchStream, StorageError>> + Send>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<RecordBatchStream, StorageError>> + Send>>
+    {
         match self {
             StarRocksBackend::Adbc(client) => client.stream_data(source, schema),
             StarRocksBackend::Jdbc(client) => client.stream_data(source, schema),

@@ -7,10 +7,10 @@
 //! - Cross-table predicates in JOINs
 //! - Conservative extraction for semantic parity
 
-use std::collections::HashMap;
 use sqlparser::ast::*;
+use std::collections::HashMap;
 
-use super::interval::{Interval, DateBound};
+use super::interval::{DateBound, Interval};
 use super::types::TableReference;
 
 /// Analyzes Boolean expressions to extract date intervals per table.
@@ -45,11 +45,7 @@ impl BooleanExprAnalyzer {
                 continue;
             }
 
-            let interval = self.analyze_for_table(
-                expr,
-                table.effective_name(),
-                time_col.unwrap(),
-            );
+            let interval = self.analyze_for_table(expr, table.effective_name(), time_col.unwrap());
 
             intervals.insert(table.dataset_id.clone(), interval);
         }
@@ -61,12 +57,7 @@ impl BooleanExprAnalyzer {
     ///
     /// Returns an Interval that conservatively bounds the dates this table needs.
     /// Uses interval algebra to handle AND (∩) and OR (∪) correctly.
-    fn analyze_for_table(
-        &self,
-        expr: &Expr,
-        table_name: &str,
-        time_col: &str,
-    ) -> Interval {
+    fn analyze_for_table(&self, expr: &Expr, table_name: &str, time_col: &str) -> Interval {
         match expr {
             // AND: Intersection (tightening)
             Expr::BinaryOp {
@@ -109,10 +100,9 @@ impl BooleanExprAnalyzer {
                 negated: false,
             } => {
                 if self.is_time_column_ref(col_expr, table_name, time_col) {
-                    if let (Some(start), Some(end)) = (
-                        self.extract_date_bound(low),
-                        self.extract_date_bound(high),
-                    ) {
+                    if let (Some(start), Some(end)) =
+                        (self.extract_date_bound(low), self.extract_date_bound(high))
+                    {
                         // BETWEEN is inclusive, add one day to end
                         let exclusive_end = self.add_one_day(&end);
                         return Interval::from_bounds(Some(start), Some(exclusive_end));
@@ -315,16 +305,21 @@ mod tests {
     #[test]
     fn test_simple_and() {
         let analyzer = setup();
-        let expr = extract_where_clause(
-            "SELECT * FROM t WHERE dt >= '2025-01-01' AND dt < '2025-02-01'",
-        );
+        let expr =
+            extract_where_clause("SELECT * FROM t WHERE dt >= '2025-01-01' AND dt < '2025-02-01'");
 
         let tables = vec![make_table_ref("sales_data", None)];
         let intervals = analyzer.extract_intervals(&expr, &tables);
 
         let interval = intervals.get("sales_data").unwrap();
-        assert_eq!(interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-01".to_string()));
-        assert_eq!(interval.end.as_ref().unwrap(), &DateBound::Literal("2025-02-01".to_string()));
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-01".to_string())
+        );
+        assert_eq!(
+            interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-02-01".to_string())
+        );
     }
 
     #[test]
@@ -340,24 +335,35 @@ mod tests {
 
         let interval = intervals.get("sales_data").unwrap();
         // Should take max of starts: '2025-01-15'
-        assert_eq!(interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-15".to_string()));
-        assert_eq!(interval.end.as_ref().unwrap(), &DateBound::Literal("2025-02-01".to_string()));
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-15".to_string())
+        );
+        assert_eq!(
+            interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-02-01".to_string())
+        );
     }
 
     #[test]
     fn test_simple_or() {
         let analyzer = setup();
-        let expr = extract_where_clause(
-            "SELECT * FROM t WHERE dt = '2025-01-01' OR dt = '2025-01-15'",
-        );
+        let expr =
+            extract_where_clause("SELECT * FROM t WHERE dt = '2025-01-01' OR dt = '2025-01-15'");
 
         let tables = vec![make_table_ref("sales_data", None)];
         let intervals = analyzer.extract_intervals(&expr, &tables);
 
         let interval = intervals.get("sales_data").unwrap();
         // Should union: ['2025-01-01', '2025-01-16') (covers both dates)
-        assert_eq!(interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-01".to_string()));
-        assert_eq!(interval.end.as_ref().unwrap(), &DateBound::Literal("2025-01-16".to_string()));
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-01".to_string())
+        );
+        assert_eq!(
+            interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-16".to_string())
+        );
     }
 
     #[test]
@@ -376,12 +382,18 @@ mod tests {
 
         // Each table should extract only its own predicate
         let sales_interval = intervals.get("sales_data").unwrap();
-        assert_eq!(sales_interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-01".to_string()));
+        assert_eq!(
+            sales_interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-01".to_string())
+        );
         assert!(sales_interval.end.is_none()); // Unbounded above
 
         let customer_interval = intervals.get("customer_data").unwrap();
         assert!(customer_interval.start.is_none()); // Unbounded below
-        assert_eq!(customer_interval.end.as_ref().unwrap(), &DateBound::Literal("2025-06-01".to_string()));
+        assert_eq!(
+            customer_interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-06-01".to_string())
+        );
     }
 
     #[test]
@@ -421,24 +433,35 @@ mod tests {
         let interval = intervals.get("sales_data").unwrap();
         // Union of [2025-01-01, 2025-01-31) and [2025-06-01, 2025-06-30)
         // Should be [2025-01-01, 2025-06-30) (covers both, plus gap in between)
-        assert_eq!(interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-01".to_string()));
-        assert_eq!(interval.end.as_ref().unwrap(), &DateBound::Literal("2025-06-30".to_string()));
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-01".to_string())
+        );
+        assert_eq!(
+            interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-06-30".to_string())
+        );
     }
 
     #[test]
     fn test_between() {
         let analyzer = setup();
-        let expr = extract_where_clause(
-            "SELECT * FROM t WHERE dt BETWEEN '2025-01-01' AND '2025-01-31'",
-        );
+        let expr =
+            extract_where_clause("SELECT * FROM t WHERE dt BETWEEN '2025-01-01' AND '2025-01-31'");
 
         let tables = vec![make_table_ref("sales_data", None)];
         let intervals = analyzer.extract_intervals(&expr, &tables);
 
         let interval = intervals.get("sales_data").unwrap();
         // BETWEEN is inclusive, should convert to [2025-01-01, 2025-02-01)
-        assert_eq!(interval.start.as_ref().unwrap(), &DateBound::Literal("2025-01-01".to_string()));
-        assert_eq!(interval.end.as_ref().unwrap(), &DateBound::Literal("2025-02-01".to_string()));
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-01".to_string())
+        );
+        assert_eq!(
+            interval.end.as_ref().unwrap(),
+            &DateBound::Literal("2025-02-01".to_string())
+        );
     }
 
     #[test]
@@ -457,9 +480,8 @@ mod tests {
     fn test_contradictory_predicates() {
         // WHERE dt > '2025-12-31' AND dt < '2025-01-01'
         let analyzer = setup();
-        let expr = extract_where_clause(
-            "SELECT * FROM t WHERE dt > '2025-12-31' AND dt < '2025-01-01'",
-        );
+        let expr =
+            extract_where_clause("SELECT * FROM t WHERE dt > '2025-12-31' AND dt < '2025-01-01'");
 
         let tables = vec![make_table_ref("sales_data", None)];
         let intervals = analyzer.extract_intervals(&expr, &tables);
@@ -468,4 +490,3 @@ mod tests {
         assert!(interval.is_empty()); // Contradiction → empty interval
     }
 }
-

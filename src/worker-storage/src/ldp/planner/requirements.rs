@@ -168,7 +168,9 @@ pub fn unsatisfied_requirements<'a>(
 mod tests {
     use super::*;
     use crate::sql::logical_plan::ColumnRef;
-    use sqlparser::ast::{Expr, Ident, ObjectName, ObjectNamePart, SetOperator, SetQuantifier, TableFactor};
+    use sqlparser::ast::{
+        Expr, Ident, ObjectName, ObjectNamePart, SetOperator, SetQuantifier, TableFactor,
+    };
 
     fn create_scan(table: &str) -> LogicalPlan {
         LogicalPlan::Scan {
@@ -203,7 +205,10 @@ mod tests {
             alias: "__exchange_0".to_string(),
         };
         let reqs = get_logical_plan_requirements(&exchange_read);
-        assert!(reqs.is_empty(), "ExchangeRead should have no input requirements");
+        assert!(
+            reqs.is_empty(),
+            "ExchangeRead should have no input requirements"
+        );
     }
 
     #[test]
@@ -373,7 +378,11 @@ mod tests {
     fn test_subquery_scan_requirements() {
         let subquery = LogicalPlan::SubqueryScan {
             input: Box::new(create_scan("test")),
-            alias: sqlparser::ast::TableAlias { name: Ident::new("sub"), columns: vec![], explicit: false },
+            alias: sqlparser::ast::TableAlias {
+                name: Ident::new("sub"),
+                columns: vec![],
+                explicit: false,
+            },
         };
 
         let reqs = get_logical_plan_requirements(&subquery);

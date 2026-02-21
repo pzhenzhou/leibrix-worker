@@ -29,7 +29,10 @@ async fn test_get_table_schema_nonexistent_table() {
     let fixture = QueryEngineTestFixture::new("schema_dataset", "epoch_001", 100).await;
 
     // Act & Assert
-    let result = fixture.query_engine.get_table_schema("nonexistent_table").await;
+    let result = fixture
+        .query_engine
+        .get_table_schema("nonexistent_table")
+        .await;
     assert_table_not_found(result);
 }
 
@@ -39,7 +42,10 @@ async fn test_get_table_schema_special_characters() {
     let fixture = QueryEngineTestFixture::new("dataset_with_underscores", "epoch_v1_0", 100).await;
 
     // Act
-    let result = fixture.query_engine.get_table_schema(&fixture.table_name).await;
+    let result = fixture
+        .query_engine
+        .get_table_schema(&fixture.table_name)
+        .await;
 
     // Assert
     assert!(
@@ -75,7 +81,10 @@ async fn test_get_table_metadata_nonexistent_table() {
     let fixture = QueryEngineTestFixture::new("metadata_dataset", "epoch_001", 100).await;
 
     // Act & Assert
-    let result = fixture.query_engine.get_table_metadata("nonexistent_table").await;
+    let result = fixture
+        .query_engine
+        .get_table_metadata("nonexistent_table")
+        .await;
     assert_table_not_found(result);
 }
 
@@ -170,7 +179,12 @@ async fn test_list_tables_multiple_epochs() {
         .expect("list_tables should succeed");
 
     // Assert
-    assert_eq!(tables.len(), epoch_count, "Should have exactly {} tables", epoch_count);
+    assert_eq!(
+        tables.len(),
+        epoch_count,
+        "Should have exactly {} tables",
+        epoch_count
+    );
     assert_tables_have_prefix(&tables, &fixture.dataset_id);
 }
 
@@ -180,22 +194,28 @@ async fn test_list_tables_empty_dataset() {
     let fixture = QueryEngineTestFixture::new("existing_dataset", "epoch_001", 100).await;
 
     // Act: Query for a dataset that doesn't exist
-    let result = fixture.query_engine.list_tables("nonexistent_dataset").await;
+    let result = fixture
+        .query_engine
+        .list_tables("nonexistent_dataset")
+        .await;
 
     // Assert
-    assert!(result.is_ok(), "list_tables should succeed even for empty dataset");
+    assert!(
+        result.is_ok(),
+        "list_tables should succeed even for empty dataset"
+    );
     let tables = result.unwrap();
-    assert_eq!(tables.len(), 0, "Should return empty list for non-existent dataset");
+    assert_eq!(
+        tables.len(),
+        0,
+        "Should return empty list for non-existent dataset"
+    );
 }
 
 #[tokio::test]
 async fn test_list_tables_isolation_between_datasets() {
     // Arrange: Create tables for two different datasets using MultiDatasetFixture
-    let fixture = MultiDatasetFixture::new(
-        vec![("dataset_a", 3), ("dataset_b", 2)],
-        100,
-    )
-    .await;
+    let fixture = MultiDatasetFixture::new(vec![("dataset_a", 3), ("dataset_b", 2)], 100).await;
 
     // Act
     let tables_a = fixture.query_engine.list_tables("dataset_a").await.unwrap();

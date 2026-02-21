@@ -25,7 +25,11 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
-fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_orders_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut o_orderkeys = Vec::with_capacity(row_count);
     let mut o_custkeys = Vec::with_capacity(row_count);
     let mut o_totalprice = Vec::with_capacity(row_count);
@@ -39,12 +43,17 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
         o_orderkeys.push(i as i64);
         o_custkeys.push((i % 20) as i32); // 20 customers for better partition testing
         o_totalprice.push(1000.0 + (i % 100) as f64 * 1000.0);
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let order_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         o_orderdate.push(days_since_epoch as i32);
-        
+
         o_orderstatus.push(statuses[i % 3].to_string());
     }
 
@@ -65,10 +74,15 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
             Arc::new(Date32Array::from(o_orderdate)),
             Arc::new(StringArray::from(o_orderstatus)),
         ],
-    ).unwrap()]
+    )
+    .unwrap()]
 }
 
-fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_lineitem_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut l_orderkeys = Vec::with_capacity(row_count);
     let mut l_partkey = Vec::with_capacity(row_count);
     let mut l_quantity = Vec::with_capacity(row_count);
@@ -82,10 +96,15 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
         l_partkey.push((i % 50) as i32); // 50 parts for better partition testing
         l_quantity.push((i % 50 + 1) as i32);
         l_extendedprice.push(100.0 + (i % 100) as f64 * 10.0);
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let ship_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         l_shipdate.push(days_since_epoch as i32);
     }
 
@@ -106,7 +125,8 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
             Arc::new(Float64Array::from(l_extendedprice)),
             Arc::new(Date32Array::from(l_shipdate)),
         ],
-    ).unwrap()]
+    )
+    .unwrap()]
 }
 
 async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
@@ -126,7 +146,9 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
     let orders_spec = TableLoadSpec::new("orders", "ds_orders", "o_orderdate")
         .with_epoch("e1", date(2024, 1, 1), date(2024, 2, 15), "w1", 300)
         .with_epoch("e2", date(2024, 2, 16), date(2024, 3, 31), "w2", 300);
-    data_loader.load_table_with_epochs(&orders_spec, generate_orders_data).await
+    data_loader
+        .load_table_with_epochs(&orders_spec, generate_orders_data)
+        .await
         .map_err(|e| anyhow!("{}", e))?;
 
     // Load lineitem data
@@ -134,19 +156,27 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
         .with_epoch("e1", date(2024, 1, 1), date(2024, 1, 31), "w1", 400)
         .with_epoch("e2", date(2024, 2, 1), date(2024, 2, 29), "w2", 400)
         .with_epoch("e3", date(2024, 3, 1), date(2024, 3, 31), "w3", 400);
-    data_loader.load_table_with_epochs(&lineitem_spec, generate_lineitem_data).await
+    data_loader
+        .load_table_with_epochs(&lineitem_spec, generate_lineitem_data)
+        .await
         .map_err(|e| anyhow!("{}", e))?;
 
     // Register datasets
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "orders".to_string(),
-        "o_orderdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "orders".to_string(),
+            "o_orderdate".to_string(),
+        ))
+        .await;
 
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "lineitem".to_string(),
-        "l_shipdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "lineitem".to_string(),
+            "l_shipdate".to_string(),
+        ))
+        .await;
 
     Ok(cluster)
 }
@@ -172,13 +202,13 @@ async fn test_row_number_window_function() {
     println!("Executing ROW_NUMBER():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     let row_count = TestVerifier::count_total_rows(&result);
     assert!(row_count <= 20, "Should respect LIMIT 20");
-    
+
     println!("✓ ROW_NUMBER() executed successfully: {} rows", row_count);
 }
 
@@ -206,10 +236,10 @@ async fn test_row_number_with_partition_by() {
     println!("Executing ROW_NUMBER() with PARTITION BY:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ ROW_NUMBER() with PARTITION BY executed successfully");
 }
 
@@ -234,10 +264,10 @@ async fn test_rank_window_function() {
     println!("Executing RANK():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ RANK() executed successfully");
 }
 
@@ -265,10 +295,10 @@ async fn test_dense_rank_window_function() {
     println!("Executing DENSE_RANK():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ DENSE_RANK() executed successfully");
 }
 
@@ -296,10 +326,10 @@ async fn test_aggregate_window_sum() {
     println!("Executing SUM() window function:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ SUM() window function executed successfully");
 }
 
@@ -326,10 +356,10 @@ async fn test_aggregate_window_avg() {
     println!("Executing AVG() window function:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ AVG() window function executed successfully");
 }
 
@@ -353,10 +383,10 @@ async fn test_aggregate_window_count() {
     println!("Executing COUNT() window function:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ COUNT() window function executed successfully");
 }
 
@@ -388,10 +418,10 @@ async fn test_window_function_with_filter() {
     println!("Executing window function with filter:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ Window function with filter executed successfully");
 }
 
@@ -426,10 +456,10 @@ async fn test_multiple_window_functions() {
     println!("Executing multiple window functions:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 6, "Should have 6 columns");
-    
+
     println!("✓ Multiple window functions executed successfully");
 }
 
@@ -458,10 +488,10 @@ async fn test_window_function_on_lineitem() {
     println!("Executing window function on lineitem:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 5, "Should have 5 columns");
-    
+
     println!("✓ Window function on lineitem executed successfully");
 }
 
@@ -501,10 +531,10 @@ async fn test_window_function_with_join() {
     println!("Executing window function with join:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 5, "Should have 5 columns");
-    
+
     println!("✓ Window function with join executed successfully");
 }
 
@@ -529,10 +559,10 @@ async fn test_ntile_window_function() {
     println!("Executing NTILE():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 4, "Should have 4 columns");
-    
+
     println!("✓ NTILE() executed successfully");
 }
 
@@ -564,10 +594,10 @@ async fn test_lag_lead_window_functions() {
     println!("Executing LAG() and LEAD():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 5, "Should have 5 columns");
-    
+
     println!("✓ LAG() and LEAD() executed successfully");
 }
 
@@ -600,9 +630,9 @@ async fn test_first_value_last_value() {
     println!("Executing FIRST_VALUE() and LAST_VALUE():\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 5, "Should have 5 columns");
-    
+
     println!("✓ FIRST_VALUE() and LAST_VALUE() executed successfully");
 }

@@ -156,8 +156,9 @@ impl LogicalPlan {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Window { input, .. }
             | LogicalPlan::SubqueryScan { input, .. } => vec![input.as_ref()],
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
         }
     }
 
@@ -172,8 +173,9 @@ impl LogicalPlan {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Window { input, .. }
             | LogicalPlan::SubqueryScan { input, .. } => vec![input.as_mut()],
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::SetOp { left, right, .. } => vec![left.as_mut(), right.as_mut()],
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+                vec![left.as_mut(), right.as_mut()]
+            }
         }
     }
 

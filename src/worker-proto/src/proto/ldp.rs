@@ -2,8 +2,7 @@
 /// Describes how data is distributed across workers.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct Distribution {
     #[prost(oneof = "distribution::DistributionType", tags = "1, 2, 3, 4")]
     pub distribution_type: ::core::option::Option<distribution::DistributionType>,
@@ -12,8 +11,7 @@ pub struct Distribution {
 pub mod distribution {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Oneof)]
     pub enum DistributionType {
         #[prost(message, tag = "1")]
         Singleton(super::SingletonDistribution),
@@ -27,16 +25,14 @@ pub mod distribution {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct SingletonDistribution {
     #[prost(string, tag = "1")]
     pub worker_id: ::prost::alloc::string::String,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct HashPartitionedDistribution {
     /// Column references for partition keys
     #[prost(message, repeated, tag = "1")]
@@ -46,16 +42,14 @@ pub struct HashPartitionedDistribution {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct EpochPartitionedDistribution {
     #[prost(string, repeated, tag = "1")]
     pub worker_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ReplicatedDistribution {
     #[prost(string, repeated, tag = "1")]
     pub worker_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
@@ -63,8 +57,7 @@ pub struct ReplicatedDistribution {
 /// Reference to a column (qualified or unqualified).
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ColumnRef {
     /// Optional table qualifier (e.g., "orders", "o")
     #[prost(string, optional, tag = "1")]
@@ -76,8 +69,7 @@ pub struct ColumnRef {
 /// Defines how data moves between stages.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct Exchange {
     #[prost(oneof = "exchange::ExchangeType", tags = "1, 2, 3")]
     pub exchange_type: ::core::option::Option<exchange::ExchangeType>,
@@ -86,8 +78,7 @@ pub struct Exchange {
 pub mod exchange {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Oneof)]
     pub enum ExchangeType {
         #[prost(message, tag = "1")]
         Gather(super::GatherExchange),
@@ -99,24 +90,21 @@ pub mod exchange {
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct GatherExchange {
     #[prost(string, tag = "1")]
     pub target_worker_id: ::prost::alloc::string::String,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct BroadcastExchange {
     #[prost(string, repeated, tag = "1")]
     pub target_worker_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct HashPartitionExchange {
     #[prost(message, repeated, tag = "1")]
     pub column_refs: ::prost::alloc::vec::Vec<ColumnRef>,
@@ -126,8 +114,7 @@ pub struct HashPartitionExchange {
 /// Describes how a stage receives its input data.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct StageInput {
     #[prost(oneof = "stage_input::InputType", tags = "1, 2")]
     pub input_type: ::core::option::Option<stage_input::InputType>,
@@ -136,8 +123,7 @@ pub struct StageInput {
 pub mod stage_input {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Oneof)]
     pub enum InputType {
         #[prost(message, tag = "1")]
         LocalCatalog(super::LocalCatalogInput),
@@ -148,13 +134,11 @@ pub mod stage_input {
 /// Empty - indicates reading from local DuckDB catalog
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct LocalCatalogInput {}
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ExchangeInput {
     #[prost(uint32, tag = "1")]
     pub exchange_id: u32,
@@ -165,8 +149,7 @@ pub struct ExchangeInput {
 /// Describes the output format of a stage.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct StageOutput {
     #[prost(oneof = "stage_output::OutputType", tags = "1, 2")]
     pub output_type: ::core::option::Option<stage_output::OutputType>,
@@ -175,8 +158,7 @@ pub struct StageOutput {
 pub mod stage_output {
     #[allow(non_camel_case_types)]
     #[allow(clippy::large_enum_variant)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Oneof)]
     pub enum OutputType {
         #[prost(message, tag = "1")]
         Stream(super::StreamOutput),
@@ -187,13 +169,11 @@ pub mod stage_output {
 /// Empty - single Arrow stream
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StreamOutput {}
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct PartitionedOutput {
     #[prost(uint32, tag = "1")]
     pub partitions: u32,
@@ -204,8 +184,7 @@ pub struct PartitionedOutput {
 /// Resource limits for stage execution.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StageLimits {
     #[prost(uint64, tag = "1")]
     pub max_bytes_output: u64,
@@ -219,8 +198,7 @@ pub struct StageLimits {
 /// A single execution stage in the LDP plan.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct Stage {
     #[prost(uint32, tag = "1")]
     pub stage_id: u32,
@@ -239,8 +217,7 @@ pub struct Stage {
 /// Represents data flow between two stages via an exchange.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ExchangeEdge {
     #[prost(uint32, tag = "1")]
     pub exchange_id: u32,
@@ -257,8 +234,7 @@ pub struct ExchangeEdge {
 /// The complete Leibrix Distributed Plan for a query.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct LdpPlan {
     #[prost(string, tag = "1")]
     pub query_id: ::prost::alloc::string::String,
@@ -272,8 +248,7 @@ pub struct LdpPlan {
 /// Request to execute a stage on a worker.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct SubmitStageRequest {
     #[prost(string, tag = "1")]
     pub tenant_id: ::prost::alloc::string::String,
@@ -293,8 +268,7 @@ pub struct SubmitStageRequest {
 /// Information about an exchange input that needs to be registered.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct ExchangeInputRegistration {
     /// Table name to register as (e.g., "__exchange_0")
     #[prost(string, tag = "1")]
@@ -306,8 +280,7 @@ pub struct ExchangeInputRegistration {
 /// Response from stage execution.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct SubmitStageResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
@@ -323,8 +296,7 @@ pub struct SubmitStageResponse {
 /// Execution statistics for a stage.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StageExecutionStats {
     #[prost(uint64, tag = "1")]
     pub rows_produced: u64,
@@ -336,8 +308,7 @@ pub struct StageExecutionStats {
 /// Configuration for the LDP planner's cost-based decisions.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, ::prost::Message)]
 pub struct PlannerPolicy {
     /// Max bytes for broadcast exchange (default: 256MB)
     #[prost(uint64, tag = "1")]
@@ -358,8 +329,7 @@ pub struct PlannerPolicy {
 /// Statistics for an epoch, used for cost estimation.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct EpochStats {
     #[prost(uint64, tag = "1")]
     pub rows: u64,

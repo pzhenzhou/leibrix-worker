@@ -3,10 +3,10 @@
 //! This module provides facilities to track and collect metrics during
 //! LDP execution, including exchange operations, stage execution, and query performance.
 
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use dashmap::DashMap;
-use tracing::{info, warn, debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::ldp::{ExchangeId, StageId, WorkerId};
 use arrow::datatypes::SchemaRef;
@@ -16,40 +16,40 @@ use arrow::datatypes::SchemaRef;
 pub struct BroadcastExchangeMetrics {
     /// Exchange identifier.
     pub exchange_id: ExchangeId,
-    
+
     /// Query identifier.
     pub query_id: String,
-    
+
     /// Source worker that broadcasts the data.
     pub source_worker: WorkerId,
-    
+
     /// Target workers that receive the broadcasted data.
     pub target_workers: Vec<WorkerId>,
-    
+
     /// Number of rows broadcasted.
     pub rows_broadcasted: u64,
-    
+
     /// Number of bytes broadcasted.
     pub bytes_broadcasted: u64,
-    
+
     /// Number of target workers (replication factor).
     pub replication_factor: usize,
-    
+
     /// Start time of the broadcast operation.
     pub start_time: std::time::Instant,
-    
+
     /// Duration of the broadcast operation.
     pub duration: Duration,
-    
+
     /// Throughput in bytes per second.
     pub throughput_bps: f64,
-    
+
     /// Whether the broadcast decision was optimal.
     pub is_optimal: bool,
-    
+
     /// Threshold that was used for broadcast decision.
     pub broadcast_threshold_bytes: u64,
-    
+
     /// Actual size compared to threshold (percentage).
     pub size_ratio_to_threshold: f64,
 }
@@ -85,12 +85,12 @@ impl BroadcastExchangeMetrics {
         self.rows_broadcasted = rows;
         self.bytes_broadcasted = bytes;
         self.replication_factor = self.target_workers.len();
-        
+
         // Calculate size ratio to threshold
         if self.broadcast_threshold_bytes > 0 {
             self.size_ratio_to_threshold = (bytes as f64) / (self.broadcast_threshold_bytes as f64);
         }
-        
+
         // Determine if broadcast was optimal (within safety margin)
         // If size is less than threshold, it's likely optimal
         self.is_optimal = bytes <= self.broadcast_threshold_bytes;
@@ -99,7 +99,7 @@ impl BroadcastExchangeMetrics {
     /// Finalize metrics calculation after broadcast completes.
     pub fn finalize(&mut self) {
         self.duration = self.start_time.elapsed();
-        
+
         // Calculate throughput (avoid division by zero)
         let duration_secs = self.duration.as_secs_f64();
         if duration_secs > 0.0 {
@@ -143,31 +143,31 @@ impl BroadcastExchangeMetrics {
 pub struct ExchangeMetrics {
     /// Exchange identifier.
     pub exchange_id: ExchangeId,
-    
+
     /// Query identifier.
     pub query_id: String,
-    
+
     /// Exchange type (Gather, Broadcast, HashPartition).
     pub exchange_type: String,
-    
+
     /// Source workers.
     pub source_workers: Vec<WorkerId>,
-    
+
     /// Target workers.
     pub target_workers: Vec<WorkerId>,
-    
+
     /// Bytes transferred.
     pub bytes_transferred: u64,
-    
+
     /// Rows transferred.
     pub rows_transferred: u64,
-    
+
     /// Start time of the exchange operation.
     pub start_time: std::time::Instant,
-    
+
     /// Duration of the exchange operation.
     pub duration: Duration,
-    
+
     /// Throughput in bytes per second.
     pub throughput_bps: f64,
 }
@@ -204,7 +204,7 @@ impl ExchangeMetrics {
     /// Finalize metrics calculation after exchange completes.
     pub fn finalize(&mut self) {
         self.duration = self.start_time.elapsed();
-        
+
         // Calculate throughput (avoid division by zero)
         let duration_secs = self.duration.as_secs_f64();
         if duration_secs > 0.0 {
@@ -236,7 +236,7 @@ impl ExchangeMetrics {
 pub struct ExchangeMetricsRegistry {
     /// Broadcast exchange metrics.
     broadcast_metrics: Arc<DashMap<String, BroadcastExchangeMetrics>>,
-    
+
     /// General exchange metrics.
     exchange_metrics: Arc<DashMap<String, ExchangeMetrics>>,
 }
@@ -295,10 +295,7 @@ impl ExchangeMetricsRegistry {
     }
 
     /// Get all exchange metrics for a query.
-    pub async fn get_query_exchange_metrics(
-        &self,
-        query_id: &str,
-    ) -> Vec<ExchangeMetrics> {
+    pub async fn get_query_exchange_metrics(&self, query_id: &str) -> Vec<ExchangeMetrics> {
         self.exchange_metrics
             .iter()
             .filter(|entry| entry.value().query_id == query_id)
@@ -308,8 +305,10 @@ impl ExchangeMetricsRegistry {
 
     /// Clear metrics for a completed query.
     pub async fn clear_query_metrics(&self, query_id: &str) {
-        self.broadcast_metrics.retain(|key, _| !key.starts_with(query_id));
-        self.exchange_metrics.retain(|key, _| !key.starts_with(query_id));
+        self.broadcast_metrics
+            .retain(|key, _| !key.starts_with(query_id));
+        self.exchange_metrics
+            .retain(|key, _| !key.starts_with(query_id));
     }
 }
 
@@ -324,60 +323,56 @@ impl Default for ExchangeMetricsRegistry {
 pub struct StageExecutionMetrics {
     /// Stage identifier.
     pub stage_id: StageId,
-    
+
     /// Query identifier.
     pub query_id: String,
-    
+
     /// Worker that executes this stage.
     pub worker_id: WorkerId,
-    
+
     /// Number of input rows to the stage.
     pub input_rows: u64,
-    
+
     /// Number of output rows from the stage.
     pub output_rows: u64,
-    
+
     /// Number of input bytes to the stage.
     pub input_bytes: u64,
-    
+
     /// Number of output bytes from the stage.
     pub output_bytes: u64,
-    
+
     /// Start time of stage execution.
     pub start_time: std::time::Instant,
-    
+
     /// Duration of stage execution.
     pub execution_duration: Duration,
-    
+
     /// Duration of stage submission (waiting time).
     pub submission_duration: Duration,
-    
+
     /// Peak memory usage during execution (in bytes).
     pub peak_memory_bytes: u64,
-    
+
     /// Number of input partitions processed.
     pub input_partitions: u32,
-    
+
     /// Number of output partitions created.
     pub output_partitions: u32,
-    
+
     /// Schema of the output.
     pub output_schema: Option<SchemaRef>,
-    
+
     /// Whether the stage execution was successful.
     pub success: bool,
-    
+
     /// Error message if execution failed.
     pub error_message: Option<String>,
 }
 
 impl StageExecutionMetrics {
     /// Create a new stage execution metrics instance.
-    pub fn new(
-        stage_id: StageId,
-        query_id: String,
-        worker_id: WorkerId,
-    ) -> Self {
+    pub fn new(stage_id: StageId, query_id: String, worker_id: WorkerId) -> Self {
         Self {
             stage_id,
             query_id,
@@ -406,7 +401,13 @@ impl StageExecutionMetrics {
     }
 
     /// Update output statistics.
-    pub fn update_output_stats(&mut self, rows: u64, bytes: u64, partitions: u32, schema: SchemaRef) {
+    pub fn update_output_stats(
+        &mut self,
+        rows: u64,
+        bytes: u64,
+        partitions: u32,
+        schema: SchemaRef,
+    ) {
         self.output_rows = rows;
         self.output_bytes = bytes;
         self.output_partitions = partitions;
@@ -483,43 +484,43 @@ impl StageExecutionMetrics {
 pub struct QueryExecutionMetrics {
     /// Query identifier.
     pub query_id: String,
-    
+
     /// Start time of query execution.
     pub start_time: std::time::Instant,
-    
+
     /// Total execution time.
     pub total_duration: Duration,
-    
+
     /// Number of stages in the query.
     pub stage_count: usize,
-    
+
     /// Number of stages completed successfully.
     pub successful_stages: usize,
-    
+
     /// Number of stages failed.
     pub failed_stages: usize,
-    
+
     /// Total rows processed across all stages.
     pub total_rows_processed: u64,
-    
+
     /// Total bytes processed across all stages.
     pub total_bytes_processed: u64,
-    
+
     /// Peak memory usage across all stages.
     pub peak_memory_bytes: u64,
-    
+
     /// Average stage execution time.
     pub avg_stage_duration: Duration,
-    
+
     /// Total time spent in exchange operations.
     pub exchange_time: Duration,
-    
+
     /// Total bytes transferred in exchanges.
     pub exchange_bytes: u64,
-    
+
     /// Whether the query execution was successful.
     pub success: bool,
-    
+
     /// Error message if query failed.
     pub error_message: Option<String>,
 }
@@ -546,7 +547,14 @@ impl QueryExecutionMetrics {
     }
 
     /// Update stage statistics.
-    pub fn update_stage_stats(&mut self, success: bool, rows: u64, bytes: u64, memory: u64, duration: Duration) {
+    pub fn update_stage_stats(
+        &mut self,
+        success: bool,
+        rows: u64,
+        bytes: u64,
+        memory: u64,
+        duration: Duration,
+    ) {
         self.stage_count += 1;
         if success {
             self.successful_stages += 1;
@@ -558,7 +566,7 @@ impl QueryExecutionMetrics {
         if memory > self.peak_memory_bytes {
             self.peak_memory_bytes = memory;
         }
-        
+
         // Recalculate average stage duration
         let total_completed = self.successful_stages + self.failed_stages;
         if total_completed > 0 {
@@ -626,34 +634,34 @@ impl QueryExecutionMetrics {
 pub struct SystemHealthMetrics {
     /// Worker identifier.
     pub worker_id: WorkerId,
-    
+
     /// Timestamp of metric collection.
     pub timestamp: std::time::Instant,
-    
+
     /// Memory usage (in bytes).
     pub memory_used_bytes: u64,
-    
+
     /// Memory capacity (in bytes).
     pub memory_capacity_bytes: u64,
-    
+
     /// CPU usage percentage.
     pub cpu_usage_percent: f64,
-    
+
     /// Number of active queries.
     pub active_queries: usize,
-    
+
     /// Number of active stages.
     pub active_stages: usize,
-    
+
     /// Disk space used (in bytes).
     pub disk_used_bytes: u64,
-    
+
     /// Disk space capacity (in bytes).
     pub disk_capacity_bytes: u64,
-    
+
     /// Network I/O in the last period (in bytes).
     pub network_io_bytes: u64,
-    
+
     /// Active connections.
     pub active_connections: usize,
 }
@@ -750,16 +758,16 @@ impl SystemHealthMetrics {
 pub struct LdpMetricsRegistry {
     /// Broadcast exchange metrics.
     broadcast_metrics: Arc<DashMap<String, BroadcastExchangeMetrics>>,
-    
+
     /// General exchange metrics.
     exchange_metrics: Arc<DashMap<String, ExchangeMetrics>>,
-    
+
     /// Stage execution metrics.
     stage_metrics: Arc<DashMap<String, StageExecutionMetrics>>,
-    
+
     /// Query execution metrics.
     query_metrics: Arc<DashMap<String, QueryExecutionMetrics>>,
-    
+
     /// System health metrics.
     health_metrics: Arc<DashMap<WorkerId, SystemHealthMetrics>>,
 }
@@ -789,7 +797,8 @@ impl LdpMetricsRegistry {
 
     /// Register system health metrics.
     pub async fn register_health_metrics(&self, metrics: SystemHealthMetrics) {
-        self.health_metrics.insert(metrics.worker_id.clone(), metrics);
+        self.health_metrics
+            .insert(metrics.worker_id.clone(), metrics);
     }
 
     /// Get stage metrics for a specific query and stage.
@@ -803,26 +812,19 @@ impl LdpMetricsRegistry {
     }
 
     /// Get query metrics for a specific query.
-    pub async fn get_query_metrics(
-        &self,
-        query_id: &str,
-    ) -> Option<QueryExecutionMetrics> {
+    pub async fn get_query_metrics(&self, query_id: &str) -> Option<QueryExecutionMetrics> {
         self.query_metrics.get(query_id).map(|v| v.clone())
     }
 
     /// Get system health metrics for a worker.
-    pub async fn get_health_metrics(
-        &self,
-        worker_id: &str,
-    ) -> Option<SystemHealthMetrics> {
-        self.health_metrics.get(&WorkerId::from(worker_id)).map(|v| v.clone())
+    pub async fn get_health_metrics(&self, worker_id: &str) -> Option<SystemHealthMetrics> {
+        self.health_metrics
+            .get(&WorkerId::from(worker_id))
+            .map(|v| v.clone())
     }
 
     /// Get all stage metrics for a query.
-    pub async fn get_query_stage_metrics(
-        &self,
-        query_id: &str,
-    ) -> Vec<StageExecutionMetrics> {
+    pub async fn get_query_stage_metrics(&self, query_id: &str) -> Vec<StageExecutionMetrics> {
         self.stage_metrics
             .iter()
             .filter(|entry| entry.value().query_id == query_id)
@@ -830,18 +832,17 @@ impl LdpMetricsRegistry {
             .collect()
     }
 
-
-
     /// Clear metrics for a completed query.
     pub async fn clear_query_metrics(&self, query_id: &str) {
         // Clear from all maps
-        self.stage_metrics.retain(|key, _| !key.starts_with(query_id));
+        self.stage_metrics
+            .retain(|key, _| !key.starts_with(query_id));
         self.query_metrics.retain(|key, _| key != query_id);
         // Call parent method for exchange metrics
         ExchangeMetricsRegistry::clear_query_metrics_from_maps(
-            &self.broadcast_metrics, 
-            &self.exchange_metrics, 
-            query_id
+            &self.broadcast_metrics,
+            &self.exchange_metrics,
+            query_id,
         );
     }
 }
@@ -857,16 +858,16 @@ impl Default for LdpMetricsRegistry {
 pub struct QuerySummary {
     /// Query identifier.
     pub query_id: String,
-    
+
     /// Stage execution metrics.
     pub stage_metrics: Vec<StageExecutionMetrics>,
-    
+
     /// Query execution metrics.
     pub query_metric: Option<QueryExecutionMetrics>,
-    
+
     /// Exchange metrics.
     pub exchange_metrics: Vec<ExchangeMetrics>,
-    
+
     /// Broadcast exchange metrics.
     pub broadcast_metrics: Vec<BroadcastExchangeMetrics>,
 }
@@ -923,7 +924,9 @@ mod tests {
 
         registry.register_exchange_metrics(exchange_metrics).await;
 
-        let retrieved = registry.get_exchange_metrics("test_query", ExchangeId(1)).await;
+        let retrieved = registry
+            .get_exchange_metrics("test_query", ExchangeId(1))
+            .await;
         assert!(retrieved.is_some());
     }
 

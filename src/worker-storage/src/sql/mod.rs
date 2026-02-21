@@ -67,9 +67,9 @@ mod discovery;
 mod error;
 mod interval;
 pub mod logical_plan;
+mod parser;
 pub mod plan_builder;
 pub mod stage_sql_gen;
-mod parser;
 mod transformer;
 mod types;
 

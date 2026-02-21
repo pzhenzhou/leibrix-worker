@@ -1,6 +1,6 @@
 pub mod adapter;
-pub mod types;
 mod starrocks;
+pub mod types;
 
 use self::adapter::SourceAdapter;
 use self::types::{Catalog, LoadRequest};

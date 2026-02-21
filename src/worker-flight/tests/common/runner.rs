@@ -41,9 +41,10 @@ pub async fn execute_via_flight(
     //    containing the (potentially rewritten) SQL.
     let descriptor = FlightDescriptor::new_cmd(sql.as_bytes().to_vec());
     let mut info_request = tonic::Request::new(descriptor);
-    info_request
-        .metadata_mut()
-        .insert("x-tenant-id", tenant_id.parse().expect("valid header value"));
+    info_request.metadata_mut().insert(
+        "x-tenant-id",
+        tenant_id.parse().expect("valid header value"),
+    );
 
     let flight_info = client.get_flight_info(info_request).await?.into_inner();
 

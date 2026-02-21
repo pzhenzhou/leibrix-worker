@@ -336,7 +336,7 @@ where
 
         // Execute the stage with DuckDB (with timeout)
         let start_time = Instant::now();
-        
+
         let batches = if request.stage_sql.is_empty() {
             // Empty plan (placeholder for testing)
             warn!(
@@ -347,10 +347,12 @@ where
             Vec::new()
         } else {
             // Execute with timeout
-            let timeout_ms = request.limits.as_ref()
+            let timeout_ms = request
+                .limits
+                .as_ref()
                 .map(|l| l.timeout_ms)
                 .unwrap_or(300_000); // Default 5 minutes
-            
+
             let execution_future = self.execute_stage_with_duckdb(
                 &request.query_id,
                 request.stage_id,
@@ -360,8 +362,10 @@ where
 
             match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                execution_future
-            ).await {
+                execution_future,
+            )
+            .await
+            {
                 Ok(result) => result.map_err(|e| {
                     error!(
                         query_id = %request.query_id,
@@ -387,7 +391,7 @@ where
         };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
-        
+
         // Calculate stats
         let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let bytes_produced: u64 = batches
@@ -462,7 +466,11 @@ where
             true,
             "",
             &ticket_bytes,
-            Some((stats.rows_produced, stats.bytes_produced, stats.execution_time_ms)),
+            Some((
+                stats.rows_produced,
+                stats.bytes_produced,
+                stats.execution_time_ms,
+            )),
         )
         .map_err(|e| Status::internal(format!("Failed to serialize response: {}", e)))?;
 
@@ -507,9 +515,11 @@ where
         // 1. Find all stage results for this query in the store
         // 2. Cancel any ongoing executions
         // 3. Remove cached results
-        
+
         // For now, just remove any cached results for this query
-        self.stage_results.results.retain(|key, _| key.query_id != request.query_id);
+        self.stage_results
+            .results
+            .retain(|key, _| key.query_id != request.query_id);
 
         // Create response
         let response_body = format!("Query {} cancelled", request.query_id);
@@ -575,9 +585,8 @@ where
                     continue;
                 }
 
-                register_arrow_batches(&conn, table_name, batches).map_err(|e| {
-                    format!("Failed to register table '{}': {}", table_name, e)
-                })?;
+                register_arrow_batches(&conn, table_name, batches)
+                    .map_err(|e| format!("Failed to register table '{}': {}", table_name, e))?;
 
                 registered_tables.push(table_name.clone());
 
@@ -604,9 +613,11 @@ where
             // SQL prepare or execution fails, preventing temp-table leaks on
             // the shared pooled connection.
             let result: Result<Vec<RecordBatch>, String> = (|| {
-                let mut stmt = conn.prepare(&stage_sql)
+                let mut stmt = conn
+                    .prepare(&stage_sql)
                     .map_err(|e| format!("Failed to prepare SQL: {}", e))?;
-                let rows = stmt.query_arrow([])
+                let rows = stmt
+                    .query_arrow([])
                     .map_err(|e| format!("Failed to execute SQL: {}", e))?;
                 Ok(rows.collect())
             })();
@@ -708,10 +719,10 @@ where
             batches = batches.len(),
             "Retrieved stage result from cache"
         );
-        
+
         if batches.is_empty() {
             // Return empty stream with proper type
-            let empty_stream: BoxStream<'static, Result<FlightData, Status>> = 
+            let empty_stream: BoxStream<'static, Result<FlightData, Status>> =
                 Box::pin(stream::empty());
             return Ok(Response::new(empty_stream));
         }
@@ -811,7 +822,7 @@ where
         let schema = if !transform_result.tables_replaced.is_empty() {
             let first_table = &transform_result.tables_replaced[0];
             debug!(table = %first_table, "Extracting schema from first logical table");
-            
+
             self.query_engine
                 .get_table_schema(first_table)
                 .await
@@ -821,11 +832,14 @@ where
             // This could happen for queries like "SELECT 1" or queries against non-registered tables
             return Err(Status::invalid_argument(
                 "Cannot determine schema: query does not reference any registered logical tables. \
-                 Use get_schema with a query containing logical table references."
+                 Use get_schema with a query containing logical table references.",
             ));
         };
 
-        debug!(fields = schema.fields().len(), "Schema extracted successfully");
+        debug!(
+            fields = schema.fields().len(),
+            "Schema extracted successfully"
+        );
 
         // Create a ticket with the original SQL (transformation happens at DoGet time)
         let ticket = QueryTicket::new(sql.clone(), self.tenant_id.clone());
@@ -888,7 +902,7 @@ where
         let schema = if !transform_result.tables_replaced.is_empty() {
             let first_table = &transform_result.tables_replaced[0];
             debug!(table = %first_table, "Extracting schema from first logical table");
-            
+
             self.query_engine
                 .get_table_schema(first_table)
                 .await
@@ -896,19 +910,23 @@ where
         } else {
             // No logical tables found in the query
             return Err(Status::invalid_argument(
-                "Cannot determine schema: query does not reference any registered logical tables"
+                "Cannot determine schema: query does not reference any registered logical tables",
             ));
         };
 
-        debug!(fields = schema.fields().len(), "Schema extracted successfully");
+        debug!(
+            fields = schema.fields().len(),
+            "Schema extracted successfully"
+        );
 
         // Encode schema to Arrow IPC format
         let schema_bytes = {
             let mut buf = Vec::new();
             let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut buf, &schema)
                 .map_err(|e| Status::internal(format!("Failed to encode schema: {}", e)))?;
-            writer.finish()
-                .map_err(|e| Status::internal(format!("Failed to finish schema encoding: {}", e)))?;
+            writer.finish().map_err(|e| {
+                Status::internal(format!("Failed to finish schema encoding: {}", e))
+            })?;
             buf
         };
 
@@ -936,12 +954,11 @@ where
         let flight_ticket = FlightTicket::decode(&ticket)?;
 
         // Validate tenant
-        self.validate_tenant(flight_ticket.tenant_id()).map_err(|e| *e)?;
+        self.validate_tenant(flight_ticket.tenant_id())
+            .map_err(|e| *e)?;
 
         match flight_ticket {
-            FlightTicket::Query(query_ticket) => {
-                self.handle_query_do_get(query_ticket).await
-            }
+            FlightTicket::Query(query_ticket) => self.handle_query_do_get(query_ticket).await,
             FlightTicket::StageResult(stage_ticket) => {
                 self.handle_stage_result_do_get(stage_ticket).await
             }
@@ -994,9 +1011,7 @@ where
                 let stream = stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }
-            "submit_stage" => {
-                self.handle_submit_stage(&action.body).await
-            }
+            "submit_stage" => self.handle_submit_stage(&action.body).await,
             "cancel_query" => {
                 // TODO: Implement query cancellation
                 self.handle_cancel_query(&action.body).await
@@ -1025,7 +1040,8 @@ where
             }),
             Ok(ActionType {
                 r#type: "submit_stage".to_string(),
-                description: "Submit an LDP stage for execution (body: SubmitStageRequest proto)".to_string(),
+                description: "Submit an LDP stage for execution (body: SubmitStageRequest proto)"
+                    .to_string(),
             }),
             Ok(ActionType {
                 r#type: "cancel_query".to_string(),
@@ -1060,11 +1076,8 @@ mod tests {
             arrow::datatypes::DataType::Int32,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
 
         let result = CachedStageResult::new(
             vec![batch],
@@ -1107,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn test_stage_result_store_with_partition() {
         let store = StageResultStore::new();
-        
+
         // Insert results for different partitions
         let key_p0 = StageResultKey {
             query_id: "q1".to_string(),
@@ -1193,7 +1206,7 @@ mod tests {
         };
 
         let result = CachedStageResult::new(vec![batch], stats);
-        
+
         assert_eq!(result.batches.len(), 1);
         assert_eq!(result.stats.rows_produced, 5);
         assert_eq!(result.stats.bytes_produced, 20);
@@ -1239,7 +1252,7 @@ mod tests {
 
         let mut map = HashMap::new();
         map.insert(key1, "value1");
-        
+
         // key2 should be able to retrieve the value since it equals key1
         assert_eq!(map.get(&key2), Some(&"value1"));
     }
@@ -1258,10 +1271,10 @@ mod tests {
         WorkerFlightService<worker_storage::engine::duckdb::DuckDBQueryEngine>,
         std::sync::Arc<worker_storage::engine::duckdb::SharedDatabase>,
     ) {
+        use tokio::sync::RwLock;
         use worker_storage::engine::duckdb::storage_engine_impl::MemoryDuckDBEngine;
         use worker_storage::engine::duckdb::{DuckDBConfig, DuckDBQueryEngine};
         use worker_storage::sql::SqlTransformer;
-        use tokio::sync::RwLock;
 
         // Pool size 1 guarantees that every get() returns the same connection.
         let config = DuckDBConfig::default().with_pool_size(1);
@@ -1306,12 +1319,17 @@ mod tests {
         let result = service
             .execute_stage_with_duckdb("q1", 0, "SELECT id FROM \"__exchange_0\"", &inputs)
             .await;
-        assert!(result.is_ok(), "Stage execution should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Stage execution should succeed: {:?}",
+            result
+        );
 
         // Acquire the (only) pooled connection and confirm the temp table is gone.
         let conn = shared_db.get().unwrap();
         assert!(
-            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1").is_err(),
+            conn.prepare("SELECT 1 FROM \"__exchange_0\" LIMIT 1")
+                .is_err(),
             "Temp table __exchange_0 must be absent on the pooled connection after success"
         );
     }
@@ -1331,11 +1349,8 @@ mod tests {
         let (service, shared_db) = make_service_with_pool_size_1();
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
 
         let mut inputs = HashMap::new();
         inputs.insert("__exchange_0".to_string(), vec![batch]);

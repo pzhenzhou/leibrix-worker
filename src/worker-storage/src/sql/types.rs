@@ -134,7 +134,11 @@ impl RegisteredDataset {
     }
 
     /// Create with a custom macro name.
-    pub fn with_macro_name(dataset_id: String, time_column_name: String, macro_name: String) -> Self {
+    pub fn with_macro_name(
+        dataset_id: String,
+        time_column_name: String,
+        macro_name: String,
+    ) -> Self {
         Self {
             dataset_id,
             time_column_name,

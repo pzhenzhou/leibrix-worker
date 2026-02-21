@@ -12,8 +12,9 @@ use worker_flight::ticket::FlightTicket;
 
 use common::{
     assertions::{
-        assert_flight_empty_matches_reference, assert_flight_error, assert_flight_matches_reference,
-        assert_flight_matches_reference_ordered, assert_flight_row_count,
+        assert_flight_empty_matches_reference, assert_flight_error,
+        assert_flight_matches_reference, assert_flight_matches_reference_ordered,
+        assert_flight_row_count,
     },
     data::DataSeeder,
     harness::FlightTestHarness,

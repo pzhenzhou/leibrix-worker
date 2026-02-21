@@ -64,9 +64,13 @@ impl TestScenario {
         // by the test setup code using load_test_data_for_e2e() or similar
 
         // Step 2: Execute query
-        let batches = cluster.execute_query(&self.query).await.map_err(|e| TestError::ExecutionFailed {
-            error: e.to_string(),
-        })?;
+        let batches =
+            cluster
+                .execute_query(&self.query)
+                .await
+                .map_err(|e| TestError::ExecutionFailed {
+                    error: e.to_string(),
+                })?;
 
         // Step 3: Verify result expectations
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -268,7 +272,10 @@ impl PlanExpectation {
             PlanExpectation::NoExchangeFor(table) => {
                 format!("No exchange for table '{}'", table)
             }
-            PlanExpectation::HasExchangeType { table, exchange_type } => {
+            PlanExpectation::HasExchangeType {
+                table,
+                exchange_type,
+            } => {
                 format!("Table '{}' has exchange type {:?}", table, exchange_type)
             }
             PlanExpectation::MinStageCount(min) => {
@@ -280,9 +287,7 @@ impl PlanExpectation {
             PlanExpectation::MaxExchangeCount(max) => {
                 format!("At most {} exchanges", max)
             }
-            PlanExpectation::Custom { description, .. } => {
-                description.clone()
-            }
+            PlanExpectation::Custom { description, .. } => description.clone(),
         }
     }
 }
@@ -376,12 +381,13 @@ impl ResultExpectation {
                 Ok(())
             }
 
-            ResultExpectation::Custom { description, validator } => {
-                validator(batches, row_count).map_err(|msg| TestError::ResultExpectationFailed {
-                    expectation: description.clone(),
-                    actual: msg,
-                })
-            }
+            ResultExpectation::Custom {
+                description,
+                validator,
+            } => validator(batches, row_count).map_err(|msg| TestError::ResultExpectationFailed {
+                expectation: description.clone(),
+                actual: msg,
+            }),
         }
     }
 }
@@ -412,16 +418,10 @@ pub enum TestError {
     ExecutionFailed { error: String },
 
     #[error("Plan expectation failed: expected {expectation}, but {actual}")]
-    PlanExpectationFailed {
-        expectation: String,
-        actual: String,
-    },
+    PlanExpectationFailed { expectation: String, actual: String },
 
     #[error("Result expectation failed: expected {expectation}, but {actual}")]
-    ResultExpectationFailed {
-        expectation: String,
-        actual: String,
-    },
+    ResultExpectationFailed { expectation: String, actual: String },
 }
 
 #[cfg(test)]

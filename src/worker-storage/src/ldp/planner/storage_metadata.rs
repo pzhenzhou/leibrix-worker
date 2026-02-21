@@ -214,13 +214,7 @@ impl ClusterMetadata {
         for stat in &memory_stats.epochs {
             let key = format!("{}__{}", stat.dataset_id, stat.epoch_id);
             if let Some((view, rows, bytes)) = epoch_views.get(&key) {
-                metadata.register_from_epoch_view(
-                    &stat.dataset_id,
-                    view,
-                    worker_id,
-                    *rows,
-                    *bytes,
-                );
+                metadata.register_from_epoch_view(&stat.dataset_id, view, worker_id, *rows, *bytes);
             } else {
                 // Fallback: create placement from stats only (no time range)
                 let placement = EpochPlacement {
@@ -344,9 +338,8 @@ impl<E: StorageEngine + Send + Sync> StorageEngineMetadata<E> {
                 .get_epoch_stats(&stat.dataset_id, &stat.epoch_id)
                 .await?;
 
-            let stats = epoch_stats.unwrap_or_else(|| {
-                EpochStats::exact(stat.rows_count, stat.approx_bytes)
-            });
+            let stats = epoch_stats
+                .unwrap_or_else(|| EpochStats::exact(stat.rows_count, stat.approx_bytes));
 
             // Get time_range from epoch view
             let key = (stat.dataset_id.clone(), stat.epoch_id.clone());
@@ -496,13 +489,9 @@ mod tests {
     #[test]
     fn test_epoch_placement_overlaps() {
         let placement = create_test_placement(
-            "sales",
-            "e1",
-            "w1",
-            1000, // 1 second
+            "sales", "e1", "w1", 1000, // 1 second
             2000, // 2 seconds
-            100,
-            1000,
+            100, 1000,
         );
 
         // Fully contained
@@ -563,8 +552,14 @@ mod tests {
             "sales", "e2", "w2", 2000, 3000, 200, 2000,
         ));
 
-        assert_eq!(metadata.worker_for("sales", "e1"), Some(WorkerId::from("w1")));
-        assert_eq!(metadata.worker_for("sales", "e2"), Some(WorkerId::from("w2")));
+        assert_eq!(
+            metadata.worker_for("sales", "e1"),
+            Some(WorkerId::from("w1"))
+        );
+        assert_eq!(
+            metadata.worker_for("sales", "e2"),
+            Some(WorkerId::from("w2"))
+        );
         assert_eq!(metadata.worker_for("sales", "e3"), None);
     }
 

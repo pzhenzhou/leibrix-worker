@@ -21,10 +21,7 @@ pub fn assert_flight_matches_reference(flight: &[RecordBatch], reference: &[Reco
 }
 
 /// Assert equality when the query has an explicit `ORDER BY` and row order matters.
-pub fn assert_flight_matches_reference_ordered(
-    flight: &[RecordBatch],
-    reference: &[RecordBatch],
-) {
+pub fn assert_flight_matches_reference_ordered(flight: &[RecordBatch], reference: &[RecordBatch]) {
     TestVerifier::assert_results_equal(flight, reference, true).unwrap_or_else(|e| {
         TestVerifier::print_results(flight, "flight (actual)");
         TestVerifier::print_results(reference, "reference (expected)");
@@ -36,10 +33,7 @@ pub fn assert_flight_matches_reference_ordered(
 /// (zero rows). Delegates to [`assert_flight_matches_reference`] so schema
 /// consistency is verified when both sides carry batch metadata, and
 /// empty-vs-empty is accepted as valid.
-pub fn assert_flight_empty_matches_reference(
-    flight: &[RecordBatch],
-    reference: &[RecordBatch],
-) {
+pub fn assert_flight_empty_matches_reference(flight: &[RecordBatch], reference: &[RecordBatch]) {
     // Row count check first for a clear error message.
     let flight_rows = TestVerifier::count_total_rows(flight);
     let reference_rows = TestVerifier::count_total_rows(reference);
@@ -58,11 +52,7 @@ pub fn assert_flight_empty_matches_reference(
 
 /// Assert float-column results within `tolerance`.
 /// Non-float columns are compared exactly. Order-independent.
-pub fn assert_flight_approx(
-    flight: &[RecordBatch],
-    reference: &[RecordBatch],
-    tolerance: f64,
-) {
+pub fn assert_flight_approx(flight: &[RecordBatch], reference: &[RecordBatch], tolerance: f64) {
     TestVerifier::assert_results_approximately_equal(flight, reference, tolerance, false)
         .unwrap_or_else(|e| {
             TestVerifier::print_results(flight, "flight (actual)");
@@ -99,17 +89,14 @@ pub fn assert_flight_error(
 ///
 /// This is a golden-content assertion independent of the reference path,
 /// used to verify epoch-pruning semantics against known fixture IDs.
-pub fn assert_column_int_range(
-    batches: &[RecordBatch],
-    col_name: &str,
-    min_id: i32,
-    max_id: i32,
-) {
+pub fn assert_column_int_range(batches: &[RecordBatch], col_name: &str, min_id: i32, max_id: i32) {
     for batch in batches {
-        let col_idx = batch
-            .schema()
-            .index_of(col_name)
-            .unwrap_or_else(|_| panic!("column '{col_name}' not found in schema {:?}", batch.schema()));
+        let col_idx = batch.schema().index_of(col_name).unwrap_or_else(|_| {
+            panic!(
+                "column '{col_name}' not found in schema {:?}",
+                batch.schema()
+            )
+        });
         let arr = batch
             .column(col_idx)
             .as_any()
@@ -131,8 +118,5 @@ pub fn assert_column_int_range(
 /// Assert the total row count across all batches equals `expected`.
 pub fn assert_flight_row_count(batches: &[RecordBatch], expected: usize) {
     let actual = TestVerifier::count_total_rows(batches);
-    assert_eq!(
-        actual, expected,
-        "expected {expected} rows, got {actual}"
-    );
+    assert_eq!(actual, expected, "expected {expected} rows, got {actual}");
 }

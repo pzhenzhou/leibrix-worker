@@ -24,7 +24,11 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).unwrap()
 }
 
-fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_orders_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut o_orderkeys = Vec::with_capacity(row_count);
     let mut o_custkeys = Vec::with_capacity(row_count);
     let mut o_totalprice = Vec::with_capacity(row_count);
@@ -38,12 +42,17 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
         o_orderkeys.push(i as i64);
         o_custkeys.push((i % 50) as i32);
         o_totalprice.push(1000.0 + (i % 100) as f64 * 1000.0);
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let order_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (order_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         o_orderdate.push(days_since_epoch as i32);
-        
+
         o_orderstatus.push(statuses[i % 3].to_string());
     }
 
@@ -64,10 +73,15 @@ fn generate_orders_data(row_count: usize, start_date: NaiveDate, end_date: Naive
             Arc::new(Date32Array::from(o_orderdate)),
             Arc::new(StringArray::from(o_orderstatus)),
         ],
-    ).unwrap()]
+    )
+    .unwrap()]
 }
 
-fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: NaiveDate) -> Vec<RecordBatch> {
+fn generate_lineitem_data(
+    row_count: usize,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Vec<RecordBatch> {
     let mut l_orderkeys = Vec::with_capacity(row_count);
     let mut l_partkey = Vec::with_capacity(row_count);
     let mut l_quantity = Vec::with_capacity(row_count);
@@ -81,10 +95,15 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
         l_partkey.push((i % 200) as i32);
         l_quantity.push((i % 50 + 1) as i32);
         l_extendedprice.push(100.0 + (i % 100) as f64 * 10.0);
-        
-        let days_offset = if date_range_days > 0 { i as i32 % date_range_days } else { 0 };
+
+        let days_offset = if date_range_days > 0 {
+            i as i32 % date_range_days
+        } else {
+            0
+        };
         let ship_date = start_date + chrono::Duration::days(days_offset as i64);
-        let days_since_epoch = (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        let days_since_epoch =
+            (ship_date - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
         l_shipdate.push(days_since_epoch as i32);
     }
 
@@ -105,7 +124,8 @@ fn generate_lineitem_data(row_count: usize, start_date: NaiveDate, end_date: Nai
             Arc::new(Float64Array::from(l_extendedprice)),
             Arc::new(Date32Array::from(l_shipdate)),
         ],
-    ).unwrap()]
+    )
+    .unwrap()]
 }
 
 fn generate_customer_data(row_count: usize) -> Vec<RecordBatch> {
@@ -132,7 +152,8 @@ fn generate_customer_data(row_count: usize) -> Vec<RecordBatch> {
             Arc::new(StringArray::from(c_names)),
             Arc::new(Float64Array::from(c_acctbal)),
         ],
-    ).unwrap()]
+    )
+    .unwrap()]
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -152,7 +173,9 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
     let orders_spec = TableLoadSpec::new("orders", "ds_orders", "o_orderdate")
         .with_epoch("e1", date(2024, 1, 1), date(2024, 2, 15), "w1", 200)
         .with_epoch("e2", date(2024, 2, 16), date(2024, 3, 31), "w2", 200);
-    data_loader.load_table_with_epochs(&orders_spec, generate_orders_data).await
+    data_loader
+        .load_table_with_epochs(&orders_spec, generate_orders_data)
+        .await
         .map_err(|e| anyhow!("{}", e))?;
 
     // Load lineitem data
@@ -160,24 +183,34 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
         .with_epoch("e1", date(2024, 1, 1), date(2024, 1, 31), "w1", 300)
         .with_epoch("e2", date(2024, 2, 1), date(2024, 2, 29), "w2", 300)
         .with_epoch("e3", date(2024, 3, 1), date(2024, 3, 31), "w3", 300);
-    data_loader.load_table_with_epochs(&lineitem_spec, generate_lineitem_data).await
+    data_loader
+        .load_table_with_epochs(&lineitem_spec, generate_lineitem_data)
+        .await
         .map_err(|e| anyhow!("{}", e))?;
 
     // Load customer data on w1
     let customers = generate_customer_data(50);
-    cluster.load_data_to_worker("w1", "customer", customers).await
+    cluster
+        .load_data_to_worker("w1", "customer", customers)
+        .await
         .map_err(|e| anyhow!("{}", e))?;
 
     // Register datasets
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "orders".to_string(),
-        "o_orderdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "orders".to_string(),
+            "o_orderdate".to_string(),
+        ))
+        .await;
 
-    cluster.coordinator.register_dataset(RegisteredDataset::new(
-        "lineitem".to_string(),
-        "l_shipdate".to_string(),
-    )).await;
+    cluster
+        .coordinator
+        .register_dataset(RegisteredDataset::new(
+            "lineitem".to_string(),
+            "l_shipdate".to_string(),
+        ))
+        .await;
 
     Ok(cluster)
 }
@@ -204,14 +237,17 @@ async fn test_in_clause_with_subquery() {
     println!("Executing IN clause with subquery:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     let row_count = TestVerifier::count_total_rows(&result);
     assert!(row_count <= 20, "Should respect LIMIT 20");
-    
-    println!("✓ IN clause with subquery executed successfully: {} rows", row_count);
+
+    println!(
+        "✓ IN clause with subquery executed successfully: {} rows",
+        row_count
+    );
 }
 
 #[tokio::test]
@@ -236,10 +272,10 @@ async fn test_not_in_clause_with_subquery() {
     println!("Executing NOT IN clause with subquery:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ NOT IN clause with subquery executed successfully");
 }
 
@@ -267,10 +303,10 @@ async fn test_exists_clause() {
     println!("Executing EXISTS clause:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ EXISTS clause executed successfully");
 }
 
@@ -297,10 +333,10 @@ async fn test_not_exists_clause() {
     println!("Executing NOT EXISTS clause:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ NOT EXISTS clause executed successfully");
 }
 
@@ -327,14 +363,17 @@ async fn test_scalar_subquery_in_select() {
     println!("Executing scalar subquery in SELECT:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     let row_count = TestVerifier::count_total_rows(&result);
     assert!(row_count <= 25, "Should respect LIMIT 25");
-    
-    println!("✓ Scalar subquery in SELECT executed successfully: {} rows", row_count);
+
+    println!(
+        "✓ Scalar subquery in SELECT executed successfully: {} rows",
+        row_count
+    );
 }
 
 #[tokio::test]
@@ -364,10 +403,10 @@ async fn test_subquery_in_from_clause() {
     println!("Executing subquery in FROM clause:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     assert!(!result.is_empty(), "Result should not be empty");
     assert_eq!(result[0].num_columns(), 2, "Should have 2 columns");
-    
+
     println!("✓ Subquery in FROM clause executed successfully");
 }
 
@@ -396,10 +435,10 @@ async fn test_nested_subqueries() {
     println!("Executing nested subqueries:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 2, "Should have 2 columns");
-    
+
     println!("✓ Nested subqueries executed successfully");
 }
 
@@ -426,10 +465,10 @@ async fn test_correlated_subquery_simple() {
     println!("Executing correlated subquery:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ Correlated subquery executed successfully");
 }
 
@@ -461,10 +500,10 @@ async fn test_subquery_with_aggregation() {
     println!("Executing subquery with aggregation:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ Subquery with aggregation executed successfully");
 }
 
@@ -496,10 +535,10 @@ async fn test_multiple_subqueries_in_where() {
     println!("Executing multiple subqueries in WHERE:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 3, "Should have 3 columns");
-    
+
     println!("✓ Multiple subqueries in WHERE executed successfully");
 }
 
@@ -525,9 +564,9 @@ async fn test_subquery_with_union() {
     println!("Executing subquery with UNION:\n{}", sql);
 
     let result = cluster.execute_query(sql).await.expect("Query failed");
-    
+
     // Query executed successfully
     assert_eq!(result[0].num_columns(), 2, "Should have 2 columns");
-    
+
     println!("✓ Subquery with UNION executed successfully");
 }

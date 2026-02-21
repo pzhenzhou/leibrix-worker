@@ -15,9 +15,7 @@ use futures_util::TryStreamExt;
 use tonic::transport::Channel;
 use tracing::{debug, error, info};
 
-use crate::ldp::executor::stage::{
-    StageExecutionError, StageExecutor, StageTicket, StageTickets,
-};
+use crate::ldp::executor::stage::{StageExecutionError, StageExecutor, StageTicket, StageTickets};
 use crate::ldp::proto_convert::{
     deserialize_submit_stage_response, serialize_submit_stage_request,
 };
@@ -40,19 +38,15 @@ impl WorkerConnection {
     /// Create a new connection to a worker.
     pub async fn connect(worker_id: WorkerId, endpoint: &str) -> Result<Self, StageExecutionError> {
         let channel = Channel::from_shared(endpoint.to_string())
-            .map_err(|e| {
-                StageExecutionError::WorkerUnavailable {
-                    worker_id: worker_id.clone(),
-                    detail: format!("Invalid endpoint '{}': {}", endpoint, e),
-                }
+            .map_err(|e| StageExecutionError::WorkerUnavailable {
+                worker_id: worker_id.clone(),
+                detail: format!("Invalid endpoint '{}': {}", endpoint, e),
             })?
             .connect()
             .await
-            .map_err(|e| {
-                StageExecutionError::WorkerUnavailable {
-                    worker_id: worker_id.clone(),
-                    detail: format!("Failed to connect to '{}': {}", endpoint, e),
-                }
+            .map_err(|e| StageExecutionError::WorkerUnavailable {
+                worker_id: worker_id.clone(),
+                detail: format!("Failed to connect to '{}': {}", endpoint, e),
             })?;
 
         let client = FlightServiceClient::new(channel);
@@ -93,12 +87,14 @@ impl WorkerConnectionPool {
         }
 
         // Get the endpoint
-        let endpoint = self.endpoints.get(worker_id).map(|e| e.clone()).ok_or_else(|| {
-            StageExecutionError::WorkerUnavailable {
+        let endpoint = self
+            .endpoints
+            .get(worker_id)
+            .map(|e| e.clone())
+            .ok_or_else(|| StageExecutionError::WorkerUnavailable {
                 worker_id: worker_id.clone(),
                 detail: format!("No endpoint registered for worker '{}'", worker_id),
-            }
-        })?;
+            })?;
 
         // Create new connection
         let conn = WorkerConnection::connect(worker_id.clone(), &endpoint).await?;
@@ -121,7 +117,10 @@ impl WorkerConnectionPool {
 
     /// Get all registered worker IDs.
     pub async fn worker_ids(&self) -> Vec<WorkerId> {
-        self.endpoints.iter().map(|entry| entry.key().clone()).collect()
+        self.endpoints
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 }
 
@@ -273,7 +272,8 @@ impl FlightStageExecutor {
 
         // Cache the result ticket using the actual query_id
         let ticket_key = Self::ticket_key(query_id, stage.stage_id, worker_id);
-        self.ticket_cache.insert(ticket_key, submit_response.result_ticket.clone());
+        self.ticket_cache
+            .insert(ticket_key, submit_response.result_ticket.clone());
 
         // Log stats if available
         if let Some(stats) = submit_response.stats {
@@ -289,7 +289,11 @@ impl FlightStageExecutor {
         }
 
         // Create ticket
-        Ok(StageTicket::new(query_id.to_string(), stage.stage_id, worker_id.clone()))
+        Ok(StageTicket::new(
+            query_id.to_string(),
+            stage.stage_id,
+            worker_id.clone(),
+        ))
     }
 }
 
@@ -315,8 +319,12 @@ impl StageExecutor for FlightStageExecutor {
                 StageOutput::Partitioned { partitions, .. } => {
                     // For partitioned output, create a ticket for each partition
                     for p in 0..*partitions {
-                        let part_ticket =
-                            StageTicket::partitioned(query_id.to_string(), stage.stage_id, worker_id.clone(), p);
+                        let part_ticket = StageTicket::partitioned(
+                            query_id.to_string(),
+                            stage.stage_id,
+                            worker_id.clone(),
+                            p,
+                        );
                         tickets.add(part_ticket);
                     }
                 }
@@ -335,7 +343,7 @@ impl StageExecutor for FlightStageExecutor {
         // TODO: Implement streaming execution for Flight-based distributed execution
         // For now, return an error indicating it's not yet implemented
         Err(StageExecutionError::ExecutionFailed(
-            "Streaming execution not yet implemented for Flight executor".into()
+            "Streaming execution not yet implemented for Flight executor".into(),
         ))
     }
 
@@ -354,12 +362,15 @@ impl StageExecutor for FlightStageExecutor {
         let ticket_key = Self::ticket_key(&ticket.query_id, ticket.stage_id, &ticket.worker_id);
 
         let ticket_bytes = {
-            self.ticket_cache.get(&ticket_key).map(|v| v.clone()).ok_or_else(|| {
-                StageExecutionError::InputNotReady(format!(
-                    "No ticket cached for stage {} on worker {}",
-                    ticket.stage_id, ticket.worker_id
-                ))
-            })?
+            self.ticket_cache
+                .get(&ticket_key)
+                .map(|v| v.clone())
+                .ok_or_else(|| {
+                    StageExecutionError::InputNotReady(format!(
+                        "No ticket cached for stage {} on worker {}",
+                        ticket.stage_id, ticket.worker_id
+                    ))
+                })?
         };
 
         // Get connection to worker
@@ -373,33 +384,28 @@ impl StageExecutor for FlightStageExecutor {
             ticket: ticket_bytes.into(),
         };
 
-        let response = conn
-            .client
-            .do_get(flight_ticket)
-            .await
-            .map_err(|e| {
-                error!(
-                    stage_id = %ticket.stage_id,
-                    worker_id = %ticket.worker_id,
-                    error = %e,
-                    "DoGet failed"
-                );
-                StageExecutionError::ExecutionFailed(format!("DoGet failed: {}", e))
-            })?;
+        let response = conn.client.do_get(flight_ticket).await.map_err(|e| {
+            error!(
+                stage_id = %ticket.stage_id,
+                worker_id = %ticket.worker_id,
+                error = %e,
+                "DoGet failed"
+            );
+            StageExecutionError::ExecutionFailed(format!("DoGet failed: {}", e))
+        })?;
 
         // Decode FlightData stream to RecordBatches
         let stream = response.into_inner();
         let batch_stream = FlightRecordBatchStream::new_from_flight_data(stream.map_err(|e| {
-            arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::internal(e.to_string())))
+            arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::internal(
+                e.to_string(),
+            )))
         }));
 
         // Collect all batches
-        let batches: Vec<RecordBatch> = batch_stream
-            .try_collect()
-            .await
-            .map_err(|e| {
-                StageExecutionError::ExecutionFailed(format!("Failed to decode batches: {}", e))
-            })?;
+        let batches: Vec<RecordBatch> = batch_stream.try_collect().await.map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!("Failed to decode batches: {}", e))
+        })?;
 
         info!(
             stage_id = %ticket.stage_id,
@@ -469,7 +475,9 @@ impl LdpFlightClient {
     }
 
     /// Get the underlying client, connecting if needed.
-    async fn get_client(&mut self) -> Result<&mut FlightServiceClient<Channel>, StageExecutionError> {
+    async fn get_client(
+        &mut self,
+    ) -> Result<&mut FlightServiceClient<Channel>, StageExecutionError> {
         if self.client.is_none() {
             self.connect().await?;
         }
@@ -532,9 +540,10 @@ impl LdpFlightClient {
             body: request_bytes.into(),
         };
 
-        let response = client.do_action(action).await.map_err(|e| {
-            StageExecutionError::ExecutionFailed(format!("DoAction failed: {}", e))
-        })?;
+        let response = client
+            .do_action(action)
+            .await
+            .map_err(|e| StageExecutionError::ExecutionFailed(format!("DoAction failed: {}", e)))?;
 
         let mut stream = response.into_inner();
         let result = stream
@@ -572,13 +581,16 @@ impl LdpFlightClient {
             ticket: ticket_bytes.to_vec().into(),
         };
 
-        let response = client.do_get(ticket).await.map_err(|e| {
-            StageExecutionError::ExecutionFailed(format!("DoGet failed: {}", e))
-        })?;
+        let response = client
+            .do_get(ticket)
+            .await
+            .map_err(|e| StageExecutionError::ExecutionFailed(format!("DoGet failed: {}", e)))?;
 
         let stream = response.into_inner();
         let batch_stream = FlightRecordBatchStream::new_from_flight_data(stream.map_err(|e| {
-            arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::internal(e.to_string())))
+            arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::internal(
+                e.to_string(),
+            )))
         }));
 
         let batches: Vec<RecordBatch> = batch_stream.try_collect().await.map_err(|e| {
@@ -615,7 +627,10 @@ mod tests {
         pool.register_worker(WorkerId::from("w1"), "http://localhost:50051".to_string())
             .await;
 
-        assert_eq!(pool.endpoints.get(&WorkerId::from("w1")).map(|e| e.clone()), Some("http://localhost:50051".to_string()));
+        assert_eq!(
+            pool.endpoints.get(&WorkerId::from("w1")).map(|e| e.clone()),
+            Some("http://localhost:50051".to_string())
+        );
     }
 
     #[tokio::test]

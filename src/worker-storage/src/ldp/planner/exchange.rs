@@ -512,7 +512,10 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            column_refs: vec![ColumnRef {
+                table: None,
+                column: "col0".into(),
+            }],
         };
 
         // In join context with exact stats -> broadcast
@@ -548,7 +551,10 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            column_refs: vec![ColumnRef {
+                table: None,
+                column: "col0".into(),
+            }],
         };
 
         // Not join context -> shuffle even if small
@@ -585,7 +591,10 @@ mod tests {
         );
 
         let required = RequiredDistribution::HashPartitioned {
-            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            column_refs: vec![ColumnRef {
+                table: None,
+                column: "col0".into(),
+            }],
         };
 
         // Join context but uncertain stats -> shuffle (baseline)
@@ -602,7 +611,10 @@ mod tests {
         // which equals broadcast_bytes_max, but we need EXACT stats for broadcast
         match decision {
             ExchangeDecision::Insert(Exchange::HashPartition { .. }) => {}
-            _ => panic!("Expected HashPartition exchange (baseline), got {:?}", decision),
+            _ => panic!(
+                "Expected HashPartition exchange (baseline), got {:?}",
+                decision
+            ),
         }
     }
 
@@ -629,8 +641,14 @@ mod tests {
             StatsSource::Exact,
         );
 
-        let left_key = ColumnRef { table: None, column: "col0".into() };
-        let right_key = ColumnRef { table: None, column: "col0".into() };
+        let left_key = ColumnRef {
+            table: None,
+            column: "col0".into(),
+        };
+        let right_key = ColumnRef {
+            table: None,
+            column: "col0".into(),
+        };
 
         let (left_decision, right_decision) = determine_join_exchanges(JoinExchangeContext {
             left_annotation: &left_annotation,
@@ -651,11 +669,17 @@ mod tests {
     fn test_join_shortcut_co_partitioned() {
         let policy = test_policy();
         let left_actual = Distribution::HashPartitioned {
-            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            column_refs: vec![ColumnRef {
+                table: None,
+                column: "col0".into(),
+            }],
             workers: vec!["w1".into(), "w2".into(), "w3".into()],
         };
         let right_actual = Distribution::HashPartitioned {
-            column_refs: vec![ColumnRef {table: None, column: "col0".into()}],
+            column_refs: vec![ColumnRef {
+                table: None,
+                column: "col0".into(),
+            }],
             workers: vec!["w1".into(), "w2".into(), "w3".into()],
         };
 
@@ -672,8 +696,14 @@ mod tests {
             StatsSource::Exact,
         );
 
-        let left_key = ColumnRef { table: None, column: "col0".into() };
-        let right_key = ColumnRef { table: None, column: "col0".into() };
+        let left_key = ColumnRef {
+            table: None,
+            column: "col0".into(),
+        };
+        let right_key = ColumnRef {
+            table: None,
+            column: "col0".into(),
+        };
 
         let (left_decision, right_decision) = determine_join_exchanges(JoinExchangeContext {
             left_annotation: &left_annotation,

@@ -1,10 +1,10 @@
-use super::DuckDBConfig;
 use super::helper::*;
+use super::DuckDBConfig;
 use crate::engine::storage_engine::*;
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use arrow::datatypes::Schema;
 use arrow::record_batch;
-use duckdb::{Connection, params, DuckdbConnectionManager};
+use duckdb::{params, Connection, DuckdbConnectionManager};
 use r2d2::PooledConnection;
 use std::collections::HashMap;
 use std::sync::Arc;

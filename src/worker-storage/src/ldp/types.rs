@@ -5,9 +5,9 @@
 //! - Exchange types for data movement between stages
 //! - Stage and LdpPlan for the execution plan structure
 
+use crate::sql::logical_plan::ColumnRef;
 use std::collections::HashMap;
 use std::fmt;
-use crate::sql::logical_plan::ColumnRef;
 
 // ============================================================================
 // Identifiers — Newtypes for compile-time safety (Effective Rust Item 6)
@@ -65,49 +65,73 @@ impl fmt::Display for WorkerId {
 // --- From conversions: ergonomic construction from literals ---
 
 impl From<&str> for QueryId {
-    fn from(s: &str) -> Self { QueryId(s.to_string()) }
+    fn from(s: &str) -> Self {
+        QueryId(s.to_string())
+    }
 }
 impl From<String> for QueryId {
-    fn from(s: String) -> Self { QueryId(s) }
+    fn from(s: String) -> Self {
+        QueryId(s)
+    }
 }
 impl AsRef<str> for QueryId {
-    fn as_ref(&self) -> &str { &self.0 }
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 impl From<u32> for StageId {
-    fn from(v: u32) -> Self { StageId(v) }
+    fn from(v: u32) -> Self {
+        StageId(v)
+    }
 }
 
 impl From<u32> for ExchangeId {
-    fn from(v: u32) -> Self { ExchangeId(v) }
+    fn from(v: u32) -> Self {
+        ExchangeId(v)
+    }
 }
 
 impl From<&str> for WorkerId {
-    fn from(s: &str) -> Self { WorkerId(s.to_string()) }
+    fn from(s: &str) -> Self {
+        WorkerId(s.to_string())
+    }
 }
 impl From<String> for WorkerId {
-    fn from(s: String) -> Self { WorkerId(s) }
+    fn from(s: String) -> Self {
+        WorkerId(s)
+    }
 }
 impl AsRef<str> for WorkerId {
-    fn as_ref(&self) -> &str { &self.0 }
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 // --- PartialEq<str>: allows `worker_id == "w1"` without wrapping ---
 
 impl PartialEq<str> for WorkerId {
-    fn eq(&self, other: &str) -> bool { self.0 == other }
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
 }
 
 impl PartialEq<&str> for WorkerId {
-    fn eq(&self, other: &&str) -> bool { self.0 == *other }
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
 }
 
 impl PartialEq<str> for QueryId {
-    fn eq(&self, other: &str) -> bool { self.0 == other }
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
 }
 
 impl PartialEq<&str> for QueryId {
-    fn eq(&self, other: &&str) -> bool { self.0 == *other }
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
 }
 
 // --- StageId counter support for planner (cut.rs alloc_stage_id) ---
@@ -388,7 +412,10 @@ pub enum StageOutput {
     Stream,
 
     /// Multiple partitioned streams (for HashPartition exchange).
-    Partitioned { partitions: u32, column_refs: Vec<ColumnRef> },
+    Partitioned {
+        partitions: u32,
+        column_refs: Vec<ColumnRef>,
+    },
 }
 
 /// Resource limits for stage execution.
@@ -682,12 +709,10 @@ mod tests {
 
         assert!(RequiredDistribution::Any.is_satisfied_by(&singleton));
         assert!(RequiredDistribution::Singleton.is_satisfied_by(&singleton));
-        assert!(
-            !RequiredDistribution::HashPartitioned {
-                column_refs: vec![ColumnRef::unqualified("col0")]
-            }
-            .is_satisfied_by(&singleton)
-        );
+        assert!(!RequiredDistribution::HashPartitioned {
+            column_refs: vec![ColumnRef::unqualified("col0")]
+        }
+        .is_satisfied_by(&singleton));
 
         let hash_partitioned = Distribution::HashPartitioned {
             column_refs: vec![
@@ -697,21 +722,17 @@ mod tests {
             workers: vec![WorkerId::from("w1"), WorkerId::from("w2")],
         };
 
-        assert!(
-            RequiredDistribution::HashPartitioned {
-                column_refs: vec![
-                    ColumnRef::unqualified("col0"),
-                    ColumnRef::unqualified("col1"),
-                ]
-            }
-            .is_satisfied_by(&hash_partitioned)
-        );
-        assert!(
-            !RequiredDistribution::HashPartitioned {
-                column_refs: vec![ColumnRef::unqualified("col0")]
-            }
-            .is_satisfied_by(&hash_partitioned)
-        );
+        assert!(RequiredDistribution::HashPartitioned {
+            column_refs: vec![
+                ColumnRef::unqualified("col0"),
+                ColumnRef::unqualified("col1"),
+            ]
+        }
+        .is_satisfied_by(&hash_partitioned));
+        assert!(!RequiredDistribution::HashPartitioned {
+            column_refs: vec![ColumnRef::unqualified("col0")]
+        }
+        .is_satisfied_by(&hash_partitioned));
     }
 
     #[test]

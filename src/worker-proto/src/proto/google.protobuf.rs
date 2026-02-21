@@ -49,7 +49,6 @@
 ///      Timestamp timestamp = Timestamp.newBuilder().setSeconds(millis / 1000)
 ///          .setNanos((int) ((millis % 1000) * 1000000)).build();
 ///
-///
 /// Example 5: Compute Timestamp from Java `Instant.now()`.
 ///
 ///      Instant now = Instant.now();
@@ -57,7 +56,6 @@
 ///      Timestamp timestamp =
 ///          Timestamp.newBuilder().setSeconds(now.getEpochSecond())
 ///              .setNanos(now.getNano()).build();
-///
 ///
 /// Example 6: Compute Timestamp from current time in Python.
 ///
@@ -88,9 +86,8 @@
 /// [`strftime`](<https://docs.python.org/2/library/time.html#time.strftime>) with
 /// the time format spec '%Y-%m-%dT%H:%M:%S.%fZ'. Likewise, in Java, one can use
 /// the Joda Time's [`ISODateTimeFormat.dateTime()`](
-/// <http://www.joda.org/joda-time/apidocs/org/joda/time/format/ISODateTimeFormat.html#dateTime%2D%2D>
+/// <http://joda-time.sourceforge.net/apidocs/org/joda/time/format/ISODateTimeFormat.html#dateTime(>)
 /// ) to obtain a formatter capable of generating timestamps in this format.
-///
 ///
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
@@ -184,7 +181,7 @@ pub struct ListValue {
 /// `NullValue` is a singleton enumeration to represent the null value for the
 /// `Value` type union.
 ///
-///   The JSON representation for `NullValue` is JSON `null`.
+/// The JSON representation for `NullValue` is JSON `null`.
 #[allow(non_camel_case_types)]
 #[allow(clippy::large_enum_variant)]
 #[derive(serde::Serialize, serde::Deserialize)]

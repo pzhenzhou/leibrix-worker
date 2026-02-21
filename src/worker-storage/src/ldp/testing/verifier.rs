@@ -15,7 +15,7 @@ pub struct TestVerifier;
 
 impl TestVerifier {
     /// Compare two sets of record batches for equality.
-    /// 
+    ///
     /// This function compares the results of distributed execution with reference results
     /// to ensure they are equivalent. It handles floating-point precision differences
     /// and ignores row ordering by default.
@@ -98,7 +98,7 @@ impl TestVerifier {
     }
 
     /// Compare two sets of record batches for approximate equality.
-    /// 
+    ///
     /// This function is useful for comparing results that may have minor floating-point
     /// precision differences. It compares numeric values within a tolerance.
     pub fn assert_results_approximately_equal(
@@ -199,13 +199,18 @@ impl TestVerifier {
 
         let columns: Result<Vec<_>, _> = (0..schema.fields().len())
             .map(|i| {
-                let col_arrays: Vec<&dyn arrow::array::Array> = batches.iter().map(|batch| batch.column(i).as_ref()).collect();
+                let col_arrays: Vec<&dyn arrow::array::Array> = batches
+                    .iter()
+                    .map(|batch| batch.column(i).as_ref())
+                    .collect();
                 arrow::compute::concat(&col_arrays)
             })
             .collect();
 
-        let concatenated_columns = columns.map_err(|e| VerificationError::ArrowError(e.to_string()))?;
-        RecordBatch::try_new(schema, concatenated_columns).map_err(|e| VerificationError::ArrowError(e.to_string()))
+        let concatenated_columns =
+            columns.map_err(|e| VerificationError::ArrowError(e.to_string()))?;
+        RecordBatch::try_new(schema, concatenated_columns)
+            .map_err(|e| VerificationError::ArrowError(e.to_string()))
     }
 
     /// Convert a record batch to sorted rows for comparison.
@@ -226,11 +231,13 @@ impl TestVerifier {
             })
             .collect();
 
-        let sort_fields: Vec<_> = sort_fields.map_err(|e: ArrowError| VerificationError::ArrowError(e.to_string()))?;
-        let converter = RowConverter::new(sort_fields).map_err(|e: ArrowError| VerificationError::ArrowError(e.to_string()))?;
+        let sort_fields: Vec<_> =
+            sort_fields.map_err(|e: ArrowError| VerificationError::ArrowError(e.to_string()))?;
+        let converter = RowConverter::new(sort_fields)
+            .map_err(|e: ArrowError| VerificationError::ArrowError(e.to_string()))?;
 
         let rows = converter.convert_columns(batch.columns())?;
-        
+
         if preserve_order {
             // Convert rows to owned
             Ok(rows.iter().map(|row| row.owned()).collect())
@@ -391,7 +398,7 @@ impl TestVerifier {
             (DataType::Float32, DataType::Float32) => {
                 let arr1 = col1.as_any().downcast_ref::<Float32Array>().unwrap();
                 let arr2 = col2.as_any().downcast_ref::<Float32Array>().unwrap();
-                
+
                 for i in 0..arr1.len() {
                     if arr1.is_null(i) != arr2.is_null(i) {
                         return Err(VerificationError::ValueMismatch {
@@ -419,7 +426,7 @@ impl TestVerifier {
             (DataType::Float64, DataType::Float64) => {
                 let arr1 = col1.as_any().downcast_ref::<Float64Array>().unwrap();
                 let arr2 = col2.as_any().downcast_ref::<Float64Array>().unwrap();
-                
+
                 for i in 0..arr1.len() {
                     if arr1.is_null(i) != arr2.is_null(i) {
                         return Err(VerificationError::ValueMismatch {
@@ -468,8 +475,14 @@ impl TestVerifier {
     pub fn print_results(batches: &[RecordBatch], label: &str) {
         println!("=== {} Results ===", label);
         for (batch_idx, batch) in batches.iter().enumerate() {
-            println!("Batch {}: {} rows, {} cols", batch_idx, batch.num_rows(), batch.num_columns());
-            for row_idx in 0..std::cmp::min(batch.num_rows(), 10) { // Print first 10 rows
+            println!(
+                "Batch {}: {} rows, {} cols",
+                batch_idx,
+                batch.num_rows(),
+                batch.num_columns()
+            );
+            for row_idx in 0..std::cmp::min(batch.num_rows(), 10) {
+                // Print first 10 rows
                 let mut row_str = String::new();
                 for col_idx in 0..batch.num_columns() {
                     let col = batch.column(col_idx);
@@ -487,7 +500,7 @@ impl TestVerifier {
     /// Format a cell value for display.
     fn format_cell_value(array: &ArrayRef, row_idx: usize) -> String {
         use arrow::array::*;
-        
+
         if array.is_null(row_idx) {
             return "NULL".to_string();
         }
@@ -496,27 +509,27 @@ impl TestVerifier {
             DataType::Int32 => {
                 let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
                 arr.value(row_idx).to_string()
-            },
+            }
             DataType::Int64 => {
                 let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
                 arr.value(row_idx).to_string()
-            },
+            }
             DataType::Float32 => {
                 let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
                 format!("{:.6}", arr.value(row_idx))
-            },
+            }
             DataType::Float64 => {
                 let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
                 format!("{:.6}", arr.value(row_idx))
-            },
+            }
             DataType::Utf8 => {
                 let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
                 format!("'{}'", arr.value(row_idx))
-            },
+            }
             DataType::Boolean => {
                 let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
                 arr.value(row_idx).to_string()
-            },
+            }
             DataType::Date32 => {
                 let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
                 let days = arr.value(row_idx);
@@ -524,7 +537,7 @@ impl TestVerifier {
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "INVALID_DATE".to_string());
                 format!("DATE '{}'", date)
-            },
+            }
             _ => format!("<{:?}>", array.data_type()),
         }
     }
@@ -541,52 +554,60 @@ pub enum VerificationError {
     EmptyResults,
     /// Row count mismatch between distributed and reference results.
     #[error("Row count mismatch: distributed={distributed} vs reference={reference}")]
-    RowCountMismatch { distributed: usize, reference: usize },
+    RowCountMismatch {
+        distributed: usize,
+        reference: usize,
+    },
     /// Column count mismatch between distributed and reference results.
     #[error("Column count mismatch: distributed={distributed} vs reference={reference}")]
-    ColumnCountMismatch { distributed: usize, reference: usize },
+    ColumnCountMismatch {
+        distributed: usize,
+        reference: usize,
+    },
     /// Schema mismatch between distributed and reference results.
     #[error("Schema mismatch between results")]
-    SchemaMismatch { 
-        distributed: Arc<arrow::datatypes::Schema>, 
-        reference: Arc<arrow::datatypes::Schema> 
+    SchemaMismatch {
+        distributed: Arc<arrow::datatypes::Schema>,
+        reference: Arc<arrow::datatypes::Schema>,
     },
     /// Row content mismatch at a specific index.
-    #[error("Row mismatch at index {index}: distributed='{distributed}' vs reference='{reference}'")]
-    RowMismatch { 
-        index: usize, 
-        distributed: String, 
-        reference: String 
+    #[error(
+        "Row mismatch at index {index}: distributed='{distributed}' vs reference='{reference}'"
+    )]
+    RowMismatch {
+        index: usize,
+        distributed: String,
+        reference: String,
     },
     /// Column length mismatch.
     #[error("Column {column_index} length mismatch: {len1} vs {len2}")]
-    ColumnLengthMismatch { 
-        column_index: usize, 
-        len1: usize, 
-        len2: usize 
+    ColumnLengthMismatch {
+        column_index: usize,
+        len1: usize,
+        len2: usize,
     },
     /// Column values mismatch.
     #[error("Column {column_index} values mismatch: {message}")]
-    ColumnValuesMismatch { 
-        column_index: usize, 
-        message: String 
+    ColumnValuesMismatch {
+        column_index: usize,
+        message: String,
     },
     /// Exact value mismatch.
     #[error("Value mismatch at [{column_index},{row_index}]: '{value1}' vs '{value2}'")]
-    ValueMismatch { 
-        column_index: usize, 
-        row_index: usize, 
-        value1: String, 
-        value2: String 
+    ValueMismatch {
+        column_index: usize,
+        row_index: usize,
+        value1: String,
+        value2: String,
     },
     /// Approximate value mismatch (beyond tolerance).
     #[error("Approximate value mismatch at [{column_index},{row_index}] beyond tolerance {tolerance}: {value1} vs {value2}")]
-    ApproximateValueMismatch { 
-        column_index: usize, 
-        row_index: usize, 
-        value1: f64, 
-        value2: f64, 
-        tolerance: f64 
+    ApproximateValueMismatch {
+        column_index: usize,
+        row_index: usize,
+        value1: f64,
+        value2: f64,
+        tolerance: f64,
     },
 }
 
@@ -603,27 +624,33 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn create_test_batch_with_ints(values: Vec<i32>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
 
         let array = Arc::new(Int32Array::from(values));
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
     fn create_test_batch_with_floats(values: Vec<f64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
 
         let array = Arc::new(Float64Array::from(values));
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
     fn create_test_batch_with_strings(values: Vec<&str>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
 
         let array = Arc::new(StringArray::from(values));
         RecordBatch::try_new(schema, vec![array]).unwrap()
@@ -680,7 +707,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Should fail with tighter tolerance
-        let result = TestVerifier::assert_results_approximately_equal(&[batch1], &[batch2], 0.00005, true);
+        let result =
+            TestVerifier::assert_results_approximately_equal(&[batch1], &[batch2], 0.00005, true);
         assert!(result.is_err());
     }
 
@@ -688,12 +716,16 @@ mod tests {
     fn test_concat_batches() {
         let batch1 = create_test_batch_with_ints(vec![1, 2]);
         let batch2 = create_test_batch_with_ints(vec![3, 4]);
-        
+
         let result = TestVerifier::concat_batches(&[batch1, batch2]).unwrap();
         assert_eq!(result.num_rows(), 4);
         assert_eq!(result.num_columns(), 1);
 
-        let values = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(values.value(0), 1);
         assert_eq!(values.value(1), 2);
         assert_eq!(values.value(2), 3);

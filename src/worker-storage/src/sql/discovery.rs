@@ -65,9 +65,10 @@ impl TableDiscovery {
     fn visit_statement(&mut self, stmt: &Statement) -> Result<(), SqlTransformError> {
         match stmt {
             Statement::Query(query) => self.visit_query(query),
-            _ => Err(SqlTransformError::UnsupportedStatement(
-                format!("{:?}", std::mem::discriminant(stmt))
-            )),
+            _ => Err(SqlTransformError::UnsupportedStatement(format!(
+                "{:?}",
+                std::mem::discriminant(stmt)
+            ))),
         }
     }
 
@@ -104,10 +105,14 @@ impl TableDiscovery {
                 Ok(())
             }
             SetExpr::Values(_) => Ok(()), // VALUES clause, no tables
-            SetExpr::Insert(_) => Err(SqlTransformError::UnsupportedStatement("INSERT".to_string())),
-            SetExpr::Update(_) => Err(SqlTransformError::UnsupportedStatement("UPDATE".to_string())),
+            SetExpr::Insert(_) => Err(SqlTransformError::UnsupportedStatement(
+                "INSERT".to_string(),
+            )),
+            SetExpr::Update(_) => Err(SqlTransformError::UnsupportedStatement(
+                "UPDATE".to_string(),
+            )),
             SetExpr::Table(_) => Ok(()), // TABLE t syntax
-            _ => Ok(()), // Handle any other variants
+            _ => Ok(()),                 // Handle any other variants
         }
     }
 
@@ -144,9 +149,11 @@ impl TableDiscovery {
 
         for join in &twj.joins {
             self.visit_table_factor(&join.relation)?;
-            
+
             // Check JOIN ON clause for subqueries
-            if let Some(JoinConstraint::On(expr)) = super::extract_join_constraint(&join.join_operator) {
+            if let Some(JoinConstraint::On(expr)) =
+                super::extract_join_constraint(&join.join_operator)
+            {
                 self.visit_expr_for_subqueries(expr)?;
             }
         }
@@ -159,11 +166,11 @@ impl TableDiscovery {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = extract_table_name(name);
-                
+
                 // Check if this is a registered logical dataset
                 if self.registered_datasets.contains(&table_name) {
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-                    
+
                     self.tables.push(TableReference {
                         dataset_id: table_name,
                         alias: alias_name,
@@ -179,7 +186,9 @@ impl TableDiscovery {
             TableFactor::TableFunction { .. } => {
                 // Table functions like UNNEST - no logical tables
             }
-            TableFactor::NestedJoin { table_with_joins, .. } => {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 self.visit_table_with_joins(table_with_joins)?;
             }
             _ => {
@@ -217,12 +226,19 @@ impl TableDiscovery {
             Expr::Nested(inner) => {
                 self.visit_expr_for_subqueries(inner)?;
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.visit_expr_for_subqueries(expr)?;
                 self.visit_expr_for_subqueries(low)?;
                 self.visit_expr_for_subqueries(high)?;
             }
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     self.visit_expr_for_subqueries(op)?;
                 }
@@ -254,7 +270,8 @@ impl TableDiscovery {
 /// Extract table name from ObjectName.
 fn extract_table_name(name: &ObjectName) -> String {
     // Take the last part of the name (handles schema.table)
-    name.0.last()
+    name.0
+        .last()
         .and_then(|part| match part {
             ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
             _ => None,
@@ -276,9 +293,9 @@ mod tests {
         let sql = "SELECT * FROM sales_data";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "sales_data");
         assert!(tables[0].alias.is_none());
@@ -289,9 +306,9 @@ mod tests {
         let sql = "SELECT s.* FROM sales_data AS s";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "sales_data");
         assert_eq!(tables[0].alias, Some("s".to_string()));
@@ -302,9 +319,9 @@ mod tests {
         let sql = "SELECT * FROM sales_data s JOIN customer_data c ON s.cid = c.id";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data", "customer_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 2);
         assert_eq!(tables[0].dataset_id, "sales_data");
         assert_eq!(tables[1].dataset_id, "customer_data");
@@ -315,9 +332,9 @@ mod tests {
         let sql = "SELECT * FROM sales_data JOIN other_table ON 1=1";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]); // other_table not registered
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "sales_data");
     }
@@ -327,9 +344,9 @@ mod tests {
         let sql = "WITH recent AS (SELECT * FROM sales_data WHERE dt > '2025-01-01') SELECT * FROM recent";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "sales_data");
     }
@@ -339,9 +356,9 @@ mod tests {
         let sql = "SELECT * FROM (SELECT * FROM sales_data) AS sub";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "sales_data");
     }
@@ -351,9 +368,9 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE cid IN (SELECT id FROM customer_data)";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["customer_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].dataset_id, "customer_data");
     }
@@ -363,9 +380,9 @@ mod tests {
         let sql = "SELECT * FROM sales_data UNION ALL SELECT * FROM archive_data";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data", "archive_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert_eq!(tables.len(), 2);
     }
 
@@ -374,9 +391,9 @@ mod tests {
         let sql = "SELECT 1, 2, 3";
         let stmt = parse_sql(sql).unwrap();
         let datasets = make_datasets(&["sales_data"]);
-        
+
         let tables = TableDiscovery::new(datasets).discover(&stmt).unwrap();
-        
+
         assert!(tables.is_empty());
     }
 }

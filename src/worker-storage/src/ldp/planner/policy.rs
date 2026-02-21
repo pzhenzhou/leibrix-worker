@@ -71,13 +71,13 @@ pub struct PlannerPolicy {
 impl Default for PlannerPolicy {
     fn default() -> Self {
         Self {
-            broadcast_bytes_max: 256 * 1024 * 1024,       // 256MB
-            shuffle_bytes_max: 2 * 1024 * 1024 * 1024,    // 2GB
-            gather_rows_max: 50_000_000,                  // 50M rows
-            gather_bytes_max: 5 * 1024 * 1024 * 1024,     // 5GB
+            broadcast_bytes_max: 256 * 1024 * 1024,    // 256MB
+            shuffle_bytes_max: 2 * 1024 * 1024 * 1024, // 2GB
+            gather_rows_max: 50_000_000,               // 50M rows
+            gather_bytes_max: 5 * 1024 * 1024 * 1024,  // 5GB
             default_partitions: 16,
             coordinator: WorkerId::default(),
-            safety_factor: 2.0,                           // 2x for uncertain stats
+            safety_factor: 2.0, // 2x for uncertain stats
             enable_streaming_pipeline: false,
             pipeline_buffer_bytes: 32 * 1024 * 1024,
         }
@@ -103,8 +103,8 @@ impl PlannerPolicy {
     /// Aggressive preset: favor broadcast and trust stats more.
     pub fn aggressive() -> Self {
         Self {
-            broadcast_bytes_max: 1024 * 1024 * 1024,      // 1GB
-            shuffle_bytes_max: 10 * 1024 * 1024 * 1024,   // 10GB
+            broadcast_bytes_max: 1024 * 1024 * 1024,    // 1GB
+            shuffle_bytes_max: 10 * 1024 * 1024 * 1024, // 10GB
             gather_rows_max: 100_000_000,
             gather_bytes_max: 10 * 1024 * 1024 * 1024,
             default_partitions: 32,
@@ -173,11 +173,7 @@ impl PlannerPolicy {
 
     /// Enable/disable broadcast by threshold toggling.
     pub fn with_broadcast_enabled(mut self, enabled: bool) -> Self {
-        self.broadcast_bytes_max = if enabled {
-            256 * 1024 * 1024
-        } else {
-            0
-        };
+        self.broadcast_bytes_max = if enabled { 256 * 1024 * 1024 } else { 0 };
         self
     }
 
@@ -287,9 +283,9 @@ mod tests {
 
         // Under threshold
         assert!(policy.can_broadcast(100 * 1024 * 1024)); // 100MB
-        // At threshold
+                                                          // At threshold
         assert!(policy.can_broadcast(256 * 1024 * 1024)); // 256MB
-        // Over threshold
+                                                          // Over threshold
         assert!(!policy.can_broadcast(300 * 1024 * 1024)); // 300MB
     }
 

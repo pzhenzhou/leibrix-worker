@@ -1,11 +1,11 @@
 use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
 use futures_core::Stream;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use arrow::datatypes::Schema;
 use thiserror::Error;
-use std::future::Future;
 
 use crate::ldp::EpochStats;
 

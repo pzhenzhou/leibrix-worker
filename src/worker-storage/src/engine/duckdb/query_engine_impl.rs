@@ -1,6 +1,6 @@
+use super::SharedDatabase;
 use crate::engine::query_engine::{QueryEngine, QueryError, QueryResultStream};
 use crate::engine::storage_engine::TableMetadata;
-use super::SharedDatabase;
 use arrow_schema::Schema;
 use std::future::Future;
 use std::sync::Arc;
@@ -42,8 +42,8 @@ impl DuckDBQueryEngine {
     fn classify_anyhow_error(err: anyhow::Error, table_name: &str) -> QueryError {
         // Use {:#} to get the full error chain including all nested causes
         let full_msg = format!("{:#}", err);
-        
-        if full_msg.contains("does not exist") 
+
+        if full_msg.contains("does not exist")
             || full_msg.contains("not found")
             || full_msg.contains("Table with name")
             || full_msg.contains("Catalog Error")
@@ -82,9 +82,9 @@ impl QueryEngine for DuckDBQueryEngine {
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = shared_db
-                    .get()
-                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
+                let conn = shared_db.get().map_err(|e| {
+                    QueryError::Internal(format!("failed to get pooled connection: {}", e))
+                })?;
 
                 // Use DuckDB's DESCRIBE to get schema
                 super::helper::query_table_schema(&conn, &table_name)
@@ -110,9 +110,9 @@ impl QueryEngine for DuckDBQueryEngine {
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = shared_db
-                    .get()
-                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
+                let conn = shared_db.get().map_err(|e| {
+                    QueryError::Internal(format!("failed to get pooled connection: {}", e))
+                })?;
 
                 let schema = super::helper::query_table_schema(&conn, &table_name)
                     .map_err(|e| Self::classify_anyhow_error(e, &table_name))?;
@@ -152,9 +152,9 @@ impl QueryEngine for DuckDBQueryEngine {
 
         async move {
             let result = tokio::task::spawn_blocking(move || {
-                let conn = shared_db
-                    .get()
-                    .map_err(|e| QueryError::Internal(format!("failed to get pooled connection: {}", e)))?;
+                let conn = shared_db.get().map_err(|e| {
+                    QueryError::Internal(format!("failed to get pooled connection: {}", e))
+                })?;
                 // dataset is logical, a high-level concept, is a grouping of data (e.g., a project, a user, a topic).
                 // Tables are physical entities in the database.
                 let mut stmt = conn
@@ -224,7 +224,8 @@ impl QueryEngine for DuckDBQueryEngine {
                 let conn = match shared_db.get() {
                     Ok(c) => c,
                     Err(e) => {
-                        let err = QueryError::Internal(format!("failed to get pooled connection: {}", e));
+                        let err =
+                            QueryError::Internal(format!("failed to get pooled connection: {}", e));
                         error!(error = %err, "execute_query: connection failed");
                         let _ = tx_blocking.blocking_send(Err(err.clone()));
                         return Err(err);
