@@ -80,6 +80,23 @@ impl SharedDatabase {
         Ok(Self { db_name, pool })
     }
 
+    /// Applies database-global settings that must be configured once at init time.
+    ///
+    /// These settings (e.g., `memory_limit`, `enable_progress_bar`) are database-level
+    /// in DuckDB — all connections share the same value.  Setting them per-query would
+    /// create a race where the last writer wins.  Instead, we apply them once here,
+    /// immediately after the pool is created, while no other thread can see the DB yet.
+    pub fn apply_global_settings(&self, config: &DuckDBConfig) -> anyhow::Result<()> {
+        let conn = self.get()?;
+        if let Some(limit_mb) = config.memory_limit_mb {
+            conn.execute(&format!("SET memory_limit = '{}MB'", limit_mb), [])
+                .context("Failed to set database memory_limit")?;
+        }
+        conn.execute("SET enable_progress_bar = false", [])
+            .context("Failed to disable progress bar")?;
+        Ok(())
+    }
+
     /// Gets a connection from the pool.
     ///
     /// This is the primary method for obtaining connections.

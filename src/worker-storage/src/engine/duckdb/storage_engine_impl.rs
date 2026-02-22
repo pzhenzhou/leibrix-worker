@@ -24,6 +24,9 @@ impl MemoryDuckDBEngine {
     /// Creates a new engine with a shared database.
     /// The shared database can be used by QueryEngine for read operations.
     pub fn new(config: DuckDBConfig, shared_db: Arc<SharedDatabase>) -> anyhow::Result<Self> {
+        // Apply database-global settings once at init time.
+        // This must happen before any queries are issued so there are no concurrent races.
+        shared_db.apply_global_settings(&config)?;
         info!("MemoryDuckDBEngine starting with config: {:?}", config);
 
         // Get a pooled connection for the storage engine (writer)

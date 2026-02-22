@@ -236,9 +236,11 @@ fn build_select(select: &Select, cte_map: &CteMap<'_>) -> Result<LogicalPlan, Pl
     let has_window = select.projection.iter().any(select_item_has_window);
 
     if has_window {
+        let partition_keys = extract_window_partition_keys(&select.projection);
         plan = LogicalPlan::Window {
             input: Box::new(plan),
             window_exprs: select.projection.clone(),
+            partition_keys,
         };
     } else {
         plan = LogicalPlan::Project {
@@ -544,6 +546,102 @@ fn extract_group_keys(group_by: &GroupByExpr) -> Vec<ColumnRef> {
             vec![]
         }
         GroupByExpr::Expressions(exprs, _) => exprs.iter().filter_map(expr_to_column_ref).collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window partition key extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the common PARTITION BY keys from all window functions.
+///
+/// Returns the intersection of partition-by columns across all window
+/// expressions in the SELECT list. If any window function has no PARTITION BY
+/// clause, the result is empty (conservative Singleton fallback).
+///
+/// Named windows (`OVER window_name`) are treated as unpartitioned because
+/// we cannot resolve the referenced window specification at plan-build time.
+fn extract_window_partition_keys(items: &[SelectItem]) -> Vec<ColumnRef> {
+    let mut common_keys: Option<Vec<ColumnRef>> = None;
+
+    for item in items {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        for_each_window_spec(expr, &mut |spec: &sqlparser::ast::WindowSpec| {
+            let keys: Vec<ColumnRef> = spec
+                .partition_by
+                .iter()
+                .filter_map(expr_to_column_ref)
+                .collect();
+            common_keys = Some(match common_keys.take() {
+                None => keys,
+                Some(prev) => intersect_column_refs(&prev, &keys),
+            });
+        });
+    }
+
+    common_keys.unwrap_or_default()
+}
+
+/// Compute the intersection of two `ColumnRef` slices (order-preserving).
+fn intersect_column_refs(a: &[ColumnRef], b: &[ColumnRef]) -> Vec<ColumnRef> {
+    a.iter()
+        .filter(|col_a| b.iter().any(|col_b| col_a.matches(col_b)))
+        .cloned()
+        .collect()
+}
+
+/// Visit every `WindowSpec` inside an expression tree.
+fn for_each_window_spec(expr: &Expr, visitor: &mut dyn FnMut(&sqlparser::ast::WindowSpec)) {
+    match expr {
+        Expr::Function(func) => {
+            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
+                visitor(spec);
+            }
+            // Also visit function arguments for nested window calls (unlikely
+            // but thorough).
+            if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
+                for arg in &arg_list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    )
+                    | sqlparser::ast::FunctionArg::Named {
+                        arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        for_each_window_spec(e, visitor);
+                    }
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            for_each_window_spec(left, visitor);
+            for_each_window_spec(right, visitor);
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) => {
+            for_each_window_spec(inner, visitor);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(e) = operand {
+                for_each_window_spec(e, visitor);
+            }
+            for c in conditions {
+                for_each_window_spec(&c.condition, visitor);
+                for_each_window_spec(&c.result, visitor);
+            }
+            if let Some(e) = else_result {
+                for_each_window_spec(e, visitor);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -510,7 +510,13 @@ fn compute_output_distribution<M: Metadata>(
 
         // ===== Join operators =====
         LogicalPlan::Join { .. } => {
-            // Join output distribution follows the left side (probe side)
+            // Join output distribution follows the non-replicated side.
+            //
+            // When one side is Replicated (broadcast), it exists on all workers holding
+            // the other side, so the output partitioning is determined by the non-replicated
+            // side. If both are Replicated (unusual), fall back to left. This prevents
+            // downstream operators from incorrectly skipping required exchanges because they
+            // see the output as Replicated.
             let (dist, rows, bytes, source) = if annotated_children.len() >= 2 {
                 let left = &annotated_children[0].annotation;
                 let right = &annotated_children[1].annotation;
@@ -525,8 +531,16 @@ fn compute_output_distribution<M: Metadata>(
 
                 let combined_source = combine_stats_sources(left.stats_source, right.stats_source);
 
+                // If the left side was broadcast-replicated, the output partitioning
+                // is dictated by the right (probe) side, and vice versa.
+                let output_dist = match (&left.distribution, &right.distribution) {
+                    (Distribution::Replicated { .. }, _) => right.distribution.clone(),
+                    (_, Distribution::Replicated { .. }) => left.distribution.clone(),
+                    _ => left.distribution.clone(),
+                };
+
                 (
-                    left.distribution.clone(),
+                    output_dist,
                     est_rows,
                     est_rows * bytes_per_row,
                     combined_source,
@@ -574,11 +588,45 @@ fn compute_output_distribution<M: Metadata>(
         }
 
         // ===== Window =====
-        LogicalPlan::Window { .. } => {
-            // Window preserves row count, might change distribution based on PARTITION BY
+        // Window preserves row count. The output distribution depends on
+        // PARTITION BY keys: when the input was hash-partitioned by those
+        // keys to satisfy the requirement, the output retains that
+        // distribution. Without PARTITION BY the input was gathered to a
+        // Singleton, which is also preserved.
+        LogicalPlan::Window { partition_keys, .. } => {
             if let Some(child) = annotated_children.first() {
+                let dist = if !partition_keys.is_empty() {
+                    // The enforcement step already ensured the child is
+                    // HashPartitioned by partition_keys. Preserve that.
+                    match &child.annotation.distribution {
+                        Distribution::HashPartitioned {
+                            column_refs,
+                            workers,
+                        } if column_refs.len() == partition_keys.len()
+                            && column_refs
+                                .iter()
+                                .zip(partition_keys.iter())
+                                .all(|(a, b)| a.matches(b)) =>
+                        {
+                            Distribution::HashPartitioned {
+                                column_refs: column_refs.clone(),
+                                workers: workers.clone(),
+                            }
+                        }
+                        // Replicated also satisfies HashPartitioned requirement.
+                        Distribution::Replicated { workers } => Distribution::HashPartitioned {
+                            column_refs: partition_keys.clone(),
+                            workers: workers.clone(),
+                        },
+                        // Fallback: keep child distribution as-is (Singleton
+                        // or any other shape that satisfied the requirement).
+                        other => other.clone(),
+                    }
+                } else {
+                    child.annotation.distribution.clone()
+                };
                 Ok((
-                    child.annotation.distribution.clone(),
+                    dist,
                     child.annotation.est_rows,
                     child.annotation.est_bytes,
                     child.annotation.stats_source,
@@ -770,5 +818,169 @@ mod tests {
             }
             _ => panic!("expected hash partitioned distribution"),
         }
+    }
+
+    // ── BUG-4 regression tests ─────────────────────────────────────────────────
+
+    /// Build metadata that includes a tiny "products" table (1 epoch, 100 bytes on w1)
+    /// alongside the standard "sales" epochs.
+    fn test_metadata_with_products() -> InMemoryMetadata {
+        use crate::ldp::EpochStats;
+        InMemoryMetadata::new()
+            .with_epoch("e1", "sales", EpochStats::exact(1000, 10000), "w1".into())
+            .with_epoch("e2", "sales", EpochStats::exact(2000, 20000), "w2".into())
+            .with_epoch("ep1", "products", EpochStats::exact(10, 100), "w1".into())
+    }
+
+    /// BUG-4: When the left (build) side of a join is broadcast-replicated the join
+    /// output distribution must follow the right (probe) side, not the left.
+    ///
+    /// Before the fix `annotate.rs` returned `left.distribution.clone()` which was
+    /// `Replicated` after the broadcast exchange.  Downstream operators (e.g. GROUP BY)
+    /// would then see a `Replicated` distribution and skip the required gather exchange,
+    /// producing silently incorrect results.
+    #[test]
+    fn test_join_output_follows_probe_side_when_build_is_broadcast() {
+        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, TableFactor};
+
+        // Policy: broadcast_bytes_max = 500, so products (100 bytes) triggers broadcast.
+        let policy = PlannerPolicy::with_coordinator("coordinator")
+            .broadcast_bytes_max(500)
+            .shuffle_bytes_max(10_000_000)
+            .gather_rows_max(100_000)
+            .gather_bytes_max(10_000_000);
+        let metadata = test_metadata_with_products();
+
+        let make_scan = |table: &str| -> LogicalPlan {
+            LogicalPlan::Scan {
+                table_name: table.to_string(),
+                alias: None,
+                table_factor: TableFactor::Table {
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    partitions: vec![],
+                    with_ordinality: false,
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+            }
+        };
+
+        // products (left/build side, ~100 bytes) JOIN sales (right/probe side, ~30 000 bytes)
+        let plan = LogicalPlan::Join {
+            left: Box::new(make_scan("products")),
+            right: Box::new(make_scan("sales")),
+            join_op: sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![ColumnRef::qualified("products", "id")],
+            right_keys: vec![ColumnRef::qualified("sales", "product_id")],
+        };
+
+        let annotated =
+            annotate_logical_plan(&plan, &policy, &metadata).expect("annotation should succeed");
+
+        // The left child must have received a Broadcast exchange (build-side broadcast).
+        let left_child = &annotated.children[0];
+        assert!(
+            matches!(left_child.exchange_before, Some(Exchange::Broadcast { .. })),
+            "expected Broadcast on left (products), got: {:?}",
+            left_child.exchange_before
+        );
+
+        // BUG-4 fix: the join output must NOT be Replicated.  It must follow the
+        // probe (right) side which is EpochPartitioned.
+        assert!(
+            !matches!(
+                annotated.annotation.distribution,
+                Distribution::Replicated { .. }
+            ),
+            "join output must not be Replicated (BUG-4 regression): {:?}",
+            annotated.annotation.distribution
+        );
+        assert!(
+            matches!(
+                annotated.annotation.distribution,
+                Distribution::EpochPartitioned { .. }
+            ),
+            "join output should be EpochPartitioned (probe side): {:?}",
+            annotated.annotation.distribution
+        );
+    }
+
+    /// When the RIGHT side is broadcast the join output must follow the LEFT side.
+    #[test]
+    fn test_join_output_follows_left_when_right_is_broadcast() {
+        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, TableFactor};
+
+        // Policy: broadcast_bytes_max = 500, so products (100 bytes) triggers broadcast.
+        let policy = PlannerPolicy::with_coordinator("coordinator")
+            .broadcast_bytes_max(500)
+            .shuffle_bytes_max(10_000_000)
+            .gather_rows_max(100_000)
+            .gather_bytes_max(10_000_000);
+        let metadata = test_metadata_with_products();
+
+        let make_scan = |table: &str| -> LogicalPlan {
+            LogicalPlan::Scan {
+                table_name: table.to_string(),
+                alias: None,
+                table_factor: TableFactor::Table {
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    partitions: vec![],
+                    with_ordinality: false,
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+            }
+        };
+
+        // sales (left/probe, large) JOIN products (right/build, small → broadcast)
+        let plan = LogicalPlan::Join {
+            left: Box::new(make_scan("sales")),
+            right: Box::new(make_scan("products")),
+            join_op: sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![ColumnRef::qualified("sales", "product_id")],
+            right_keys: vec![ColumnRef::qualified("products", "id")],
+        };
+
+        let annotated =
+            annotate_logical_plan(&plan, &policy, &metadata).expect("annotation should succeed");
+
+        // Right child must have a Broadcast exchange.
+        let right_child = &annotated.children[1];
+        assert!(
+            matches!(
+                right_child.exchange_before,
+                Some(Exchange::Broadcast { .. })
+            ),
+            "expected Broadcast on right (products), got: {:?}",
+            right_child.exchange_before
+        );
+
+        // BUG-4 fix: output must follow the left (epoch-partitioned) side.
+        assert!(
+            !matches!(
+                annotated.annotation.distribution,
+                Distribution::Replicated { .. }
+            ),
+            "join output must not be Replicated when right is broadcast (BUG-4): {:?}",
+            annotated.annotation.distribution
+        );
+        assert!(
+            matches!(
+                annotated.annotation.distribution,
+                Distribution::EpochPartitioned { .. }
+            ),
+            "join output should follow left (EpochPartitioned): {:?}",
+            annotated.annotation.distribution
+        );
     }
 }

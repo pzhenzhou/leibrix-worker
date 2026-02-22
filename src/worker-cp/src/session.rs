@@ -265,13 +265,15 @@ async fn build_channel_with_backoff(
     _status_tx: &watch::Sender<SessionStatus>,
 ) -> Result<tonic::transport::Channel, SessionError> {
     // Normalize the address: tonic requires an absolute URI with a scheme.
-    // Accept bare `host:port` (or `host`) and prepend `http://` so that a
-    // common CLI value like `master:9090` works without forcing operators to
-    // know about URI syntax.
+    // Accept bare `host:port` (or `host`) and prepend the correct scheme.
+    // When TLS is configured, force `https://`; otherwise use `http://`.
+    let has_tls = config.tls.is_some();
     let addr = {
         let raw = config.master_addr.as_str();
         if raw.starts_with("http://") || raw.starts_with("https://") {
             config.master_addr.clone()
+        } else if has_tls {
+            format!("https://{raw}")
         } else {
             format!("http://{raw}")
         }
@@ -290,6 +292,18 @@ async fn build_channel_with_backoff(
         .http2_keep_alive_interval(config.http2_keep_alive_interval)
         .keep_alive_timeout(config.keep_alive_timeout)
         .keep_alive_while_idle(config.keep_alive_while_idle);
+
+    // Apply TLS config if provided.
+    let endpoint = if let Some(tls) = config.tls.clone() {
+        endpoint
+            .tls_config(tls)
+            .map_err(|e| SessionError::ConnectionFailed {
+                addr: addr.clone(),
+                source: e,
+            })?
+    } else {
+        endpoint
+    };
 
     let backoff = ExponentialBackoff {
         initial_interval: config.retry_initial_interval,

@@ -116,15 +116,23 @@ pub enum LogicalPlan {
         set_quantifier: SetQuantifier,
     },
 
-    /// Window functions. Conservative: requires Singleton distribution.
+    /// Window functions.
     ///
     /// Carries the full SELECT list (both window and non-window expressions).
     /// Exists solely to signal distribution requirements to the planner; SQL
     /// generation treats it like a `Project` emitting all items in a single
     /// `SELECT` clause.
+    ///
+    /// When `partition_keys` is non-empty, the planner uses
+    /// `HashPartitioned(partition_keys)` so each partition group can execute
+    /// on a separate worker.  When empty (unpartitioned window), the planner
+    /// falls back to `Singleton`.
     Window {
         input: Box<LogicalPlan>,
         window_exprs: Vec<SelectItem>,
+        /// Extracted PARTITION BY columns for distribution planning.
+        /// Empty → unpartitioned window → Singleton requirement.
+        partition_keys: Vec<ColumnRef>,
     },
 
     /// Subquery scan (derived table).

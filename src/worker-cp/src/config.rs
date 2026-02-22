@@ -94,6 +94,16 @@ pub struct ControlPlaneConfig {
     ///
     /// Default: 5 minutes.
     pub retry_max_elapsed_time: Duration,
+
+    // -------------------------------------------------------------------
+    // TLS
+    // -------------------------------------------------------------------
+    /// Optional TLS configuration for the gRPC channel.
+    ///
+    /// When `None`, the channel uses plain HTTP/2.  When `Some`, the scheme
+    /// in `master_addr` is automatically switched to `https://` and the
+    /// provided `ClientTlsConfig` is applied to the tonic endpoint.
+    pub tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 impl ControlPlaneConfig {
@@ -131,6 +141,7 @@ impl Default for ControlPlaneConfig {
             retry_initial_interval: Duration::from_millis(500),
             retry_max_interval: Duration::from_secs(30),
             retry_max_elapsed_time: Duration::from_secs(300),
+            tls: None,
         }
     }
 }

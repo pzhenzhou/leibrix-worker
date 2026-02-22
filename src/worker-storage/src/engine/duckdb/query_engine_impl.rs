@@ -11,8 +11,6 @@ use tracing::{error, info, warn};
 
 /// Default timeout for queries if not specified (5 minutes)
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
-/// Default memory limit per query if not specified (1024 MB)
-const DEFAULT_QUERY_MEMORY_MB: usize = 1024;
 
 /// Result type for streaming record batches out of the query engine.
 type BatchResult = Result<arrow::array::RecordBatch, QueryError>;
@@ -187,13 +185,14 @@ impl QueryEngine for DuckDBQueryEngine {
     fn execute_query(
         &self,
         sql: &str,
-        memory_limit: Option<usize>,
+        // Memory limit is now set once at database initialization (apply_global_settings),
+        // not per-query, to avoid races on the database-global setting.
+        _memory_limit: Option<usize>,
         timeout_secs: Option<Duration>,
     ) -> impl Future<Output = Result<QueryResultStream, QueryError>> + Send {
         let query_limiter = self.query_limiter.clone();
         let shared_db = self.shared_db.clone();
         let sql = sql.to_string();
-        let memory_mb = memory_limit.unwrap_or(DEFAULT_QUERY_MEMORY_MB);
         let timeout = timeout_secs.unwrap_or(Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS));
 
         async move {
@@ -213,8 +212,12 @@ impl QueryEngine for DuckDBQueryEngine {
             ) = tokio::sync::mpsc::channel(100);
             let tx_blocking = tx.clone(); // Clone for blocking task
 
-            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cancelled_blocking = cancelled.clone();
+            // Channel for the interrupt handle: the blocking task sends it once the
+            // connection is acquired so the timeout supervisor can hard-cancel DuckDB
+            // via duckdb_interrupt() instead of relying on the cooperative AtomicBool
+            // (which only fires between batch iterations).
+            let (interrupt_tx, interrupt_rx) =
+                tokio::sync::oneshot::channel::<std::sync::Arc<duckdb::InterruptHandle>>();
 
             let blocking_task = tokio::task::spawn_blocking(move || {
                 // Hold permit for full execution
@@ -232,19 +235,9 @@ impl QueryEngine for DuckDBQueryEngine {
                     }
                 };
 
-                if let Err(e) = conn.execute(&format!("SET memory_limit='{}MB'", memory_mb), []) {
-                    let err = QueryError::Internal(format!("set memory limit failed: {}", e));
-                    error!(error = %err, "execute_query: set memory limit failed");
-                    let _ = tx_blocking.blocking_send(Err(err.clone()));
-                    return Err(err);
-                }
-
-                if let Err(e) = conn.execute("SET enable_progress_bar=false", []) {
-                    let err = QueryError::Internal(format!("disable progress bar failed: {}", e));
-                    error!(error = %err, "execute_query: disable progress bar failed");
-                    let _ = tx_blocking.blocking_send(Err(err.clone()));
-                    return Err(err);
-                }
+                // Send the interrupt handle to the timeout supervisor so it can
+                // call duckdb_interrupt() to hard-cancel in-flight DuckDB operations.
+                let _ = interrupt_tx.send(conn.interrupt_handle());
 
                 // Prepare statement
                 let mut stmt = match conn.prepare(&sql) {
@@ -268,14 +261,34 @@ impl QueryEngine for DuckDBQueryEngine {
                 };
 
                 for batch in arrow_reader {
-                    if cancelled_blocking.load(std::sync::atomic::Ordering::Relaxed) {
-                        info!(sql = %sql_log_blocking, "execute_query: query cancelled due to timeout");
-                        break;
-                    }
-
-                    // Send batch to channel
-                    if tx_blocking.blocking_send(Ok(batch)).is_err() {
-                        // Client disconnected
+                    // Use try_send in a timed backoff loop instead of blocking_send.
+                    // blocking_send can hold the spawn_blocking OS thread indefinitely if
+                    // the consumer is slow or the client has disconnected, eventually
+                    // exhausting tokio's blocking thread pool.  Here we retry for at most
+                    // 5 seconds, then treat a perpetually-full channel as a disconnect.
+                    let mut msg = Ok(batch);
+                    let send_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let sent = loop {
+                        match tx_blocking.try_send(msg) {
+                            Ok(()) => break true,
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                break false;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                                msg = returned; // reclaim value for next attempt
+                                if std::time::Instant::now() >= send_deadline {
+                                    warn!(
+                                        sql = %sql_log_blocking,
+                                        "execute_query: output channel full for >5s, treating as client disconnect"
+                                    );
+                                    break false;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    };
+                    if !sent {
                         info!(sql = %sql_log_blocking, "execute_query: query cancelled due to client disconnect");
                         break;
                     }
@@ -284,10 +297,9 @@ impl QueryEngine for DuckDBQueryEngine {
                 Ok::<(), QueryError>(())
             });
 
-            // Timeout supervision
+            // Timeout supervision — uses duckdb_interrupt() for hard cancellation.
             tokio::spawn({
                 let tx = tx.clone();
-                let cancelled = cancelled.clone();
 
                 async move {
                     match tokio::time::timeout(timeout, blocking_task).await {
@@ -305,10 +317,14 @@ impl QueryEngine for DuckDBQueryEngine {
                             let _ = tx.send(Err(err)).await;
                         }
                         Err(_) => {
-                            // Timeout fired
-                            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Timeout fired — hard-cancel the in-flight DuckDB operation
+                            // via duckdb_interrupt() so we don't have to wait for the next
+                            // batch boundary.
+                            if let Ok(handle) = interrupt_rx.await {
+                                handle.interrupt();
+                            }
                             let err = QueryError::Timeout(timeout.as_secs());
-                            warn!(sql = %sql_log_supervisor, timeout_secs = timeout.as_secs(), "execute_query: query timed out");
+                            warn!(sql = %sql_log_supervisor, timeout_secs = timeout.as_secs(), "execute_query: query timed out, duckdb_interrupt sent");
                             let _ = tx.send(Err(err)).await;
                         }
                     }

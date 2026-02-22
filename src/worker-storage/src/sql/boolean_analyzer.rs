@@ -116,9 +116,16 @@ impl BooleanExprAnalyzer {
                 // Check if left side is our time column
                 if self.is_time_column_ref(left, table_name, time_col) {
                     match op {
-                        BinaryOperator::Gt | BinaryOperator::GtEq => {
+                        BinaryOperator::GtEq => {
                             if let Some(bound) = self.extract_date_bound(right) {
                                 return Interval::from_bounds(Some(bound), None);
+                            }
+                        }
+                        BinaryOperator::Gt => {
+                            if let Some(bound) = self.extract_date_bound(right) {
+                                // Exclusive lower bound: advance start by one day
+                                let exclusive_start = self.add_one_day(&bound);
+                                return Interval::from_bounds(Some(exclusive_start), None);
                             }
                         }
                         BinaryOperator::Lt => {
@@ -144,10 +151,17 @@ impl BooleanExprAnalyzer {
                 // Check if right side is our time column (reversed comparison)
                 else if self.is_time_column_ref(right, table_name, time_col) {
                     match op {
-                        BinaryOperator::Lt | BinaryOperator::LtEq => {
-                            // '2025-01-01' < dt  =>  dt > '2025-01-01'
+                        BinaryOperator::LtEq => {
+                            // '2025-01-01' <= dt  =>  dt >= '2025-01-01'
                             if let Some(bound) = self.extract_date_bound(left) {
                                 return Interval::from_bounds(Some(bound), None);
+                            }
+                        }
+                        BinaryOperator::Lt => {
+                            // '2025-01-01' < dt  =>  dt > '2025-01-01'
+                            if let Some(bound) = self.extract_date_bound(left) {
+                                let exclusive_start = self.add_one_day(&bound);
+                                return Interval::from_bounds(Some(exclusive_start), None);
                             }
                         }
                         BinaryOperator::Gt => {
@@ -488,5 +502,75 @@ mod tests {
 
         let interval = intervals.get("sales_data").unwrap();
         assert!(interval.is_empty()); // Contradiction → empty interval
+    }
+
+    #[test]
+    fn test_gt_exclusive_lower_bound() {
+        // WHERE dt > '2025-01-15'  →  lower bound should advance to 2025-01-16
+        let analyzer = setup();
+        let expr = extract_where_clause("SELECT * FROM t WHERE dt > '2025-01-15'");
+
+        let tables = vec![make_table_ref("sales_data", None)];
+        let intervals = analyzer.extract_intervals(&expr, &tables);
+
+        let interval = intervals.get("sales_data").unwrap();
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-16".to_string()),
+            "Gt (exclusive) should advance start by one day"
+        );
+        assert!(interval.end.is_none());
+    }
+
+    #[test]
+    fn test_gteq_inclusive_lower_bound() {
+        // WHERE dt >= '2025-01-15'  →  lower bound should stay at 2025-01-15
+        let analyzer = setup();
+        let expr = extract_where_clause("SELECT * FROM t WHERE dt >= '2025-01-15'");
+
+        let tables = vec![make_table_ref("sales_data", None)];
+        let intervals = analyzer.extract_intervals(&expr, &tables);
+
+        let interval = intervals.get("sales_data").unwrap();
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-15".to_string()),
+            "GtEq (inclusive) should keep start unchanged"
+        );
+        assert!(interval.end.is_none());
+    }
+
+    #[test]
+    fn test_reversed_lt_exclusive_lower_bound() {
+        // WHERE '2025-01-15' < dt  =>  dt > '2025-01-15'  →  start should advance to 2025-01-16
+        let analyzer = setup();
+        let expr = extract_where_clause("SELECT * FROM t WHERE '2025-01-15' < dt");
+
+        let tables = vec![make_table_ref("sales_data", None)];
+        let intervals = analyzer.extract_intervals(&expr, &tables);
+
+        let interval = intervals.get("sales_data").unwrap();
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-16".to_string()),
+            "Reversed Lt (exclusive) should advance start by one day"
+        );
+    }
+
+    #[test]
+    fn test_reversed_lteq_inclusive_lower_bound() {
+        // WHERE '2025-01-15' <= dt  =>  dt >= '2025-01-15'  →  start stays at 2025-01-15
+        let analyzer = setup();
+        let expr = extract_where_clause("SELECT * FROM t WHERE '2025-01-15' <= dt");
+
+        let tables = vec![make_table_ref("sales_data", None)];
+        let intervals = analyzer.extract_intervals(&expr, &tables);
+
+        let interval = intervals.get("sales_data").unwrap();
+        assert_eq!(
+            interval.start.as_ref().unwrap(),
+            &DateBound::Literal("2025-01-15".to_string()),
+            "Reversed LtEq (inclusive) should keep start unchanged"
+        );
     }
 }

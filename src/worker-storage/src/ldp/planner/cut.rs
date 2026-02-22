@@ -728,9 +728,11 @@ fn reconstruct_plan_with_children(
         },
         Window {
             window_exprs,
+            partition_keys,
             input: _,
         } => Window {
             window_exprs: window_exprs.clone(),
+            partition_keys: partition_keys.clone(),
             input: Box::new(new_children[0].clone()),
         },
         SubqueryScan { alias, input: _ } => SubqueryScan {
@@ -918,32 +920,19 @@ fn has_local_scan(plan: &LogicalPlan) -> bool {
 }
 
 /// Determine the output format for a stage.
+///
+/// A stage executes **before** its `exchange_before` exchange. Therefore the stage
+/// output is determined by what exchange (if any) will consume this stage's data, not
+/// by the post-exchange distribution stored in `annotation.distribution`.
+///
+/// The previous first block checked `annotation.distribution` (the post-exchange
+/// distribution, i.e. what the *parent* sees after the exchange runs), which caused
+/// stages whose pre-exchange distribution was `Singleton` to be wrongly classified as
+/// `Partitioned` after the planner overwrote `annotation.distribution` with the
+/// post-exchange `HashPartitioned` value.
 fn determine_stage_output(annotated: &AnnotatedPlan) -> StageOutput {
-    use crate::ldp::Distribution;
-
-    // If the annotated node's output distribution is hash partitioned, mark the stage output
-    // as partitioned to align with downstream consumers.
-    if let Distribution::HashPartitioned { column_refs, .. } = &annotated.annotation.distribution {
-        let partitions = annotated
-            .exchange_before
-            .as_ref()
-            .and_then(|ex| {
-                if let Exchange::HashPartition { partitions, .. } = ex {
-                    Some(*partitions)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(policy_default_partitions);
-
-        return StageOutput::Partitioned {
-            partitions,
-            column_refs: column_refs.clone(),
-        };
-    }
-
-    // If this annotated node has an exchange_before, it will produce partitioned output
-    // for hash partition exchanges
+    // If this stage's output will be consumed by a HashPartition exchange, the
+    // stage produces partitioned output according to that exchange's spec.
     if let Some(Exchange::HashPartition {
         partitions,
         column_refs,
@@ -958,11 +947,6 @@ fn determine_stage_output(annotated: &AnnotatedPlan) -> StageOutput {
 
     // Default to stream output
     StageOutput::Stream
-}
-
-/// Default partitions helper (matches PlannerPolicy default).
-fn policy_default_partitions() -> u32 {
-    crate::ldp::planner::policy::PlannerPolicy::default().default_partitions
 }
 
 /// Assign target workers to stages based on distribution annotations.
@@ -1283,5 +1267,94 @@ mod tests {
             input: Box::new(scan.plan),
         };
         assert!(has_local_scan(&filter_with_scan));
+    }
+
+    // ── BUG-5 regression tests ─────────────────────────────────────────────────
+
+    /// Build a minimal AnnotatedPlan for a scan with fully customisable
+    /// `annotation.distribution` and `exchange_before`.
+    fn make_plan_with(dist: Distribution, exchange: Option<Exchange>) -> AnnotatedPlan {
+        let mut ap = create_scan_annotated("sales", vec!["w1", "w2"]);
+        ap.annotation.distribution = dist;
+        ap.exchange_before = exchange;
+        ap
+    }
+
+    /// BUG-5: `determine_stage_output` previously checked `annotation.distribution`
+    /// (the POST-exchange distribution) to decide if a stage is partitioned.  When
+    /// a node had `annotation.distribution = HashPartitioned` but NO hash-partition
+    /// exchange (e.g. natural epoch-partitioned scan at the plan root) the old code
+    /// wrongly returned `StageOutput::Partitioned`.
+    ///
+    /// After the fix only the `exchange_before = Some(HashPartition)` path triggers
+    /// `StageOutput::Partitioned`; everything else is `StageOutput::Stream`.
+    #[test]
+    fn test_determine_stage_output_stream_when_no_exchange() {
+        // HashPartitioned annotation but NO exchange_before → Stream, not Partitioned
+        let col_ref = ColumnRef {
+            table: Some("sales".to_string()),
+            column: "region".to_string(),
+        };
+        let hash_dist = Distribution::HashPartitioned {
+            column_refs: vec![col_ref],
+            workers: vec!["w1".into(), "w2".into()],
+        };
+        let ap = make_plan_with(hash_dist, None);
+        assert!(
+            matches!(determine_stage_output(&ap), StageOutput::Stream),
+            "BUG-5: no exchange_before should produce Stream even if annotation is HashPartitioned"
+        );
+    }
+
+    /// BUG-5: A Gather exchange must yield `StageOutput::Stream`, regardless of
+    /// what `annotation.distribution` was set to.
+    #[test]
+    fn test_determine_stage_output_stream_for_gather() {
+        // Annotation was incorrectly overwritten to HashPartitioned after the exchange
+        let col_ref = ColumnRef {
+            table: Some("sales".to_string()),
+            column: "id".to_string(),
+        };
+        let hash_dist = Distribution::HashPartitioned {
+            column_refs: vec![col_ref],
+            workers: vec!["coordinator".into()],
+        };
+        let ap = make_plan_with(
+            hash_dist,
+            Some(Exchange::Gather {
+                target: "coordinator".into(),
+            }),
+        );
+        assert!(
+            matches!(determine_stage_output(&ap), StageOutput::Stream),
+            "BUG-5: Gather exchange_before should always produce Stream"
+        );
+    }
+
+    /// BUG-5: A HashPartition exchange should still produce `StageOutput::Partitioned`
+    /// (this is the correct preserved behaviour).
+    #[test]
+    fn test_determine_stage_output_partitioned_for_hash_partition_exchange() {
+        let col_ref = ColumnRef {
+            table: Some("sales".to_string()),
+            column: "customer_id".to_string(),
+        };
+        let ap = make_plan_with(
+            Distribution::EpochPartitioned {
+                workers: vec!["w1".into(), "w2".into()],
+            },
+            Some(Exchange::hash_partition(vec![col_ref.clone()], 4)),
+        );
+        match determine_stage_output(&ap) {
+            StageOutput::Partitioned {
+                partitions,
+                column_refs,
+            } => {
+                assert_eq!(partitions, 4);
+                assert_eq!(column_refs.len(), 1);
+                assert_eq!(column_refs[0], col_ref);
+            }
+            other => panic!("expected Partitioned, got {:?}", other),
+        }
     }
 }
