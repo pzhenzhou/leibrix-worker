@@ -300,27 +300,46 @@ impl AdmissionController {
     }
 
     /// Check a query for time-range predicates on distributed tables.
+    ///
+    /// This method is table-scoped: it extracts qualified table references
+    /// (table name + optional alias) from FROM/JOIN clauses, then verifies
+    /// that time-range predicates reference the correct table via its name
+    /// or alias. This prevents false positives in multi-table queries where
+    /// an unrelated table happens to have a column with the same name as
+    /// the registered time column.
     fn check_query_time_ranges(&self, query: &Query) -> AdmissionResult<()> {
-        // Collect all table references
-        let tables_in_query = self.collect_table_references(query);
+        // Collect qualified table references (with aliases) from FROM/JOIN
+        let table_refs = self.collect_qualified_table_refs(query);
 
-        // Find distributed tables that are referenced
-        let distributed_tables: Vec<&RegisteredDataset> = tables_in_query
-            .iter()
-            .filter_map(|name| self.registered_datasets.get(name))
-            .collect();
+        // Build mapping: for each registered dataset found in the query,
+        // collect the set of valid qualifiers (table name + alias)
+        let mut dataset_qualifiers: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
+
+        for tr in &table_refs {
+            if self.registered_datasets.contains_key(&tr.table_name) {
+                let qualifiers = dataset_qualifiers
+                    .entry(tr.table_name.clone())
+                    .or_default();
+                qualifiers.insert(tr.table_name.clone());
+                if let Some(alias) = &tr.alias {
+                    qualifiers.insert(alias.clone());
+                }
+            }
+        }
 
         // If no distributed tables, pass
-        if distributed_tables.is_empty() {
+        if dataset_qualifiers.is_empty() {
             return Ok(());
         }
 
         // Collect all predicates
         let predicates = self.collect_predicates(query);
 
-        // Check each distributed table has a time predicate
-        for dataset in distributed_tables {
-            if !self.has_time_predicate(&predicates, &dataset.time_column_name) {
+        // Check each distributed table has a time predicate scoped to it
+        for (dataset_id, qualifiers) in &dataset_qualifiers {
+            let dataset = &self.registered_datasets[dataset_id];
+            if !self.has_time_predicate(&predicates, &dataset.time_column_name, qualifiers) {
                 return Err(AdmissionError::MissingTimeRange {
                     table_name: dataset.dataset_id.clone(),
                     time_column: dataset.time_column_name.clone(),
@@ -331,75 +350,91 @@ impl AdmissionController {
         Ok(())
     }
 
-    /// Collect all table names referenced in a query.
-    fn collect_table_references(&self, query: &Query) -> HashSet<String> {
-        let mut tables = HashSet::new();
+    /// Collect all qualified table references (name + alias) from a query.
+    fn collect_qualified_table_refs(&self, query: &Query) -> Vec<QualifiedTableRef> {
+        let mut refs = Vec::new();
 
         // Collect from CTEs
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
-                tables.extend(self.collect_table_references(&cte.query));
+                refs.extend(self.collect_qualified_table_refs(&cte.query));
             }
         }
 
         // Collect from body
-        self.collect_tables_from_set_expr(&query.body, &mut tables);
+        self.collect_qualified_refs_from_set_expr(&query.body, &mut refs);
 
-        tables
+        refs
     }
 
-    /// Collect tables from a set expression.
-    fn collect_tables_from_set_expr(&self, expr: &SetExpr, tables: &mut HashSet<String>) {
+    /// Collect qualified refs from a set expression.
+    fn collect_qualified_refs_from_set_expr(
+        &self,
+        expr: &SetExpr,
+        refs: &mut Vec<QualifiedTableRef>,
+    ) {
         match expr {
             SetExpr::Select(select) => {
-                self.collect_tables_from_select(select, tables);
+                self.collect_qualified_refs_from_select(select, refs);
             }
             SetExpr::Query(query) => {
-                tables.extend(self.collect_table_references(query));
+                refs.extend(self.collect_qualified_table_refs(query));
             }
             SetExpr::SetOperation { left, right, .. } => {
-                self.collect_tables_from_set_expr(left, tables);
-                self.collect_tables_from_set_expr(right, tables);
+                self.collect_qualified_refs_from_set_expr(left, refs);
+                self.collect_qualified_refs_from_set_expr(right, refs);
             }
             _ => {}
         }
     }
 
-    /// Collect tables from a select statement.
-    fn collect_tables_from_select(&self, select: &Select, tables: &mut HashSet<String>) {
+    /// Collect qualified refs from a select statement.
+    fn collect_qualified_refs_from_select(
+        &self,
+        select: &Select,
+        refs: &mut Vec<QualifiedTableRef>,
+    ) {
         for twj in &select.from {
-            self.collect_tables_from_table_with_joins(twj, tables);
+            self.collect_qualified_refs_from_table_with_joins(twj, refs);
         }
     }
 
-    /// Collect tables from table with joins.
-    fn collect_tables_from_table_with_joins(
+    /// Collect qualified refs from table with joins.
+    fn collect_qualified_refs_from_table_with_joins(
         &self,
         twj: &TableWithJoins,
-        tables: &mut HashSet<String>,
+        refs: &mut Vec<QualifiedTableRef>,
     ) {
-        self.collect_tables_from_table_factor(&twj.relation, tables);
+        self.collect_qualified_refs_from_table_factor(&twj.relation, refs);
 
         for join in &twj.joins {
-            self.collect_tables_from_table_factor(&join.relation, tables);
+            self.collect_qualified_refs_from_table_factor(&join.relation, refs);
         }
     }
 
-    /// Collect tables from table factor.
-    fn collect_tables_from_table_factor(&self, factor: &TableFactor, tables: &mut HashSet<String>) {
+    /// Collect qualified refs from a table factor.
+    fn collect_qualified_refs_from_table_factor(
+        &self,
+        factor: &TableFactor,
+        refs: &mut Vec<QualifiedTableRef>,
+    ) {
         match factor {
-            TableFactor::Table { name, .. } => {
+            TableFactor::Table { name, alias, .. } => {
                 if let Some(table_name) = extract_table_name(name) {
-                    tables.insert(table_name);
+                    let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+                    refs.push(QualifiedTableRef {
+                        table_name,
+                        alias: alias_name,
+                    });
                 }
             }
             TableFactor::Derived { subquery, .. } => {
-                tables.extend(self.collect_table_references(subquery));
+                refs.extend(self.collect_qualified_table_refs(subquery));
             }
             TableFactor::NestedJoin {
                 table_with_joins, ..
             } => {
-                self.collect_tables_from_table_with_joins(table_with_joins, tables);
+                self.collect_qualified_refs_from_table_with_joins(table_with_joins, refs);
             }
             _ => {}
         }
@@ -455,46 +490,98 @@ impl AdmissionController {
         }
     }
 
-    /// Check if predicates contain a time predicate for the given column.
-    fn has_time_predicate(&self, predicates: &[Expr], time_column: &str) -> bool {
+    /// Check if predicates contain a time predicate for the given column,
+    /// scoped to the specified table qualifiers.
+    fn has_time_predicate(
+        &self,
+        predicates: &[Expr],
+        time_column: &str,
+        valid_qualifiers: &HashSet<String>,
+    ) -> bool {
         for pred in predicates {
-            if self.expr_references_column(pred, time_column) {
+            if self.expr_references_column(pred, time_column, valid_qualifiers) {
                 return true;
             }
         }
         false
     }
 
-    /// Check if an expression references a column (potentially with comparison).
-    fn expr_references_column(&self, expr: &Expr, column_name: &str) -> bool {
+    /// Check if an expression references a column (potentially with comparison),
+    /// scoped to the specified table qualifiers.
+    ///
+    /// For bare identifiers (e.g., `dt`), accepts them as matching since SQL
+    /// itself would resolve them. For compound identifiers (e.g., `s.dt`),
+    /// the table qualifier must match one of the `valid_qualifiers` (table
+    /// name or alias of the registered dataset).
+    fn expr_references_column(
+        &self,
+        expr: &Expr,
+        column_name: &str,
+        valid_qualifiers: &HashSet<String>,
+    ) -> bool {
         match expr {
-            // Column reference
+            // Bare column reference (unqualified) — accept as potentially
+            // belonging to the registered dataset.
             Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column_name),
 
-            // Compound identifier like table.column
-            Expr::CompoundIdentifier(parts) => parts
-                .last()
-                .is_some_and(|p| p.value.eq_ignore_ascii_case(column_name)),
+            // Compound identifier like table.column or schema.table.column.
+            // The table qualifier (second-to-last part) must match one of
+            // the valid qualifiers for the registered dataset.
+            Expr::CompoundIdentifier(parts) => {
+                let col_matches = parts
+                    .last()
+                    .is_some_and(|p| p.value.eq_ignore_ascii_case(column_name));
+
+                if !col_matches {
+                    return false;
+                }
+
+                // Check that the table qualifier belongs to the registered dataset
+                if parts.len() >= 2 {
+                    let qualifier = &parts[parts.len() - 2].value;
+                    valid_qualifiers
+                        .iter()
+                        .any(|q| q.eq_ignore_ascii_case(qualifier))
+                } else {
+                    // Single-part compound identifier — treat like bare
+                    true
+                }
+            }
 
             // Binary comparison (col = x, col > x, etc.)
             Expr::BinaryOp { left, right, .. } => {
-                self.expr_references_column(left, column_name)
-                    || self.expr_references_column(right, column_name)
+                self.expr_references_column(left, column_name, valid_qualifiers)
+                    || self.expr_references_column(right, column_name, valid_qualifiers)
             }
 
             // BETWEEN expression
-            Expr::Between { expr: inner, .. } => self.expr_references_column(inner, column_name),
+            Expr::Between { expr: inner, .. } => {
+                self.expr_references_column(inner, column_name, valid_qualifiers)
+            }
 
             // IN expression
-            Expr::InList { expr: inner, .. } => self.expr_references_column(inner, column_name),
+            Expr::InList { expr: inner, .. } => {
+                self.expr_references_column(inner, column_name, valid_qualifiers)
+            }
 
             // Nested/parenthesized
-            Expr::Nested(inner) => self.expr_references_column(inner, column_name),
+            Expr::Nested(inner) => {
+                self.expr_references_column(inner, column_name, valid_qualifiers)
+            }
 
             // Other cases don't reference the column directly
             _ => false,
         }
     }
+}
+
+/// A table reference extracted from FROM/JOIN clauses with its optional alias.
+#[derive(Debug)]
+struct QualifiedTableRef {
+    /// The actual table name (e.g., "sales_data").
+    table_name: String,
+    /// The alias used in the query, if any (e.g., "s").
+    alias: Option<String>,
 }
 
 /// Extract table name from ObjectName.
@@ -656,5 +743,91 @@ mod tests {
 
         let result = controller.check(sql);
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Table-Scoped Predicate Tests (FUNC-11)
+    // =========================================================================
+
+    #[test]
+    fn test_reject_cross_table_false_positive() {
+        // Register sales_data with time column 'dt'.
+        // The events table also has a 'dt' column but is NOT registered.
+        // A predicate on e.dt must NOT satisfy the time-range requirement for sales_data.
+        let controller = create_controller(&[("sales_data", "dt")]);
+        let sql = "SELECT * FROM sales_data s JOIN events e ON s.id = e.id \
+                   WHERE e.dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        if let AdmissionError::MissingTimeRange { table_name, .. } = err {
+            assert_eq!(table_name, "sales_data");
+        } else {
+            panic!("Expected MissingTimeRange error for sales_data");
+        }
+    }
+
+    #[test]
+    fn test_accept_correctly_qualified_predicate() {
+        let controller = create_controller(&[("sales_data", "dt")]);
+        // s.dt correctly qualifies to sales_data
+        let sql = "SELECT * FROM sales_data s JOIN events e ON s.id = e.id \
+                   WHERE s.dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_when_both_tables_registered_only_one_qualified() {
+        // Both registered, both require time predicates.
+        // Only sales_data has a correctly-scoped predicate.
+        let controller =
+            create_controller(&[("sales_data", "dt"), ("events", "event_time")]);
+        let sql = "SELECT * FROM sales_data s JOIN events e ON s.id = e.id \
+                   WHERE s.dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        if let AdmissionError::MissingTimeRange { table_name, .. } = err {
+            assert_eq!(table_name, "events");
+        } else {
+            panic!("Expected MissingTimeRange error for events");
+        }
+    }
+
+    #[test]
+    fn test_accept_unqualified_table_name_as_qualifier() {
+        // When no alias is used, the full table name is the qualifier.
+        let controller = create_controller(&[("sales_data", "dt")]);
+        let sql = "SELECT * FROM sales_data WHERE sales_data.dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_accept_bare_column_single_table() {
+        // Bare (unqualified) column in a single-table query still passes.
+        let controller = create_controller(&[("sales_data", "dt")]);
+        let sql = "SELECT * FROM sales_data WHERE dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_wrong_alias_predicate() {
+        // Alias 'x' does not refer to any registered dataset.
+        let controller = create_controller(&[("sales_data", "dt")]);
+        let sql = "SELECT * FROM sales_data s JOIN other_table x ON s.id = x.id \
+                   WHERE x.dt >= '2025-01-01'";
+
+        let result = controller.check(sql);
+        assert!(result.is_err());
     }
 }

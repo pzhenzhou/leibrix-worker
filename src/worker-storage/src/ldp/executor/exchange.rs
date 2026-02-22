@@ -21,7 +21,7 @@ use arrow::datatypes::SchemaRef;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Parameters for a distributed hash-partition exchange.
 pub struct HashPartitionRequest<'a> {
@@ -1002,18 +1002,17 @@ impl DistributedExchangeRuntime {
             }
         }
 
-        if !errors.is_empty() && all_batches.is_empty() {
-            return Err(ExchangeError::FetchFailed(errors.join("; ")));
-        }
-
+        // Any worker failure means the gathered result is incomplete — rows held
+        // by the failed worker are simply absent.  For correctness the entire
+        // gather must fail so the query is not silently answered with partial data.
         if !errors.is_empty() {
-            warn!(
-                query_id = query_id,
-                stage_id = %stage_id,
-                "Partial gather success: {} batches collected, {} workers failed",
+            return Err(ExchangeError::FetchFailed(format!(
+                "{} of {} source workers failed (discarding {} batches collected from other workers): {}",
+                errors.len(),
+                source_workers.len(),
                 all_batches.len(),
-                errors.len()
-            );
+                errors.join("; ")
+            )));
         }
 
         // If all batches are empty but we observed a schema, return one empty
@@ -1562,5 +1561,43 @@ mod tests {
         let refs: Vec<crate::sql::logical_plan::ColumnRef> = vec![];
         let indices = resolve_column_indices(&refs, &schema).unwrap();
         assert_eq!(indices, Vec::<u32>::new());
+    }
+
+    // ========================================================================
+    // Gather Correctness Test
+    // ========================================================================
+
+    /// Verify that `execute_gather` fails immediately when any source worker
+    /// returns an error, even if other workers have already returned data.
+    ///
+    /// Previously the code only failed when *all* batches were empty; now any
+    /// worker failure is a hard error to prevent silently incomplete results.
+    #[tokio::test]
+    async fn test_gather_fails_on_any_worker_error() {
+        let runtime = DistributedExchangeRuntime::with_new_pool("test-tenant".to_string());
+
+        // Two workers — neither has a registered ticket, so both fetch attempts
+        // will return ExchangeError::FetchFailed (ticket not found).
+        let source_workers = vec![WorkerId::from("w1"), WorkerId::from("w2")];
+        let target = WorkerId::from("coordinator");
+
+        let result = runtime
+            .execute_gather("q-test", StageId(1), &source_workers, &target)
+            .await;
+
+        // Must be an error — not silent partial success
+        assert!(
+            result.is_err(),
+            "gather must fail when any source worker fails"
+        );
+        if let Err(ExchangeError::FetchFailed(msg)) = result {
+            // Error message must mention the worker count context
+            assert!(
+                msg.contains("source workers failed"),
+                "error message should describe partial failure context, got: {msg}"
+            );
+        } else {
+            panic!("expected ExchangeError::FetchFailed");
+        }
     }
 }

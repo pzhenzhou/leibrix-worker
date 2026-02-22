@@ -78,7 +78,7 @@ use crate::ldp::planner::metadata::{InMemoryMetadata, Metadata};
 use crate::ldp::planner::pipeline::{plan_ldp, PipelineError};
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::storage_metadata::ClusterMetadata;
-use crate::ldp::{Exchange, ExchangeId, LdpPlan, Stage, StageId, WorkerId};
+use crate::ldp::{Exchange, ExchangeId, LdpPlan, QueryId, Stage, StageId, WorkerId};
 use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
 use arrow::datatypes::{DataType, Schema};
 
@@ -129,6 +129,9 @@ pub enum CoordinatorError {
     /// Invalid configuration.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+    /// Invalid execution plan (e.g., cyclic stage dependencies).
+    #[error("Invalid plan: {0}")]
+    InvalidPlan(String),
 }
 
 impl From<StageExecutionError> for CoordinatorError {
@@ -423,8 +426,24 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// * `Ok(QueryResult)` - Query completed successfully.
     /// * `Err(CoordinatorError)` - Query failed.
     pub async fn execute_query(&self, sql: &str) -> Result<QueryResult, CoordinatorError> {
+        let timeout = self.config.query_timeout;
+        match tokio::time::timeout(timeout, self.execute_query_inner(sql)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "execute_query: query timed out"
+                );
+                Err(CoordinatorError::Timeout(timeout))
+            }
+        }
+    }
+
+    /// Inner implementation of execute_query, called within a timeout wrapper.
+    async fn execute_query_inner(&self, sql: &str) -> Result<QueryResult, CoordinatorError> {
         let total_start = Instant::now();
         let query_id = generate_query_id();
+        let query_id_str = query_id.as_ref();
 
         info!(query_id = %query_id, "Starting query execution");
 
@@ -452,7 +471,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
         // Step 3: LDP planning
         let planning_start = Instant::now();
-        let plan = self.plan_query(transformed_sql, &query_id).await?;
+        let plan = self.plan_query(transformed_sql, query_id_str).await?;
         let planning_time = planning_start.elapsed();
 
         info!(
@@ -464,7 +483,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
         // Step 4: Execute plan
         let execution_start = Instant::now();
-        let (batches, workers_used) = self.execute_plan(&plan, &query_id).await?;
+        let (batches, workers_used) = self.execute_plan(&plan, query_id_str).await?;
         let execution_time = execution_start.elapsed();
 
         // Calculate stats
@@ -493,7 +512,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         );
 
         Ok(QueryResult {
-            query_id,
+            query_id: query_id.0,
             batches,
             stats,
         })
@@ -501,6 +520,26 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
     /// Execute a SQL query with a pre-generated query ID.
     pub async fn execute_query_with_id(
+        &self,
+        sql: &str,
+        query_id: &str,
+    ) -> Result<QueryResult, CoordinatorError> {
+        let timeout = self.config.query_timeout;
+        match tokio::time::timeout(timeout, self.execute_query_with_id_inner(sql, query_id)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(
+                    query_id = %query_id,
+                    timeout_secs = timeout.as_secs(),
+                    "execute_query_with_id: query timed out"
+                );
+                Err(CoordinatorError::Timeout(timeout))
+            }
+        }
+    }
+
+    /// Inner implementation of execute_query_with_id, called within a timeout wrapper.
+    async fn execute_query_with_id_inner(
         &self,
         sql: &str,
         query_id: &str,
@@ -621,8 +660,13 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     ///
     /// This groups stages by dependency levels, allowing stages at the same level
     /// to be executed in parallel since they don't depend on each other.
-    fn compute_execution_levels(&self, plan: &LdpPlan) -> Vec<Vec<StageId>> {
+    fn compute_execution_levels(
+        &self,
+        plan: &LdpPlan,
+    ) -> Result<Vec<Vec<StageId>>, CoordinatorError> {
         use std::collections::{HashMap, VecDeque};
+
+        let total_stages = plan.stages.len();
 
         // Calculate in-degrees for each stage (number of dependencies)
         let mut in_degree: HashMap<StageId, usize> = HashMap::new();
@@ -645,6 +689,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             .collect();
 
         let mut levels = Vec::new();
+        let mut processed = 0usize;
 
         // Process stages in topological order, grouping by level
         while !queue.is_empty() {
@@ -655,6 +700,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             for _ in 0..current_level_size {
                 if let Some(stage_id) = queue.pop_front() {
                     current_level.push(stage_id);
+                    processed += 1;
 
                     // Reduce in-degree of dependent stages
                     for edge in &plan.edges {
@@ -673,19 +719,25 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                 }
             }
 
-            // Defensive check: if we have stages remaining but couldn't process any this round,
-            // there's a cycle in the DAG (should never happen in valid plans)
-            if current_level.is_empty() && !queue.is_empty() {
-                panic!(
-                    "Cycle detected in stage dependencies. Remaining stages: {:?}",
-                    queue.iter().collect::<Vec<_>>()
-                );
-            }
-
             levels.push(current_level);
         }
 
-        levels
+        // If not all stages were processed, there is a cycle in the dependency graph.
+        // Stages involved in a cycle never reach in-degree 0 and therefore never enter
+        // the queue, so `processed` will be less than `total_stages`.
+        if processed < total_stages {
+            let unprocessed: Vec<StageId> = in_degree
+                .iter()
+                .filter(|(_, &deg)| deg > 0)
+                .map(|(&id, _)| id)
+                .collect();
+            return Err(CoordinatorError::InvalidPlan(format!(
+                "Cycle detected in stage dependencies. Stages involved: {:?}",
+                unprocessed
+            )));
+        }
+
+        Ok(levels)
     }
 
     /// Execute plan locally (single-node).
@@ -710,7 +762,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         let mut workers_used: Vec<WorkerId> = Vec::new();
 
         // Execute stages in parallel levels based on dependencies
-        let execution_levels = self.compute_execution_levels(plan);
+        let execution_levels = self.compute_execution_levels(plan)?;
 
         for level_stages in execution_levels {
             // Execute all stages at this level concurrently
@@ -865,7 +917,7 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         let mut workers_used: Vec<WorkerId> = Vec::new();
 
         // Execute stages in parallel levels
-        let execution_levels = self.compute_execution_levels(plan);
+        let execution_levels = self.compute_execution_levels(plan)?;
 
         for level_stages in execution_levels {
             let level_futures = level_stages.iter().map(|&stage_id| {
@@ -934,6 +986,18 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
 
                         for ticket in tickets.all() {
                             all_tickets.add(ticket.clone());
+                            // BUG-8 fix: register each ticket with the exchange
+                            // runtime so that downstream stages can fetch results
+                            // via exchange_runtime.get_ticket() when resolving
+                            // ExchangeInput dependencies.
+                            exchange_runtime
+                                .register_ticket(
+                                    &ticket.query_id,
+                                    ticket.stage_id,
+                                    &ticket.worker_id,
+                                    ticket.ticket_id.as_bytes().to_vec(),
+                                )
+                                .await;
                             if !stage_workers.contains(&ticket.worker_id) {
                                 stage_workers.push(ticket.worker_id.clone());
                             }
@@ -1266,6 +1330,12 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     }
 
     /// Execute a stage with retry logic.
+    ///
+    /// Only transient errors (network unavailable, deadline exceeded,
+    /// connection refused, timed-out, broken pipe) are retried.
+    /// Non-transient errors (SQL syntax errors, column-not-found, unsupported
+    /// operations) are returned immediately to avoid wasting time on retries
+    /// that will never succeed.
     async fn execute_stage_with_retry<E: StageExecutor>(
         &self,
         executor: &E,
@@ -1280,15 +1350,29 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             match executor.submit_stage(query_id, stage, inputs.clone()).await {
                 Ok(tickets) => return Ok(tickets),
                 Err(e) => {
+                    let exec_err = ExecutionError::StageFailed(stage.stage_id, e.to_string());
+
+                    // BUG-9 fix: non-retryable errors are returned immediately.
+                    if !is_retryable_error(&exec_err) {
+                        warn!(
+                            query_id = %query_id,
+                            stage_id = %stage.stage_id,
+                            error = %e,
+                            "Stage failed with non-retryable error, aborting without retry"
+                        );
+                        return Err(exec_err);
+                    }
+
                     retries += 1;
                     warn!(
                         query_id = %query_id,
                         stage_id = %stage.stage_id,
                         retry = retries,
+                        max_retries = self.config.max_stage_retries,
                         error = %e,
-                        "Stage execution failed, retrying"
+                        "Stage execution failed with transient error, retrying"
                     );
-                    last_error = Some(e);
+                    last_error = Some(exec_err);
 
                     // Exponential backoff
                     if retries <= self.config.max_stage_retries {
@@ -1303,7 +1387,9 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
             stage.stage_id,
             format!(
                 "Failed after {} retries: {}",
-                retries,
+                // BUG-9 fix: report configured max retries, not the loop counter
+                // (which is max_stage_retries + 1 when the loop exits).
+                self.config.max_stage_retries,
                 last_error.map(|e| e.to_string()).unwrap_or_default()
             ),
         ))
@@ -1634,14 +1720,14 @@ fn arrow_type_to_duckdb_type(data_type: &DataType) -> &str {
     }
 }
 
-/// Generate a unique query ID.
-fn generate_query_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("q_{:x}", timestamp % 0xFFFFFFFFFFFF)
+/// Generate a unique query ID using UUID v4.
+///
+/// Previous implementation used a 48-bit truncated nanosecond timestamp
+/// (`timestamp % 0xFFFFFFFFFFFF`) which could collide when two queries
+/// were issued in the same nanosecond.  UUID v4 provides 122 bits of
+/// randomness, making collisions astronomically unlikely.
+fn generate_query_id() -> QueryId {
+    QueryId::from(format!("q_{}", uuid::Uuid::new_v4()))
 }
 
 // ============================================================================
@@ -1669,6 +1755,29 @@ impl LdpCoordinator<ClusterMetadata> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+// ── Retry helpers ──────────────────────────────────────────────────────────────
+
+/// Returns `true` if `e` represents a *transient* failure that may succeed on
+/// a subsequent attempt.
+///
+/// Retryable conditions (network-layer failures):
+/// - `UNAVAILABLE`      — gRPC / Flight service temporarily unreachable
+/// - `DEADLINE_EXCEEDED` — request timed out in-flight
+/// - `connection refused` — peer process not yet ready
+/// - `timed out`        — OS-level socket timeout
+/// - `broken pipe`      — peer closed connection mid-stream
+///
+/// Everything else (SQL syntax errors, column-not-found, unsupported features,
+/// permission errors) is **non-retryable** and should be surfaced immediately.
+fn is_retryable_error(e: &ExecutionError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("unavailable")
+        || msg.contains("deadline_exceeded")
+        || msg.contains("connection refused")
+        || msg.contains("timed out")
+        || msg.contains("broken pipe")
+}
 
 #[cfg(test)]
 mod tests {
@@ -1713,8 +1822,9 @@ mod tests {
         let id2 = generate_query_id();
 
         assert_ne!(id1, id2);
-        assert!(id1.starts_with("q_"));
-        assert_eq!(id1.len(), 14); // "q_" + 12 chars
+        // UUID v4 format: "q_<uuid>" where uuid is 36 chars (8-4-4-4-12 with hyphens)
+        assert!(id1.as_ref().starts_with("q_"));
+        assert_eq!(id1.as_ref().len(), 38); // "q_" + 36 chars
     }
 
     #[tokio::test]
@@ -1726,5 +1836,217 @@ mod tests {
         assert_eq!(config.tenant_id, "tenant1");
         assert!(config.distributed);
         assert_eq!(config.query_timeout, Duration::from_secs(60));
+    }
+
+    // ── BUG-6 regression tests ─────────────────────────────────────────────────
+
+    /// Build a minimal LdpPlan containing `n` stages (StageId 0..n-1) with no
+    /// edges (all independent).
+    #[allow(dead_code)]
+    fn make_plan_n_stages(n: u32) -> LdpPlan {
+        use crate::ldp::{LdpPlan, QueryId, Stage, StageId, WorkerId};
+        let mut plan = LdpPlan::new(QueryId::from("test"), WorkerId::from("coordinator"));
+        for i in 0..n {
+            plan.stages.push(Stage::new(StageId(i), String::new()));
+        }
+        plan.root_stage = StageId(n - 1);
+        plan
+    }
+
+    /// BUG-6: A cyclic plan must return Err(CoordinatorError::InvalidPlan) instead
+    /// of panicking.
+    ///
+    /// Before the fix `compute_execution_levels` contained a `panic!` inside the
+    /// topological-sort loop that was unreachable because cycles cause stages to
+    /// never enter the queue (in-degree never drops to zero).  After draining the
+    /// queue the function returned a partial level list, silently skipping cyclic
+    /// stages.  The `panic!` check was inside the loop and could never trigger.
+    ///
+    /// After the fix the function detects the cycle AFTER the while loop by
+    /// comparing processed stage count with total stage count, and returns
+    /// `Err(CoordinatorError::InvalidPlan(...))`.
+    #[test]
+    fn test_compute_execution_levels_detects_cycle() {
+        use crate::ldp::{
+            Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId, WorkerId,
+        };
+
+        let mut plan = LdpPlan::new(QueryId::from("q_cycle"), WorkerId::from("coordinator"));
+        // Three stages
+        plan.stages.push(Stage::new(StageId(0), String::new()));
+        plan.stages.push(Stage::new(StageId(1), String::new()));
+        plan.stages.push(Stage::new(StageId(2), String::new()));
+        plan.root_stage = StageId(2);
+
+        // Stage 2 depends on stage 1; stage 1 depends on stage 0; stage 0 depends on stage 2.
+        // This creates a cycle: 2 → 1 → 0 → 2.
+        let make_edge = |from: u32, to: u32| ExchangeEdge {
+            exchange_id: ExchangeId(from),
+            kind: Exchange::Gather {
+                target: WorkerId::from("coordinator"),
+            },
+            from_stage: StageId(from),
+            to_stage: StageId(to),
+            partition_to_worker: vec![],
+        };
+        plan.edges.push(make_edge(2, 1)); // stage 1 needs stage 2 to run first
+        plan.edges.push(make_edge(1, 0)); // stage 0 needs stage 1 to run first
+        plan.edges.push(make_edge(0, 2)); // stage 2 needs stage 0 to run first (cycle!)
+
+        let coordinator = LdpCoordinator::simple("tenant").unwrap();
+        let result = coordinator.compute_execution_levels(&plan);
+
+        assert!(
+            result.is_err(),
+            "cyclic plan must return Err, not Ok({:?})",
+            result.ok()
+        );
+        match result.unwrap_err() {
+            CoordinatorError::InvalidPlan(msg) => {
+                assert!(
+                    msg.contains("Cycle"),
+                    "error message should mention cycle: {msg}"
+                );
+            }
+            other => panic!("expected InvalidPlan, got {:?}", other),
+        }
+    }
+
+    /// BUG-6: A valid (acyclic) plan must succeed and return correct execution levels.
+    ///
+    /// Plan: stage 0 → stage 1 → stage 2 (simple chain, three levels).
+    #[test]
+    fn test_compute_execution_levels_linear_chain() {
+        use crate::ldp::{
+            Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId, WorkerId,
+        };
+
+        let mut plan = LdpPlan::new(QueryId::from("q_linear"), WorkerId::from("coordinator"));
+        plan.stages.push(Stage::new(StageId(0), String::new()));
+        plan.stages.push(Stage::new(StageId(1), String::new()));
+        plan.stages.push(Stage::new(StageId(2), String::new()));
+        plan.root_stage = StageId(2);
+
+        // 0 → 1 → 2
+        let make_edge = |from: u32, to: u32| ExchangeEdge {
+            exchange_id: ExchangeId(from),
+            kind: Exchange::Gather {
+                target: WorkerId::from("coordinator"),
+            },
+            from_stage: StageId(from),
+            to_stage: StageId(to),
+            partition_to_worker: vec![],
+        };
+        plan.edges.push(make_edge(0, 1));
+        plan.edges.push(make_edge(1, 2));
+
+        let coordinator = LdpCoordinator::simple("tenant").unwrap();
+        let levels = coordinator
+            .compute_execution_levels(&plan)
+            .expect("acyclic plan must succeed");
+
+        // Level 0: stage 0 (no deps), level 1: stage 1, level 2: stage 2
+        assert_eq!(levels.len(), 3, "expected 3 levels: {:?}", levels);
+        assert_eq!(levels[0], vec![StageId(0)]);
+        assert_eq!(levels[1], vec![StageId(1)]);
+        assert_eq!(levels[2], vec![StageId(2)]);
+    }
+
+    /// Plan with two independent leaf stages (diamond shape) — both must appear
+    /// in the same level.
+    #[test]
+    fn test_compute_execution_levels_fan_in() {
+        use crate::ldp::{
+            Exchange, ExchangeEdge, ExchangeId, LdpPlan, QueryId, Stage, StageId, WorkerId,
+        };
+
+        // Stages: 0 and 1 are independent; stage 2 depends on both.
+        let mut plan = LdpPlan::new(QueryId::from("q_fan"), WorkerId::from("coordinator"));
+        plan.stages.push(Stage::new(StageId(0), String::new()));
+        plan.stages.push(Stage::new(StageId(1), String::new()));
+        plan.stages.push(Stage::new(StageId(2), String::new()));
+        plan.root_stage = StageId(2);
+
+        let make_edge = |from: u32, to: u32| ExchangeEdge {
+            exchange_id: ExchangeId(from),
+            kind: Exchange::Gather {
+                target: WorkerId::from("coordinator"),
+            },
+            from_stage: StageId(from),
+            to_stage: StageId(to),
+            partition_to_worker: vec![],
+        };
+        plan.edges.push(make_edge(0, 2));
+        plan.edges.push(make_edge(1, 2));
+
+        let coordinator = LdpCoordinator::simple("tenant").unwrap();
+        let levels = coordinator
+            .compute_execution_levels(&plan)
+            .expect("fan-in plan must succeed");
+
+        assert_eq!(levels.len(), 2, "expected 2 levels: {:?}", levels);
+        // Level 0: stages 0 and 1 (order may vary)
+        let mut level0 = levels[0].clone();
+        level0.sort();
+        assert_eq!(level0, vec![StageId(0), StageId(1)]);
+        assert_eq!(levels[1], vec![StageId(2)]);
+    }
+
+    // ── BUG-9 regression tests ─────────────────────────────────────────────────
+
+    /// BUG-9: Network / transient errors must be classified as retryable.
+    #[test]
+    fn test_is_retryable_error_transient() {
+        use crate::ldp::StageId;
+        let cases: &[&str] = &[
+            "UNAVAILABLE: worker temporarily down",
+            "status: DEADLINE_EXCEEDED",
+            "connection refused (os error 111)",
+            "request timed out after 5s",
+            "broken pipe",
+            // case-insensitive variants
+            "Connection Refused",
+            "Timed Out",
+        ];
+        for msg in cases {
+            let err = ExecutionError::StageFailed(StageId(0), msg.to_string());
+            assert!(is_retryable_error(&err), "expected retryable for: {msg}");
+        }
+    }
+
+    /// BUG-9: Semantic / permanent errors must NOT be retried.
+    #[test]
+    fn test_is_retryable_error_permanent() {
+        use crate::ldp::StageId;
+        let cases: &[&str] = &[
+            "SQL parse error: unexpected token",
+            "column \"foo\" does not exist",
+            "unsupported feature: LATERAL JOIN",
+            "permission denied",
+            "out of memory",
+            "table not found: sales",
+        ];
+        for msg in cases {
+            let err = ExecutionError::StageFailed(StageId(0), msg.to_string());
+            assert!(
+                !is_retryable_error(&err),
+                "expected non-retryable for: {msg}"
+            );
+        }
+    }
+
+    /// BUG-9: Other ExecutionError variants (not StageFailed) are non-retryable.
+    #[test]
+    fn test_is_retryable_error_other_variants() {
+        use crate::ldp::StageId;
+        assert!(!is_retryable_error(&ExecutionError::StageNotFound(
+            StageId(1)
+        )));
+        assert!(!is_retryable_error(&ExecutionError::ExchangeFailed(
+            "schema mismatch".to_string()
+        )));
+        assert!(!is_retryable_error(&ExecutionError::InvalidPlan(
+            "no stages".to_string()
+        )));
     }
 }

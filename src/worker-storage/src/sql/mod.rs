@@ -61,7 +61,6 @@
 //! - Dynamic SQL (table names in variables) is not supported
 
 mod admission;
-mod analyzer;
 mod boolean_analyzer;
 mod discovery;
 mod error;

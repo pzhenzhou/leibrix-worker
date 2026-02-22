@@ -10,7 +10,7 @@ use chrono::NaiveDate;
 use sqlparser::ast::*;
 
 use super::admission::{AdmissionController, AdmissionError};
-use super::analyzer::PredicateAnalyzer;
+use super::boolean_analyzer::BooleanExprAnalyzer;
 use super::discovery::TableDiscovery;
 use super::error::{SqlTransformError, TransformError};
 use super::parser::{parse_sql, to_sql};
@@ -149,14 +149,35 @@ impl SqlTransformer {
             });
         }
 
-        // Phase 3: Extract date ranges
+        // Phase 3: Extract date ranges using Boolean interval algebra.
+        //
+        // BooleanExprAnalyzer correctly handles OR predicates (union of intervals)
+        // unlike the old PredicateAnalyzer which silently dropped OR branches.
+        // We extract only the top-level WHERE clause; correctness for CTEs,
+        // subqueries, and set operations is maintained by the Double-Guard
+        // strategy (original WHERE predicates are always kept in the output SQL).
         let time_columns: HashMap<String, String> = self
             .registered_datasets
             .iter()
             .map(|(id, ds)| (id.clone(), ds.time_column_name.clone()))
             .collect();
-        let analyzer = PredicateAnalyzer::new(time_columns);
-        let date_ranges = analyzer.extract_date_ranges(&stmt, &tables)?;
+        let analyzer = BooleanExprAnalyzer::new(time_columns);
+        let where_expr = extract_where_clause(&stmt);
+        let date_ranges: HashMap<String, DateRange> = if let Some(expr) = where_expr {
+            analyzer
+                .extract_intervals(&expr, &tables)
+                .into_iter()
+                .map(|(k, v)| (k, DateRange::from(v)))
+                .collect()
+        } else {
+            // No WHERE clause at the top level — fall back to wide-scan bounds.
+            // Double-Guard ensures correctness: the macro call uses the full epoch
+            // range while the original (empty) WHERE is preserved verbatim.
+            tables
+                .iter()
+                .map(|t| (t.dataset_id.clone(), DateRange::default()))
+                .collect()
+        };
 
         // Build replacement map: dataset_id -> (macro_name, date_range)
         let replacements: HashMap<String, (&RegisteredDataset, DateRange)> = tables
@@ -446,6 +467,25 @@ impl Default for SqlTransformer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Extract the top-level WHERE clause `Expr` from a `Statement`.
+///
+/// Returns `Some(expr)` for simple `SELECT … WHERE …` queries.
+/// For set operations (UNION / INTERSECT / EXCEPT), CTEs whose WHERE
+/// clause is inside the CTE body, and subqueries, returns `None` so the
+/// caller falls back to wide-scan bounds.
+///
+/// Correctness is preserved by the Double-Guard strategy: the original
+/// WHERE predicates are always emitted verbatim in the output SQL; the
+/// macro parameters only affect epoch pruning, not row filtering.
+fn extract_where_clause(stmt: &Statement) -> Option<Expr> {
+    if let Statement::Query(query) = stmt {
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            return select.selection.clone();
+        }
+    }
+    None
 }
 
 /// Extract table name from ObjectName.

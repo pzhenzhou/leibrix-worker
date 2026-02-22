@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -12,8 +13,9 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Ticket};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::ldp::executor::stage::{StageExecutionError, StageExecutor, StageTicket, StageTickets};
 use crate::ldp::proto_convert::{
@@ -24,6 +26,41 @@ use crate::ldp::{Stage, StageId, StageOutput, WorkerId};
 // ============================================================================
 // Worker Connection Pool
 // ============================================================================
+
+/// Default TTL for cached Flight connections (5 minutes).
+const CONNECTION_TTL_DEFAULT: Duration = Duration::from_secs(300);
+
+/// Hard upper-bound on the number of cached connections.
+const MAX_CONNECTIONS_CAP: usize = 100;
+
+/// Configuration for [`WorkerConnectionPool`].
+#[derive(Debug, Clone)]
+pub struct WorkerConnectionPoolConfig {
+    /// How long a cached connection remains valid before it is evicted.
+    /// Default: 5 minutes.
+    pub connection_ttl: Duration,
+    /// Maximum number of cached connections.
+    /// `0` means "use the number of registered workers, capped at
+    /// [`MAX_CONNECTIONS_CAP`]".  Any non-zero value is capped at
+    /// [`MAX_CONNECTIONS_CAP`].  Default: 0 (dynamic).
+    pub max_connections: usize,
+}
+
+impl Default for WorkerConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            connection_ttl: CONNECTION_TTL_DEFAULT,
+            max_connections: 0,
+        }
+    }
+}
+
+/// A timestamped, cached connection entry stored inside a per-worker mutex.
+struct CachedEntry {
+    conn: WorkerConnection,
+    /// When this connection was established; used for TTL eviction.
+    created_at: Instant,
+}
 
 /// Connection to a remote worker's Flight service.
 #[derive(Clone)]
@@ -52,22 +89,57 @@ impl WorkerConnection {
         let client = FlightServiceClient::new(channel);
         Ok(Self { worker_id, client })
     }
+
+    /// Perform a lightweight health check by sending a `health_check` DoAction.
+    ///
+    /// Returns `true` if the remote peer responded without a transport error.
+    /// The response payload is intentionally ignored — any successful gRPC
+    /// round-trip is sufficient proof that the channel is alive.
+    pub async fn health_check(&mut self) -> bool {
+        let action = Action {
+            r#type: "health_check".to_string(),
+            body: vec![].into(),
+        };
+        match self.client.do_action(action).await {
+            Ok(response) => {
+                // Drain the single-message response to release server resources.
+                let mut stream = response.into_inner();
+                let _ = stream.message().await;
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
-/// Pool of connections to remote workers.
+/// Pool of connections to remote workers, with TTL eviction, per-worker
+/// mutex-serialised connection setup, health checks, and a configurable cap.
 pub struct WorkerConnectionPool {
-    /// Map from worker ID to connection.
-    connections: DashMap<WorkerId, WorkerConnection>,
+    /// Per-worker mutex-guarded connection slot.
+    ///
+    /// Using `Arc<AsyncMutex<Option<CachedEntry>>>` per worker guarantees that
+    /// at most one `connect()` call runs concurrently for any given worker,
+    /// eliminating the double-connect race that plain `DashMap` check-then-act
+    /// patterns suffer from.
+    connections: DashMap<WorkerId, Arc<AsyncMutex<Option<CachedEntry>>>>,
     /// Map from worker ID to endpoint URL.
     endpoints: DashMap<WorkerId, String>,
+    /// Pool configuration.
+    config: WorkerConnectionPoolConfig,
 }
 
 impl WorkerConnectionPool {
-    /// Create a new empty connection pool.
+    /// Create a new empty connection pool with default configuration.
     pub fn new() -> Self {
+        Self::with_config(WorkerConnectionPoolConfig::default())
+    }
+
+    /// Create a new pool with the supplied configuration.
+    pub fn with_config(config: WorkerConnectionPoolConfig) -> Self {
         Self {
             connections: DashMap::new(),
             endpoints: DashMap::new(),
+            config,
         }
     }
 
@@ -77,16 +149,66 @@ impl WorkerConnectionPool {
     }
 
     /// Get or create a connection to a worker.
+    ///
+    /// # Guarantees
+    ///
+    /// * **No double-connect race**: the per-worker `AsyncMutex` ensures only
+    ///   one caller at a time attempts to establish a new connection to any
+    ///   given worker.
+    /// * **TTL eviction**: connections older than `config.connection_ttl` are
+    ///   evicted and re-established transparently.
+    /// * **Health check**: before returning a cached connection, a lightweight
+    ///   `health_check` DoAction is sent; unhealthy connections are evicted and
+    ///   reconnected.
+    /// * **Cap enforcement**: if the pool is at capacity, the oldest cached
+    ///   connection (across all workers) is evicted first.
     pub async fn get_connection(
         &self,
         worker_id: &WorkerId,
     ) -> Result<WorkerConnection, StageExecutionError> {
-        // Check if we already have a connection
-        if let Some(conn) = self.connections.get(worker_id) {
-            return Ok(conn.clone());
+        // Step 1 — Atomically obtain the per-worker slot.
+        // `DashMap::entry(...).or_insert_with(...)` is synchronous, so this is
+        // race-free without holding any async lock.
+        let slot = self
+            .connections
+            .entry(worker_id.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+            .clone();
+
+        // Step 2 — Lock this worker's slot exclusively.
+        // Any concurrent caller for the same worker blocks here, preventing
+        // duplicate connections.
+        let mut guard = slot.lock().await;
+
+        // Step 3 — Validate an existing cached connection.
+        if let Some(entry) = guard.as_mut() {
+            let expired = entry.created_at.elapsed() >= self.config.connection_ttl;
+            if !expired {
+                if entry.conn.health_check().await {
+                    return Ok(entry.conn.clone());
+                }
+                warn!(
+                    worker_id = %worker_id,
+                    "Cached connection failed health check; reconnecting"
+                );
+            } else {
+                info!(
+                    worker_id = %worker_id,
+                    elapsed_secs = entry.created_at.elapsed().as_secs(),
+                    "Cached connection exceeded TTL; reconnecting"
+                );
+            }
+            // Evict the stale / unhealthy entry.
+            *guard = None;
         }
 
-        // Get the endpoint
+        // Step 4 — Enforce the connection cap before creating a new one.
+        let limit = self.effective_max_connections();
+        if limit > 0 && self.active_connection_count() >= limit {
+            self.try_evict_oldest(worker_id);
+        }
+
+        // Step 5 — Resolve endpoint.
         let endpoint = self
             .endpoints
             .get(worker_id)
@@ -96,18 +218,45 @@ impl WorkerConnectionPool {
                 detail: format!("No endpoint registered for worker '{}'", worker_id),
             })?;
 
-        // Create new connection
+        // Step 6 — Connect.
         let conn = WorkerConnection::connect(worker_id.clone(), &endpoint).await?;
 
-        // Cache it
-        self.connections.insert(worker_id.clone(), conn.clone());
+        // Step 7 — Cache with a fresh timestamp.
+        *guard = Some(CachedEntry {
+            conn: conn.clone(),
+            created_at: Instant::now(),
+        });
 
         Ok(conn)
     }
 
-    /// Remove a worker connection (e.g., on failure).
+    /// Evict all cached connections whose age exceeds the configured TTL.
+    ///
+    /// Uses `try_lock` so it never blocks; slots held by concurrent callers are
+    /// simply skipped — they will be evicted on the next opportunity.
+    pub async fn evict_stale_connections(&self) {
+        let ttl = self.config.connection_ttl;
+        for entry in self.connections.iter() {
+            if let Ok(mut guard) = entry.value().try_lock() {
+                if let Some(cached) = guard.as_ref() {
+                    if cached.created_at.elapsed() >= ttl {
+                        info!(
+                            worker_id = %entry.key(),
+                            "Evicting stale connection (TTL exceeded)"
+                        );
+                        *guard = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove the cached connection for `worker_id` (e.g., after a send error).
     pub async fn remove_connection(&self, worker_id: &WorkerId) {
-        self.connections.remove(worker_id);
+        if let Some(slot) = self.connections.get(worker_id) {
+            let mut guard = slot.lock().await;
+            *guard = None;
+        }
     }
 
     /// Get the endpoint URL for a worker.
@@ -122,6 +271,70 @@ impl WorkerConnectionPool {
             .map(|entry| entry.key().clone())
             .collect()
     }
+
+    // ------------------------------------------------------------------ //
+    // Internal helpers                                                     //
+    // ------------------------------------------------------------------ //
+
+    /// Effective maximum connections: the configured value (capped at
+    /// [`MAX_CONNECTIONS_CAP`]), or when configured as `0`, the current number
+    /// of registered workers (also capped).
+    fn effective_max_connections(&self) -> usize {
+        if self.config.max_connections == 0 {
+            self.endpoints.len().min(MAX_CONNECTIONS_CAP)
+        } else {
+            self.config.max_connections.min(MAX_CONNECTIONS_CAP)
+        }
+    }
+
+    /// Count slots that currently hold a live (non-`None`) entry using
+    /// non-blocking `try_lock`.
+    fn active_connection_count(&self) -> usize {
+        self.connections
+            .iter()
+            .filter(|entry| {
+                entry
+                    .value()
+                    .try_lock()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Try to evict the oldest cached connection (excluding `skip_worker`),
+    /// using `try_lock` to avoid blocking or deadlocking.
+    fn try_evict_oldest(&self, skip_worker: &WorkerId) {
+        let mut oldest_elapsed = Duration::ZERO;
+        let mut oldest_worker: Option<WorkerId> = None;
+
+        for entry in self.connections.iter() {
+            if entry.key() == skip_worker {
+                continue;
+            }
+            if let Ok(guard) = entry.value().try_lock() {
+                if let Some(cached) = guard.as_ref() {
+                    let elapsed = cached.created_at.elapsed();
+                    if elapsed > oldest_elapsed {
+                        oldest_elapsed = elapsed;
+                        oldest_worker = Some(entry.key().clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(worker) = oldest_worker {
+            if let Some(slot) = self.connections.get(&worker) {
+                if let Ok(mut guard) = slot.try_lock() {
+                    info!(
+                        worker_id = %worker,
+                        "Evicting oldest connection to enforce pool cap"
+                    );
+                    *guard = None;
+                }
+            }
+        }
+    }
 }
 
 impl Default for WorkerConnectionPool {
@@ -134,6 +347,10 @@ impl Default for WorkerConnectionPool {
 // Flight Stage Executor
 // ============================================================================
 
+/// How long a cached stage ticket remains valid before it is evicted.
+/// This matches the TTL used by the Flight service's stage result store.
+const TICKET_CACHE_TTL: Duration = Duration::from_secs(300);
+
 /// Flight-based stage executor for distributed LDP execution.
 ///
 /// This executor:
@@ -145,9 +362,9 @@ pub struct FlightStageExecutor {
     tenant_id: String,
     /// Connection pool to workers.
     connection_pool: Arc<WorkerConnectionPool>,
-    /// Cached tickets from submit_stage responses.
-    /// Maps (query_id, stage_id, worker_id) -> ticket bytes
-    ticket_cache: DashMap<String, Vec<u8>>,
+    /// Cached tickets from submit_stage responses, with insertion timestamp for TTL eviction.
+    /// Maps (query_id, stage_id, worker_id) -> (ticket bytes, inserted_at)
+    ticket_cache: DashMap<String, (Vec<u8>, Instant)>,
 }
 
 impl FlightStageExecutor {
@@ -168,6 +385,15 @@ impl FlightStageExecutor {
     /// Get the connection pool for registering workers.
     pub fn connection_pool(&self) -> &Arc<WorkerConnectionPool> {
         &self.connection_pool
+    }
+
+    /// Evict all ticket cache entries older than [`TICKET_CACHE_TTL`].
+    ///
+    /// Call this periodically to prevent the cache from growing unboundedly
+    /// across long-running coordinators that issue many queries.
+    pub fn evict_expired_tickets(&self) {
+        self.ticket_cache
+            .retain(|_, (_, inserted_at)| inserted_at.elapsed() < TICKET_CACHE_TTL);
     }
 
     /// Generate a ticket cache key.
@@ -270,10 +496,17 @@ impl FlightStageExecutor {
             )));
         }
 
-        // Cache the result ticket using the actual query_id
+        // Cache the result ticket using the actual query_id, recording the insertion time
+        // so that the entry can be evicted once it exceeds TICKET_CACHE_TTL.
         let ticket_key = Self::ticket_key(query_id, stage.stage_id, worker_id);
-        self.ticket_cache
-            .insert(ticket_key, submit_response.result_ticket.clone());
+        self.ticket_cache.insert(
+            ticket_key,
+            (submit_response.result_ticket.clone(), Instant::now()),
+        );
+
+        // Opportunistically evict any stale tickets on each insert.
+        // The cache is small (one entry per worker per stage), so O(n) is fine here.
+        self.evict_expired_tickets();
 
         // Log stats if available
         if let Some(stats) = submit_response.stats {
@@ -364,7 +597,14 @@ impl StageExecutor for FlightStageExecutor {
         let ticket_bytes = {
             self.ticket_cache
                 .get(&ticket_key)
-                .map(|v| v.clone())
+                .and_then(|entry| {
+                    let (bytes, inserted_at) = entry.value();
+                    if inserted_at.elapsed() < TICKET_CACHE_TTL {
+                        Some(bytes.clone())
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| {
                     StageExecutionError::InputNotReady(format!(
                         "No ticket cached for stage {} on worker {}",
@@ -619,6 +859,47 @@ mod tests {
     fn test_worker_connection_pool_default() {
         let pool = WorkerConnectionPool::default();
         assert!(pool.connections.is_empty());
+        assert!(pool.endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_worker_connection_pool_config_defaults() {
+        let cfg = WorkerConnectionPoolConfig::default();
+        assert_eq!(cfg.connection_ttl, CONNECTION_TTL_DEFAULT);
+        assert_eq!(cfg.max_connections, 0);
+    }
+
+    #[test]
+    fn test_effective_max_connections_dynamic() {
+        // When max_connections == 0, effective limit == number of registered workers.
+        let pool = WorkerConnectionPool::new();
+        assert_eq!(pool.effective_max_connections(), 0); // no workers yet
+
+        // Simulate registered workers by inserting into the endpoints map directly.
+        pool.endpoints
+            .insert(WorkerId::from("w1"), "http://localhost:50051".into());
+        pool.endpoints
+            .insert(WorkerId::from("w2"), "http://localhost:50052".into());
+        assert_eq!(pool.effective_max_connections(), 2);
+    }
+
+    #[test]
+    fn test_effective_max_connections_fixed() {
+        let pool = WorkerConnectionPool::with_config(WorkerConnectionPoolConfig {
+            connection_ttl: CONNECTION_TTL_DEFAULT,
+            max_connections: 42,
+        });
+        assert_eq!(pool.effective_max_connections(), 42);
+    }
+
+    #[test]
+    fn test_effective_max_connections_cap() {
+        // A configured value above MAX_CONNECTIONS_CAP is clamped to the cap.
+        let pool = WorkerConnectionPool::with_config(WorkerConnectionPoolConfig {
+            connection_ttl: CONNECTION_TTL_DEFAULT,
+            max_connections: 200,
+        });
+        assert_eq!(pool.effective_max_connections(), MAX_CONNECTIONS_CAP);
     }
 
     #[tokio::test]
@@ -645,6 +926,41 @@ mod tests {
             }
             _ => panic!("Expected WorkerUnavailable error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_evict_stale_connections() {
+        // Build a pool with a very short TTL so we can trigger eviction immediately.
+        let pool = WorkerConnectionPool::with_config(WorkerConnectionPoolConfig {
+            connection_ttl: Duration::from_millis(1),
+            max_connections: 10,
+        });
+
+        // Manually plant an already-expired entry without going through connect().
+        // We create a slot and set its CachedEntry created_at in the past.
+        // Because we can't construct a real FlightServiceClient without a server,
+        // we just check that evict_stale_connections() doesn't panic on an empty
+        // pool and that it correctly skips locked slots.
+        pool.register_worker(WorkerId::from("w1"), "http://localhost:50051".to_string())
+            .await;
+
+        // Ensure the slot exists (empty).
+        let slot = pool
+            .connections
+            .entry(WorkerId::from("w1"))
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+            .clone();
+
+        // Lock the slot and verify evict_stale_connections skips it gracefully.
+        let _guard = slot.try_lock().expect("slot should be unlocked");
+        pool.evict_stale_connections().await; // must not panic or deadlock
+    }
+
+    #[tokio::test]
+    async fn test_remove_connection_no_panic_on_unknown_worker() {
+        // remove_connection on a worker that has no slot should be a no-op.
+        let pool = WorkerConnectionPool::new();
+        pool.remove_connection(&WorkerId::from("ghost")).await; // must not panic
     }
 
     #[test]

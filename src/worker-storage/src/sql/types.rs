@@ -2,6 +2,12 @@
 
 use std::collections::HashMap;
 
+use super::interval::Interval;
+
+/// Re-export the single canonical `DateBound` from the interval algebra module.
+/// This eliminates the duplicate definition that previously existed here.
+pub use super::interval::DateBound;
+
 /// Unique identifier for a scope in the AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub usize);
@@ -33,25 +39,6 @@ impl TableReference {
     /// Uses alias if present, otherwise the dataset_id.
     pub fn effective_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.dataset_id)
-    }
-}
-
-/// A date bound extracted from SQL predicates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DateBound {
-    /// DATE literal, e.g., '2025-01-01'
-    Literal(String),
-    /// Parameter placeholder (for prepared statements)
-    Parameter(String),
-}
-
-impl DateBound {
-    /// Format as SQL DATE literal.
-    pub fn to_sql(&self) -> String {
-        match self {
-            DateBound::Literal(s) => format!("DATE '{}'", s),
-            DateBound::Parameter(p) => p.clone(),
-        }
     }
 }
 
@@ -94,6 +81,20 @@ impl DateRange {
         if self.end.is_none() {
             self.end = other.end;
             self.end_inclusive = other.end_inclusive;
+        }
+    }
+}
+
+impl From<Interval> for DateRange {
+    /// Convert a half-open `Interval` [start, end) into a `DateRange`.
+    ///
+    /// `Interval` is always half-open (end is exclusive), so
+    /// `end_inclusive` is set to `false`.
+    fn from(interval: Interval) -> Self {
+        DateRange {
+            start: interval.start,
+            end: interval.end,
+            end_inclusive: false, // Interval is always half-open [start, end)
         }
     }
 }

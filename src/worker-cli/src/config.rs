@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use worker_cp::ControlPlaneConfig;
 use worker_storage::engine::duckdb::DuckDBConfig;
@@ -290,14 +291,51 @@ impl LeibrixWorkerConfig {
     }
 
     /// Build a [`ControlPlaneConfig`] from this runtime configuration.
-    pub fn cp_config(&self) -> ControlPlaneConfig {
-        ControlPlaneConfig {
+    ///
+    /// Returns an error if TLS certificate/key files are specified but cannot be read.
+    pub fn cp_config(&self) -> anyhow::Result<ControlPlaneConfig> {
+        // Build TLS config if certificate material was provided.
+        // All three files (CA, cert, key) must be present or none (validated at parse time).
+        let tls = if let Some(ca_path) = &self.tls.ca_path {
+            let ca_pem = std::fs::read(ca_path).with_context(|| {
+                format!("failed to read TLS CA certificate: {}", ca_path.display())
+            })?;
+            let cert_pem =
+                std::fs::read(self.tls.cert_path.as_ref().unwrap()).with_context(|| {
+                    format!(
+                        "failed to read TLS client certificate: {}",
+                        self.tls.cert_path.as_ref().unwrap().display()
+                    )
+                })?;
+            let key_pem =
+                std::fs::read(self.tls.key_path.as_ref().unwrap()).with_context(|| {
+                    format!(
+                        "failed to read TLS client key: {}",
+                        self.tls.key_path.as_ref().unwrap().display()
+                    )
+                })?;
+
+            let mut tls_config = ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(ca_pem))
+                .identity(Identity::from_pem(cert_pem, key_pem));
+
+            if let Some(ref server_name) = self.tls.server_name {
+                tls_config = tls_config.domain_name(server_name);
+            }
+
+            Some(tls_config)
+        } else {
+            None
+        };
+
+        Ok(ControlPlaneConfig {
             master_addr: self.master_endpoint.clone(),
             worker_id: self.worker_id.clone(),
             tenant_id: self.tenant_id.clone(),
             outgoing_channel_capacity: self.cp_outgoing_capacity,
+            tls,
             ..ControlPlaneConfig::default()
-        }
+        })
     }
 }
 

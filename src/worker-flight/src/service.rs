@@ -5,7 +5,7 @@
 //! - LDP stage execution via DoAction `submit_stage`
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
@@ -25,6 +25,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 use worker_storage::engine::duckdb::SharedDatabase;
 use worker_storage::engine::query_engine::QueryEngine;
+use worker_storage::ldp::executor::monitor::StageExecutionMonitor;
+use worker_storage::ldp::StageLimits;
 use worker_storage::sql::{RegisteredDataset, SqlTransformer};
 
 use crate::error::{map_query_error_to_status, map_transform_error_to_status};
@@ -177,6 +179,44 @@ impl StageResultStore {
     }
 }
 
+// ============================================================================
+// Active-stage cancellation token
+// ============================================================================
+
+/// Per-stage handle held in `WorkerFlightService::active_stages`.
+///
+/// Both the async `cancel_query` handler and the blocking execution task share
+/// an `Arc` to the same handle, so cancellation signals cross the
+/// async/blocking boundary without any shared mutable state beyond what the
+/// types already protect.
+struct ActiveStageHandle {
+    /// Cooperation-level cancellation flag; checked before executing SQL.
+    monitor: StageExecutionMonitor,
+    /// DuckDB hard-interrupt handle.  Set by the blocking task as soon as it
+    /// has obtained a connection; `None` until that point.
+    interrupt_handle: StdMutex<Option<Arc<duckdb::InterruptHandle>>>,
+}
+
+impl ActiveStageHandle {
+    fn new() -> Self {
+        Self {
+            monitor: StageExecutionMonitor::new(StageLimits::default()),
+            interrupt_handle: StdMutex::new(None),
+        }
+    }
+
+    /// Set the cancellation flag **and** fire `duckdb_interrupt()` if the
+    /// blocking task has already stored its connection handle.
+    fn cancel(&self) {
+        self.monitor.cancel();
+        if let Ok(guard) = self.interrupt_handle.lock() {
+            if let Some(handle) = guard.as_ref() {
+                handle.interrupt();
+            }
+        }
+    }
+}
+
 /// Arrow Flight query service that provides SQL query execution over Arrow Flight protocol.
 ///
 /// Also handles LDP stage execution via DoAction `submit_stage`.
@@ -201,6 +241,9 @@ where
     stage_results: Arc<StageResultStore>,
     /// Shared DuckDB database used for stage execution (gives access to epoch tables and macros)
     shared_db: Arc<SharedDatabase>,
+    /// Active stage executions keyed by (query_id, stage_id).
+    /// Allows `cancel_query` to reach in-flight DuckDB operations.
+    active_stages: DashMap<(String, u32), Arc<ActiveStageHandle>>,
 }
 
 impl<Q> WorkerFlightService<Q>
@@ -239,6 +282,7 @@ where
             tenant_id,
             stage_results,
             shared_db,
+            active_stages: DashMap::new(),
         }
     }
 
@@ -482,13 +526,16 @@ where
     }
 
     /// Handle cancel_query action to cancel a running query.
+    ///
+    /// For each active stage belonging to `query_id`:
+    /// 1. Sets the `StageExecutionMonitor::cancelled` `AtomicBool` so cooperative
+    ///    checks in the execution loop terminate early.
+    /// 2. Calls `duckdb_interrupt()` via the stored `InterruptHandle` to
+    ///    hard-cancel any in-flight DuckDB operation on that connection.
     async fn handle_cancel_query(
         &self,
         body: &[u8],
     ) -> Result<Response<BoxStream<'static, Result<arrow_flight::Result, Status>>>, Status> {
-        use serde_json;
-
-        // Parse the cancel query request
         #[derive(serde::Deserialize)]
         struct CancelQueryRequest {
             query_id: String,
@@ -504,25 +551,35 @@ where
             "Received cancel_query request"
         );
 
-        // Validate tenant by checking if the query exists in our results store
-        // For now, we just log that cancellation was requested
-        warn!(
+        // (1) Find all active stages for this query.
+        // (2) Set their cancellation AtomicBool.
+        // (3) Fire duckdb_interrupt() on each connection that is already executing.
+        let cancelled_stage_ids: Vec<u32> = self
+            .active_stages
+            .iter()
+            .filter(|entry| entry.key().0 == request.query_id)
+            .map(|entry| {
+                entry.value().cancel();
+                entry.key().1
+            })
+            .collect();
+
+        info!(
             query_id = %request.query_id,
-            "Query cancellation requested (not yet fully implemented)"
+            cancelled_stages = ?cancelled_stage_ids,
+            "Cancelled active stage(s) and sent duckdb_interrupt"
         );
 
-        // In a real implementation, we would:
-        // 1. Find all stage results for this query in the store
-        // 2. Cancel any ongoing executions
-        // 3. Remove cached results
-
-        // For now, just remove any cached results for this query
+        // Remove any cached results for this query.
         self.stage_results
             .results
             .retain(|key, _| key.query_id != request.query_id);
 
-        // Create response
-        let response_body = format!("Query {} cancelled", request.query_id);
+        let response_body = format!(
+            "Query {} cancelled ({} active stage(s) interrupted)",
+            request.query_id,
+            cancelled_stage_ids.len()
+        );
         let result = arrow_flight::Result {
             body: response_body.into_bytes().into(),
         };
@@ -545,19 +602,39 @@ where
             drop_temp_table, register_arrow_batches,
         };
 
+        // Register a cancellation handle so cancel_query can reach this stage.
+        let stage_key = (query_id.to_string(), stage_id);
+        let cancel_handle = Arc::new(ActiveStageHandle::new());
+        self.active_stages
+            .insert(stage_key.clone(), Arc::clone(&cancel_handle));
+
         // Clone data for move into blocking task
         let stage_sql = stage_sql.to_string();
         let exchange_inputs = exchange_inputs.clone();
         let query_id = query_id.to_string();
         let shared_db = Arc::clone(&self.shared_db);
+        let cancel_handle_blk = Arc::clone(&cancel_handle);
 
         // Execute in blocking task (DuckDB operations are synchronous)
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             // Get a pooled connection from the shared database so stage SQL has
             // access to epoch tables (sales_data__epoch_*) and scan macros.
             let conn = shared_db
                 .get()
                 .map_err(|e| format!("Failed to get pooled DB connection: {}", e))?;
+
+            // Publish the interrupt handle so the async cancel_query handler
+            // can call duckdb_interrupt() on this specific connection.
+            {
+                let ih = conn.interrupt_handle();
+                if let Ok(mut guard) = cancel_handle_blk.interrupt_handle.lock() {
+                    *guard = Some(ih);
+                }
+            }
+            // Honour any cancellation that arrived before we obtained the connection.
+            if cancel_handle_blk.monitor.is_cancelled() {
+                return Err("Stage cancelled before execution started".to_string());
+            }
 
             debug!(
                 query_id = %query_id,
@@ -640,9 +717,15 @@ where
                 }
                 Err(e) => Err(format!("Stage SQL execution failed: {}", e)),
             }
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
+        });
+
+        // Deregister the stage regardless of success or failure so the map
+        // doesn't grow without bound.
+        self.active_stages.remove(&stage_key);
+
+        result
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?
     }
 
     /// Handle SQL query execution via DoGet.
@@ -1045,7 +1128,7 @@ where
             }),
             Ok(ActionType {
                 r#type: "cancel_query".to_string(),
-                description: "Cancel a running query (not yet implemented)".to_string(),
+                description: "Cancel a running query by setting the cancellation flag and sending duckdb_interrupt()".to_string(),
             }),
         ];
 

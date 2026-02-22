@@ -19,6 +19,18 @@ pub enum DateBound {
     Parameter(String),
 }
 
+impl DateBound {
+    /// Format as SQL DATE literal or parameter placeholder.
+    ///
+    /// Matches the `to_sql` semantics used throughout the transformer.
+    pub fn to_sql(&self) -> String {
+        match self {
+            DateBound::Literal(s) => format!("DATE '{}'", s),
+            DateBound::Parameter(p) => p.clone(),
+        }
+    }
+}
+
 impl PartialOrd for DateBound {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))

@@ -220,6 +220,7 @@ fn generate_sql(plan: &LogicalPlan, sql: &mut String) {
         LogicalPlan::Window {
             input,
             window_exprs,
+            ..
         } => {
             sql.push_str("SELECT ");
             write_select_items(sql, window_exprs);

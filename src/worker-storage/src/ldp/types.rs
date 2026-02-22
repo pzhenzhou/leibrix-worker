@@ -34,9 +34,16 @@ pub struct ExchangeId(pub u32);
 pub struct WorkerId(pub String);
 
 /// Identifier for an epoch (time-partitioned data segment).
-pub type EpochId = String;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct EpochId(pub String);
 
 // --- Display: renders the inner value directly so format!() just works ---
+
+impl fmt::Display for EpochId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl fmt::Display for QueryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,6 +110,22 @@ impl From<String> for WorkerId {
     }
 }
 impl AsRef<str> for WorkerId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for EpochId {
+    fn from(s: &str) -> Self {
+        EpochId(s.to_string())
+    }
+}
+impl From<String> for EpochId {
+    fn from(s: String) -> Self {
+        EpochId(s)
+    }
+}
+impl AsRef<str> for EpochId {
     fn as_ref(&self) -> &str {
         &self.0
     }

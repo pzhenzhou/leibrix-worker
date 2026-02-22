@@ -21,8 +21,12 @@ struct EpochInProgress {
     pending_batches: Vec<record_batch::RecordBatch>,
     pending_rows: u64,
     total_rows_committed: u64,
-    done: oneshot::Sender<anyhow::Result<TableMetadata>>,
+    /// First flush error encountered for this epoch, if any.
+    /// Set by `on_ingest_batch` on flush failure so the error is reported
+    /// to the caller via `done` in `on_finish_epoch` without terminating
+    /// the engine or affecting other in-progress epochs.
     first_error: Option<anyhow::Error>,
+    done: oneshot::Sender<anyhow::Result<TableMetadata>>,
 }
 
 struct EngineState {
@@ -31,8 +35,6 @@ struct EngineState {
     committed: HashMap<String, (EpochView, TableMetadata)>,
     in_progress: HashMap<String, EpochInProgress>,
     metrics: EngineMetrics,
-    #[allow(dead_code)]
-    first_error: Option<anyhow::Error>,
     shutdown: bool,
 }
 
@@ -111,7 +113,6 @@ pub fn engine_main(
             active_epochs: 0,
             committed_epochs: 0,
         },
-        first_error: None,
         shutdown: false,
     };
     loop {
@@ -128,15 +129,19 @@ pub fn engine_main(
                 key: dataset_id,
                 batch,
             }) => {
+                // on_ingest_batch records flush errors per-epoch via first_error
+                // and always returns Ok(()); only truly unexpected engine-level
+                // failures would produce an Err, which we log as non-fatal.
                 if let Err(e) = on_ingest_batch(&mut state, dataset_id, batch) {
-                    error!(error = ?e, "FATAL: In-memory write failed - shutting down engine");
-                    return Err(e).context("IngestBatch failed");
+                    warn!(error = ?e, "Unexpected error in on_ingest_batch (non-fatal, other epochs unaffected)");
                 }
             }
             Some(EngineCom::FinishEpoch { key }) => {
+                // on_finish_epoch reports per-epoch errors through the done
+                // oneshot and always returns Ok(()); only unexpected engine-level
+                // failures produce an Err.
                 if let Err(e) = on_finish_epoch(&mut state, key) {
-                    error!(error = ?e, "FATAL: Failed to finish epoch - shutting down engine");
-                    return Err(e).context("Unrecoverable finish epoch failure");
+                    warn!(error = ?e, "Unexpected error in on_finish_epoch (non-fatal, other epochs unaffected)");
                 }
             }
             Some(EngineCom::DropEpoch {
@@ -235,10 +240,16 @@ fn on_ingest_batch(
     key: String,
     batch: record_batch::RecordBatch,
 ) -> anyhow::Result<()> {
-    let ep = state.in_progress.get_mut(&key).ok_or_else(|| {
-        StorageError::InvalidArgument(format!("AppendBatch for non-existent epoch: {}", key))
-    })?;
+    let ep = match state.in_progress.get_mut(&key) {
+        Some(ep) => ep,
+        None => {
+            warn!(key = %key, "IngestBatch for non-existent epoch — ignoring");
+            return Ok(());
+        }
+    };
 
+    // If a previous flush already failed, discard incoming batches for this
+    // epoch rather than accumulating data that can never be committed.
     if ep.first_error.is_some() {
         return Ok(());
     }
@@ -249,27 +260,48 @@ fn on_ingest_batch(
 
     // Flush if threshold reached
     if ep.pending_rows >= state.config.flush_rows_threshold {
-        flush_pending_batches(&state.conn, &mut state.metrics, ep)
-            .with_context(|| format!("Failed to flush pending batches for epoch {}", key))?;
+        if let Err(e) = flush_pending_batches(&state.conn, &mut state.metrics, ep)
+            .with_context(|| format!("Failed to flush pending batches for epoch {}", key))
+        {
+            // Record the error on this epoch only. Clear buffered batches so
+            // subsequent IngestBatch messages are cheaply discarded above.
+            ep.pending_batches.clear();
+            ep.pending_rows = 0;
+            error!(
+                key = %key,
+                error = ?e,
+                "Flush failed for epoch — recording error, other epochs unaffected"
+            );
+            ep.first_error = Some(e);
+        }
     }
     Ok(())
 }
 
 fn on_finish_epoch(state: &mut EngineState, key: String) -> anyhow::Result<()> {
-    let mut ep = state.in_progress.remove(&key).ok_or_else(|| {
-        StorageError::InvalidArgument(format!("FinishEpoch for non-existent epoch: {}", key))
-    })?;
+    let mut ep = match state.in_progress.remove(&key) {
+        Some(ep) => ep,
+        None => {
+            warn!(key = %key, "FinishEpoch for non-existent epoch — ignoring");
+            return Ok(());
+        }
+    };
 
-    // Check if we encountered an error during ingestion
-    if let Some(err) = ep.first_error {
-        warn!(key = %key, error = ?err, "Epoch ingestion failed");
-        let _ = ep.done.send(Err(err).context("Ingestion failed"));
+    // Fast-path: a previous flush already recorded an error for this epoch.
+    if let Some(e) = ep.first_error.take() {
+        error!(key = %key, error = ?e, "Epoch ingestion failed (flush error recorded earlier) — reporting to caller");
+        let _ = ep.done.send(Err(e));
         return Ok(());
     }
 
-    // Flush any remaining buffered batches
-    flush_pending_batches(&state.conn, &mut state.metrics, &mut ep)
-        .with_context(|| format!("Failed to flush final batches for epoch {}", key))?;
+    // Flush any remaining buffered batches; treat failure as a per-epoch error.
+    if let Err(e) = flush_pending_batches(&state.conn, &mut state.metrics, &mut ep)
+        .with_context(|| format!("Failed to flush final batches for epoch {}", key))
+    {
+        error!(key = %key, error = ?e, "Final flush failed for epoch — reporting to caller, other epochs unaffected");
+        let _ = ep.done.send(Err(e));
+        return Ok(());
+    }
 
     if ep.total_rows_committed == 0 {
         let _ = ep.done.send(Err(StorageError::InvalidArgument(
@@ -279,13 +311,22 @@ fn on_finish_epoch(state: &mut EngineState, key: String) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Get schema from DuckDB table
-    let schema = query_table_schema(&state.conn, &ep.epoch_view.table_name).with_context(|| {
-        format!(
-            "Failed to query schema for table {}",
-            ep.epoch_view.table_name
-        )
-    })?;
+    // Get schema from DuckDB table; treat failure as a per-epoch error.
+    let schema = match query_table_schema(&state.conn, &ep.epoch_view.table_name).with_context(
+        || {
+            format!(
+                "Failed to query schema for table {}",
+                ep.epoch_view.table_name
+            )
+        },
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(key = %key, error = ?e, "Schema query failed after flush — reporting to caller, other epochs unaffected");
+            let _ = ep.done.send(Err(e));
+            return Ok(());
+        }
+    };
 
     // Get actual table size from DuckDB
     let approx_bytes = query_table_size(&state.conn, &ep.epoch_view.table_name)

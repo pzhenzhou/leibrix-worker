@@ -26,9 +26,10 @@ use crate::sql::logical_plan::LogicalPlan;
 /// | Aggregate | 1 | HashPartitioned(group_keys) or Singleton if global |
 /// | Sort | 1 | Singleton |
 /// | Limit | 1 | Singleton |
-/// | Join | 2 | HashPartitioned(join_keys) for each side (or Any for cross join) |
-/// | SetOp | 2+ | Any for all inputs |
-/// | Window | 1 | Singleton (conservative; could partition by PARTITION BY keys) |
+/// | Join | 2 | HashPartitioned(join_keys) for each side (or [Any, Singleton] for cross join) |
+/// | SetOp (UNION ALL) | 2+ | Any for all inputs |
+/// | SetOp (UNION DISTINCT / INTERSECT / EXCEPT) | 2+ | Singleton for all inputs |
+/// | Window | 1 | HashPartitioned(partition_keys) when PARTITION BY present; else Singleton |
 /// | SubqueryScan | 1 | Any |
 ///
 /// # Returns
@@ -77,9 +78,12 @@ pub fn get_logical_plan_requirements(plan: &LogicalPlan) -> Vec<RequiredDistribu
             ..
         } => {
             if left_keys.is_empty() || right_keys.is_empty() {
-                // Cross join - no partitioning requirement
-                // (one side will be broadcast in practice)
-                vec![RequiredDistribution::Any, RequiredDistribution::Any]
+                // Cross join: gather the right side to the coordinator so each
+                // worker that holds left-side partitions can compute the full
+                // Cartesian product against all right rows.  Without gathering,
+                // each worker only sees its local right partition and produces a
+                // silent subset of the correct result.
+                vec![RequiredDistribution::Any, RequiredDistribution::Singleton]
             } else {
                 // Equi-join with keys
                 vec![
@@ -94,20 +98,44 @@ pub fn get_logical_plan_requirements(plan: &LogicalPlan) -> Vec<RequiredDistribu
         }
 
         // ===== Set operators (UNION, INTERSECT, EXCEPT) =====
-        LogicalPlan::SetOp { .. } => {
-            // Both inputs can have any distribution
-            // (they'll be gathered/combined at the coordinator)
-            vec![RequiredDistribution::Any, RequiredDistribution::Any]
+        // UNION ALL is append-only: no deduplication, any distribution works.
+        // All other set ops (UNION DISTINCT, INTERSECT, EXCEPT) require matching
+        // rows to be co-located for correct deduplication.  Without gathering,
+        // rows that exist on different workers are silently missed by INTERSECT
+        // or incorrectly retained by EXCEPT.
+        LogicalPlan::SetOp {
+            op, set_quantifier, ..
+        } => {
+            use sqlparser::ast::{SetOperator, SetQuantifier};
+            match (op, set_quantifier) {
+                (SetOperator::Union, SetQuantifier::All) => {
+                    // UNION ALL: pure concatenation, distribution-agnostic
+                    vec![RequiredDistribution::Any, RequiredDistribution::Any]
+                }
+                _ => {
+                    // UNION DISTINCT, INTERSECT, EXCEPT: must compare rows across
+                    // both inputs, so all data must land on a single node.
+                    vec![
+                        RequiredDistribution::Singleton,
+                        RequiredDistribution::Singleton,
+                    ]
+                }
+            }
         }
 
         // ===== Window functions =====
-        // Window may need partitioning by PARTITION BY clause
-        // For now, conservatively require Singleton (can be optimized later
-        // when we properly extract PARTITION BY keys from the window function spec)
-        LogicalPlan::Window { .. } => {
-            // TODO: Extract partition keys from window expressions
-            // when better analysis is implemented
-            vec![RequiredDistribution::Singleton]
+        // If the window has PARTITION BY keys, we can hash-partition the input
+        // by those keys so each worker processes a disjoint set of partitions.
+        // Without PARTITION BY, the window spans the entire result set and
+        // requires Singleton.
+        LogicalPlan::Window { partition_keys, .. } => {
+            if partition_keys.is_empty() {
+                vec![RequiredDistribution::Singleton]
+            } else {
+                vec![RequiredDistribution::HashPartitioned {
+                    column_refs: partition_keys.clone(),
+                }]
+            }
         }
 
         // ===== SubqueryScan =====
@@ -343,12 +371,14 @@ mod tests {
 
         let reqs = get_logical_plan_requirements(&cross_join);
         assert_eq!(reqs.len(), 2);
+        // Left side may keep its natural distribution; right side must be gathered
+        // so every worker holding left partitions can cross-product all right rows.
         assert_eq!(reqs[0], RequiredDistribution::Any);
-        assert_eq!(reqs[1], RequiredDistribution::Any);
+        assert_eq!(reqs[1], RequiredDistribution::Singleton);
     }
 
     #[test]
-    fn test_set_op_requirements() {
+    fn test_union_all_requirements() {
         let union = LogicalPlan::SetOp {
             left: Box::new(create_scan("t1")),
             right: Box::new(create_scan("t2")),
@@ -358,20 +388,116 @@ mod tests {
 
         let reqs = get_logical_plan_requirements(&union);
         assert_eq!(reqs.len(), 2);
+        // UNION ALL is pure concatenation — any distribution is fine
         assert_eq!(reqs[0], RequiredDistribution::Any);
         assert_eq!(reqs[1], RequiredDistribution::Any);
     }
 
     #[test]
-    fn test_window_requirements() {
+    fn test_union_distinct_requires_singleton() {
+        let union_distinct = LogicalPlan::SetOp {
+            left: Box::new(create_scan("t1")),
+            right: Box::new(create_scan("t2")),
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::Distinct,
+        };
+
+        let reqs = get_logical_plan_requirements(&union_distinct);
+        assert_eq!(reqs.len(), 2);
+        // Deduplication requires co-location
+        assert_eq!(reqs[0], RequiredDistribution::Singleton);
+        assert_eq!(reqs[1], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_intersect_requires_singleton() {
+        let intersect = LogicalPlan::SetOp {
+            left: Box::new(create_scan("t1")),
+            right: Box::new(create_scan("t2")),
+            op: SetOperator::Intersect,
+            set_quantifier: SetQuantifier::Distinct,
+        };
+
+        let reqs = get_logical_plan_requirements(&intersect);
+        assert_eq!(reqs.len(), 2);
+        // INTERSECT must compare matching rows — they must be co-located
+        assert_eq!(reqs[0], RequiredDistribution::Singleton);
+        assert_eq!(reqs[1], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_except_requires_singleton() {
+        let except = LogicalPlan::SetOp {
+            left: Box::new(create_scan("t1")),
+            right: Box::new(create_scan("t2")),
+            op: SetOperator::Except,
+            set_quantifier: SetQuantifier::All,
+        };
+
+        let reqs = get_logical_plan_requirements(&except);
+        assert_eq!(reqs.len(), 2);
+        // EXCEPT must compare matching rows — rows on different workers would be
+        // incorrectly retained without co-location
+        assert_eq!(reqs[0], RequiredDistribution::Singleton);
+        assert_eq!(reqs[1], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_window_requirements_unpartitioned() {
+        // Window without PARTITION BY → Singleton
         let window = LogicalPlan::Window {
             input: Box::new(create_scan("test")),
             window_exprs: vec![],
+            partition_keys: vec![],
         };
 
         let reqs = get_logical_plan_requirements(&window);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0], RequiredDistribution::Singleton);
+    }
+
+    #[test]
+    fn test_window_requirements_with_partition_by() {
+        // Window with PARTITION BY region → HashPartitioned([region])
+        let window = LogicalPlan::Window {
+            input: Box::new(create_scan("sales")),
+            window_exprs: vec![],
+            partition_keys: vec![ColumnRef::unqualified("region")],
+        };
+
+        let reqs = get_logical_plan_requirements(&window);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0],
+            RequiredDistribution::HashPartitioned {
+                column_refs: vec![ColumnRef::unqualified("region")],
+            }
+        );
+    }
+
+    #[test]
+    fn test_window_requirements_multi_partition_keys() {
+        // Window with PARTITION BY region, dt → HashPartitioned([region, dt])
+        let window = LogicalPlan::Window {
+            input: Box::new(create_scan("sales")),
+            window_exprs: vec![],
+            partition_keys: vec![
+                ColumnRef::unqualified("region"),
+                ColumnRef::unqualified("dt"),
+            ],
+        };
+
+        let reqs = get_logical_plan_requirements(&window);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0],
+            RequiredDistribution::HashPartitioned {
+                column_refs: vec![
+                    ColumnRef::unqualified("region"),
+                    ColumnRef::unqualified("dt"),
+                ],
+            }
+        );
     }
 
     #[test]
