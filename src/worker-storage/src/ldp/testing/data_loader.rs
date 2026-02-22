@@ -13,6 +13,7 @@ use chrono::{Datelike, NaiveDate};
 use rand::Rng;
 
 use super::cluster::TestCluster;
+use crate::engine::duckdb::arrow_utils::arrow_type_to_duckdb;
 use crate::ldp::WorkerId;
 
 /// Parameters for loading a single epoch into a worker's DuckDB instance.
@@ -431,7 +432,8 @@ impl TestDataLoader {
             .iter()
             .map(|field| {
                 let col_name = field.name();
-                let col_type = self.arrow_type_to_duckdb_type(field.data_type());
+                let col_type = arrow_type_to_duckdb(field.data_type())
+                    .unwrap_or_else(|_| "VARCHAR".to_string());
                 format!("{} {}", col_name, col_type)
             })
             .collect();
@@ -441,31 +443,6 @@ impl TestDataLoader {
             table_name,
             columns.join(", ")
         )
-    }
-
-    /// Convert Arrow data type to DuckDB SQL type
-    fn arrow_type_to_duckdb_type(&self, data_type: &DataType) -> &str {
-        match data_type {
-            DataType::Int8 => "TINYINT",
-            DataType::Int16 => "SMALLINT",
-            DataType::Int32 => "INTEGER",
-            DataType::Int64 => "BIGINT",
-            DataType::UInt8 => "UTINYINT",
-            DataType::UInt16 => "USMALLINT",
-            DataType::UInt32 => "UINTEGER",
-            DataType::UInt64 => "UBIGINT",
-            DataType::Float32 => "FLOAT",
-            DataType::Float64 => "DOUBLE",
-            DataType::Utf8 => "VARCHAR",
-            DataType::LargeUtf8 => "VARCHAR",
-            DataType::Boolean => "BOOLEAN",
-            DataType::Date32 => "DATE",
-            DataType::Date64 => "TIMESTAMP",
-            DataType::Timestamp(_, _) => "TIMESTAMP",
-            DataType::Decimal128(_, _) => "DECIMAL",
-            DataType::Decimal256(_, _) => "DECIMAL",
-            _ => "VARCHAR", // Fallback for unsupported types
-        }
     }
 
     /// Generate orders test data with the specified count.

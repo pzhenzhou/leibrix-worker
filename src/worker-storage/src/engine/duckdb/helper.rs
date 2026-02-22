@@ -114,12 +114,13 @@ pub fn create_table_from_arrow_schema(
     let columns = schema
         .fields()
         .iter()
-        .map(|field| {
-            let duckdb_type = arrow_type_to_duckdb_type(field.data_type());
+        .map(|field| -> anyhow::Result<String> {
+            let duckdb_type = super::arrow_utils::arrow_type_to_duckdb(field.data_type())
+                .map_err(|e| anyhow::anyhow!("Unsupported type for '{}': {}", field.name(), e))?;
             let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
-            format!("{} {}{}", escape_ident(field.name()), duckdb_type, nullable)
+            Ok(format!("{} {}{}", escape_ident(field.name()), duckdb_type, nullable))
         })
-        .collect::<Vec<String>>()
+        .collect::<anyhow::Result<Vec<String>>>()?
         .join(", ");
     let create_table_sql = format!("CREATE TABLE {} ({})", escape_ident(table_name), columns);
     conn.execute(&create_table_sql, params![])
@@ -161,6 +162,24 @@ fn duckdb_type_str_to_arrow_type(type_str: &str) -> anyhow::Result<DataType> {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
         "JSON" => DataType::Utf8, // Represent JSON as string for now
+        "DECIMAL" | "HUGEINT" => {
+            // Parse DECIMAL(precision, scale) from the original type string.
+            if let Some(params) = type_str_upper
+                .strip_prefix("DECIMAL(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                let parts: Vec<&str> = params.split(',').collect();
+                if parts.len() == 2 {
+                    if let (Ok(p), Ok(s)) = (
+                        parts[0].trim().parse::<u8>(),
+                        parts[1].trim().parse::<i8>(),
+                    ) {
+                        return Ok(DataType::Decimal128(p, s));
+                    }
+                }
+            }
+            DataType::Decimal128(38, 10)
+        }
         _ => {
             // Default to VARCHAR for unknown types
             warn!("Unknown DuckDB type: {}, defaulting to VARCHAR", type_str);
@@ -169,37 +188,3 @@ fn duckdb_type_str_to_arrow_type(type_str: &str) -> anyhow::Result<DataType> {
     })
 }
 
-fn arrow_type_to_duckdb_type(arrow_type: &DataType) -> &'static str {
-    match arrow_type {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 => "TINYINT",
-        DataType::Int16 => "SMALLINT",
-        DataType::Int32 => "INTEGER",
-        DataType::Int64 => "BIGINT",
-        DataType::UInt8 => "UTINYINT",
-        DataType::UInt16 => "USMALLINT",
-        DataType::UInt32 => "UINTEGER",
-        DataType::UInt64 => "UBIGINT",
-        DataType::Float16 => "FLOAT",
-        DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
-        DataType::Binary | DataType::LargeBinary => "BLOB",
-        DataType::Date32 | DataType::Date64 => "DATE",
-        DataType::Time32(_) | DataType::Time64(_) => "TIME",
-        DataType::Timestamp(_, None) => "TIMESTAMP",
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ",
-        DataType::Duration(_) => "INTERVAL",
-        DataType::Decimal128(_precision, _scale) => {
-            // DuckDB's DECIMAL type
-            // Note: This creates a string that needs to be handled carefully
-            // For simplicity, we'll use VARCHAR as fallback if needed
-            // In production, you'd want to format this properly
-            "DECIMAL(38, 10)" // Default precision/scale
-        }
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "JSON",
-        DataType::Struct(_) => "STRUCT",
-        DataType::Map(_, _) => "MAP",
-        _ => "VARCHAR",
-    }
-}

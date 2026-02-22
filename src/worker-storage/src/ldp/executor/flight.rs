@@ -521,12 +521,16 @@ impl FlightStageExecutor {
             );
         }
 
-        // Create ticket
-        Ok(StageTicket::new(
+        // Create ticket and attach the raw Flight ticket bytes from the remote
+        // worker so that the coordinator can register the correct bytes with the
+        // exchange runtime (instead of the synthetic local ticket_id bytes).
+        let mut ticket = StageTicket::new(
             query_id.to_string(),
             stage.stage_id,
             worker_id.clone(),
-        ))
+        );
+        ticket.flight_ticket_bytes = Some(submit_response.result_ticket.clone());
+        Ok(ticket)
     }
 }
 

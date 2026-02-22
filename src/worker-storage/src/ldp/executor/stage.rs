@@ -28,6 +28,12 @@ pub struct StageTicket {
     pub partition: Option<u32>,
     /// Ticket identifier for Flight DoGet (in distributed mode).
     pub ticket_id: String,
+    /// Raw Flight ticket bytes returned by the remote worker's submit_stage
+    /// response. Set by `FlightStageExecutor::submit_to_worker` after a
+    /// successful `DoAction(submit_stage)` call.  `None` for locally-executed
+    /// stages and for partitioned sub-tickets that are synthesised inside
+    /// `submit_stage`.
+    pub flight_ticket_bytes: Option<Vec<u8>>,
 }
 
 impl StageTicket {
@@ -40,6 +46,7 @@ impl StageTicket {
             worker_id,
             partition: None,
             ticket_id,
+            flight_ticket_bytes: None,
         }
     }
 
@@ -57,6 +64,7 @@ impl StageTicket {
             worker_id,
             partition: Some(partition),
             ticket_id,
+            flight_ticket_bytes: None,
         }
     }
 }
@@ -302,52 +310,58 @@ impl LocalStageExecutor {
         // that would hide placement bugs and produce non-deterministic behavior.
         let target_db = self.worker_databases.get(worker_id).cloned();
 
-        let result = if let Some(shared_db) = target_db {
-            let conn = shared_db.get().map_err(|e| {
-                StageExecutionError::ExecutionFailed(format!(
-                    "Failed to get DuckDB connection for worker '{}': {}",
-                    worker_id, e
-                ))
-            })?;
-            Self::run_sql_with_inputs(&conn, stage_sql, inputs)
-        } else {
-            if requires_local_catalog {
-                return Err(StageExecutionError::ExecutionFailed(format!(
-                    "Missing worker database for '{}' while stage requires local catalog access",
-                    worker_id
-                )));
-            }
-            let conn = Connection::open_in_memory().map_err(|e| {
-                StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
-            })?;
-            Self::run_sql_with_inputs(&conn, stage_sql, inputs)
-        };
+        // Clone owned values for the spawn_blocking closure so that DuckDB's
+        // synchronous I/O does not block the Tokio async runtime thread.
+        let stage_sql_owned = stage_sql.to_string();
+        let inputs_owned = inputs.clone();
+        let worker_id_owned = worker_id.clone();
 
-        // Handle execution result
-        match result {
-            Ok(batches) => {
-                // Update monitor with output counts
-                let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-                let bytes_produced: u64 = batches
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .sum();
-
-                monitor.increment_rows_produced(rows_produced);
-                monitor.increment_bytes_produced(bytes_produced);
-
-                // Check limits
-                monitor.check_limits().map_err(|e| {
+        let batches = tokio::task::spawn_blocking(move || {
+            if let Some(shared_db) = target_db {
+                let conn = shared_db.get().map_err(|e| {
                     StageExecutionError::ExecutionFailed(format!(
-                        "Limit exceeded during execution: {}",
-                        e
+                        "Failed to get DuckDB connection for worker '{}': {}",
+                        worker_id_owned, e
                     ))
                 })?;
-
-                Ok(batches)
+                Self::run_sql_with_inputs(&conn, &stage_sql_owned, &inputs_owned)
+            } else {
+                if requires_local_catalog {
+                    return Err(StageExecutionError::ExecutionFailed(format!(
+                        "Missing worker database for '{}' while stage requires local catalog access",
+                        worker_id_owned
+                    )));
+                }
+                let conn = Connection::open_in_memory().map_err(|e| {
+                    StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
+                })?;
+                Self::run_sql_with_inputs(&conn, &stage_sql_owned, &inputs_owned)
             }
-            Err(e) => Err(e),
-        }
+        })
+        .await
+        .map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!("spawn_blocking panicked: {}", e))
+        })??;
+
+        // Update monitor with output counts
+        let rows_produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let bytes_produced: u64 = batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        monitor.increment_rows_produced(rows_produced);
+        monitor.increment_bytes_produced(bytes_produced);
+
+        // Check limits
+        monitor.check_limits().map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!(
+                "Limit exceeded during execution: {}",
+                e
+            ))
+        })?;
+
+        Ok(batches)
     }
 
     /// Register exchange inputs, execute SQL, and clean up temp tables.
@@ -603,69 +617,80 @@ async fn execute_stage_batches(
     stage: &Stage,
     inputs: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Vec<RecordBatch>, StageExecutionError> {
-    use crate::engine::duckdb::arrow_utils::{drop_temp_table, register_arrow_batches};
-    use duckdb::Connection;
-
     // Handle empty SQL
     if stage.stage_sql.is_empty() {
         return Ok(vec![]);
     }
 
-    // Create DuckDB connection
-    let conn = Connection::open_in_memory().map_err(|e| {
-        StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
-    })?;
+    // Clone owned values so the synchronous DuckDB work can run on a
+    // dedicated blocking thread without borrowing `stage` or `inputs`.
+    let stage_sql_owned = stage.stage_sql.clone();
+    let inputs_owned = inputs.clone();
 
-    // Register all exchange inputs as temporary tables
-    let mut registered_tables = Vec::new();
-    for (table_name, batches) in inputs {
-        if !batches.is_empty() {
-            register_arrow_batches(&conn, table_name, batches).map_err(|e| {
-                StageExecutionError::ExecutionFailed(format!(
-                    "Failed to register table '{}': {:#}",
-                    table_name, e
-                ))
+    tokio::task::spawn_blocking(move || {
+        use crate::engine::duckdb::arrow_utils::{drop_temp_table, register_arrow_batches};
+        use duckdb::Connection;
+
+        // Create DuckDB connection
+        let conn = Connection::open_in_memory().map_err(|e| {
+            StageExecutionError::ExecutionFailed(format!("Failed to open DuckDB: {}", e))
+        })?;
+
+        // Register all exchange inputs as temporary tables
+        let mut registered_tables = Vec::new();
+        for (table_name, batches) in &inputs_owned {
+            if !batches.is_empty() {
+                register_arrow_batches(&conn, table_name, batches).map_err(|e| {
+                    StageExecutionError::ExecutionFailed(format!(
+                        "Failed to register table '{}': {:#}",
+                        table_name, e
+                    ))
+                })?;
+                registered_tables.push(table_name.clone());
+            } else {
+                // Exchange returned a truly empty Vec — skip table registration.
+                // See run_sql_with_inputs() for the detailed rationale.
+                tracing::warn!(
+                    table_name = table_name.as_str(),
+                    "Exchange input has no batches and no schema — \
+                     skipping table registration (SQL referencing this \
+                     table will fail)"
+                );
+            }
+        }
+
+        // Wrap SQL execution in an immediately-invoked closure so that `?`
+        // returns from the closure, not from `execute_stage_batches`.  This
+        // guarantees the cleanup loop below always runs even when SQL fails.
+        let result: Result<Vec<RecordBatch>, StageExecutionError> = (|| {
+            let mut stmt = conn.prepare(&stage_sql_owned).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Failed to prepare SQL: {}", e))
             })?;
-            registered_tables.push(table_name.clone());
-        } else {
-            // Exchange returned a truly empty Vec — skip table registration.
-            // See run_sql_with_inputs() for the detailed rationale.
-            tracing::warn!(
-                table_name = table_name.as_str(),
-                "Exchange input has no batches and no schema — \
-                 skipping table registration (SQL referencing this \
-                 table will fail)"
-            );
+
+            let rows = stmt.query_arrow([]).map_err(|e| {
+                StageExecutionError::ExecutionFailed(format!("Failed to execute SQL: {}", e))
+            })?;
+            let schema = rows.get_schema();
+
+            let batches: Vec<RecordBatch> = rows.collect();
+            if batches.is_empty() {
+                Ok(vec![RecordBatch::new_empty(schema)])
+            } else {
+                Ok(batches)
+            }
+        })();
+
+        // Always clean up, regardless of whether execution succeeded or failed.
+        for table_name in &registered_tables {
+            let _ = drop_temp_table(&conn, table_name);
         }
-    }
 
-    // Wrap SQL execution in an immediately-invoked closure so that `?`
-    // returns from the closure, not from `execute_stage_batches`.  This
-    // guarantees the cleanup loop below always runs even when SQL fails.
-    let result: Result<Vec<RecordBatch>, StageExecutionError> = (|| {
-        let mut stmt = conn.prepare(&stage.stage_sql).map_err(|e| {
-            StageExecutionError::ExecutionFailed(format!("Failed to prepare SQL: {}", e))
-        })?;
-
-        let rows = stmt.query_arrow([]).map_err(|e| {
-            StageExecutionError::ExecutionFailed(format!("Failed to execute SQL: {}", e))
-        })?;
-        let schema = rows.get_schema();
-
-        let batches: Vec<RecordBatch> = rows.collect();
-        if batches.is_empty() {
-            Ok(vec![RecordBatch::new_empty(schema)])
-        } else {
-            Ok(batches)
-        }
-    })();
-
-    // Always clean up, regardless of whether execution succeeded or failed.
-    for table_name in &registered_tables {
-        let _ = drop_temp_table(&conn, table_name);
-    }
-
-    result
+        result
+    })
+    .await
+    .map_err(|e| {
+        StageExecutionError::ExecutionFailed(format!("spawn_blocking panicked: {}", e))
+    })?
 }
 
 /// Helper function to partition record batches by hash.
