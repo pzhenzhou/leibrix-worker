@@ -111,7 +111,7 @@ fn build_create_table_sql(
 }
 
 /// Convert an Arrow `DataType` to a DuckDB type string.
-fn arrow_type_to_duckdb(arrow_type: &DataType) -> Result<String> {
+pub fn arrow_type_to_duckdb(arrow_type: &DataType) -> Result<String> {
     let duckdb_type = match arrow_type {
         DataType::Boolean => "BOOLEAN",
         DataType::Int8 => "TINYINT",

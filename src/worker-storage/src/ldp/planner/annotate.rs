@@ -21,7 +21,7 @@ use crate::ldp::planner::exchange::{
 use crate::ldp::planner::metadata::Metadata;
 use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::requirements::get_logical_plan_requirements;
-use crate::ldp::{Distribution, DistributionAnnotation, Exchange, StatsSource, WorkerId};
+use crate::ldp::{Distribution, DistributionAnnotation, Exchange, RequiredDistribution, StatsSource, WorkerId};
 use crate::sql::logical_plan::LogicalPlan;
 
 /// An annotated LogicalPlan with distribution information and optional exchange.
@@ -278,8 +278,26 @@ fn handle_join_exchanges(
             ..
         } => {
             if left_keys.is_empty() || right_keys.is_empty() {
-                //Cross join - no hash partitioning
-                return Ok((ExchangeDecision::None, ExchangeDecision::None));
+                // Cross join: left requires Any (trivially satisfied), right requires Singleton
+                // so that every worker sees the full right-side dataset.
+                let right_dist = &right_child.annotation.distribution;
+                if right_dist.is_singleton() {
+                    return Ok((ExchangeDecision::None, ExchangeDecision::None));
+                }
+                let right_exchange = determine_exchange(
+                    right_dist,
+                    &right_child.annotation,
+                    &RequiredDistribution::Singleton,
+                    policy,
+                    false,
+                    target_workers,
+                );
+                match right_exchange {
+                    ExchangeDecision::Reject(reason) => {
+                        return Err(PlanningError::Rejected(reason));
+                    }
+                    _ => return Ok((ExchangeDecision::None, right_exchange)),
+                }
             }
             (left_keys.clone(), right_keys.clone())
         }
@@ -907,6 +925,73 @@ mod tests {
             ),
             "join output should be EpochPartitioned (probe side): {:?}",
             annotated.annotation.distribution
+        );
+    }
+
+    /// Cross join with a non-singleton right side must insert a Gather on the right child.
+    #[test]
+    fn test_cross_join_inserts_gather_on_right_when_not_singleton() {
+        let policy = test_policy();
+        let metadata = test_metadata();
+
+        // Cross join: no join keys.
+        let plan = LogicalPlan::Join {
+            left: Box::new(create_scan("sales")),
+            right: Box::new(create_scan("sales")), // EpochPartitioned across w1, w2
+            join_op: sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![],
+            right_keys: vec![],
+        };
+
+        let annotated =
+            annotate_logical_plan(&plan, &policy, &metadata).expect("annotation should succeed");
+
+        // Right child (EpochPartitioned) must get a Gather exchange.
+        let right_child = &annotated.children[1];
+        assert!(
+            matches!(right_child.exchange_before, Some(Exchange::Gather { .. })),
+            "expected Gather on right child for cross join, got: {:?}",
+            right_child.exchange_before
+        );
+        // Left child needs no exchange.
+        let left_child = &annotated.children[0];
+        assert!(
+            left_child.exchange_before.is_none(),
+            "expected no exchange on left child for cross join, got: {:?}",
+            left_child.exchange_before
+        );
+    }
+
+    /// Cross join where the right side is already Singleton must not insert any exchange.
+    #[test]
+    fn test_cross_join_no_exchange_when_right_is_singleton() {
+        let policy = test_policy();
+        let metadata = test_metadata();
+
+        // Wrap the right side in a Sort so it produces Singleton output.
+        let right = LogicalPlan::Sort {
+            input: Box::new(create_scan("sales")),
+            order_by: vec![],
+        };
+
+        let plan = LogicalPlan::Join {
+            left: Box::new(create_scan("sales")),
+            right: Box::new(right),
+            join_op: sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None),
+            left_keys: vec![],
+            right_keys: vec![],
+        };
+
+        let annotated =
+            annotate_logical_plan(&plan, &policy, &metadata).expect("annotation should succeed");
+
+        // Sort child already inserted a Gather, making right output Singleton.
+        // The cross join itself must not add another exchange on top.
+        let right_child = &annotated.children[1];
+        assert!(
+            right_child.exchange_before.is_none(),
+            "expected no exchange inserted by cross join when right is already Singleton, got: {:?}",
+            right_child.exchange_before
         );
     }
 

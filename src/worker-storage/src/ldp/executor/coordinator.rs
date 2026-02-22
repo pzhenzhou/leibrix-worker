@@ -65,6 +65,7 @@ use duckdb::Connection;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::engine::duckdb::arrow_utils::arrow_type_to_duckdb;
 use crate::engine::duckdb::SharedDatabase;
 use crate::ldp::executor::monitor::SharedStageExecutionMonitor;
 use crate::ldp::executor::stage::{
@@ -80,7 +81,7 @@ use crate::ldp::planner::policy::PlannerPolicy;
 use crate::ldp::planner::storage_metadata::ClusterMetadata;
 use crate::ldp::{Exchange, ExchangeId, LdpPlan, QueryId, Stage, StageId, WorkerId};
 use crate::sql::{AdmissionError, RegisteredDataset, SqlTransformer};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::Schema;
 
 // ============================================================================
 // Type Aliases
@@ -359,12 +360,13 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
         let columns: Vec<String> = schema
             .fields()
             .iter()
-            .map(|field| {
+            .map(|field| -> Result<String, CoordinatorError> {
                 let col_name = field.name();
-                let col_type = arrow_type_to_duckdb_type(field.data_type());
-                format!("CAST(NULL AS {}) AS {}", col_type, col_name)
+                let col_type = arrow_type_to_duckdb(field.data_type())
+                    .map_err(|e| CoordinatorError::ConnectionFailed(format!("Unsupported type for '{}': {}", col_name, e)))?;
+                Ok(format!("CAST(NULL AS {}) AS {}", col_type, col_name))
             })
-            .collect();
+            .collect::<Result<Vec<String>, CoordinatorError>>()?;
 
         let columns_sql = columns.join(", ");
 
@@ -990,12 +992,19 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
                             // runtime so that downstream stages can fetch results
                             // via exchange_runtime.get_ticket() when resolving
                             // ExchangeInput dependencies.
+                            // Use the raw Flight ticket bytes returned by the remote
+                            // worker (set on the ticket by submit_to_worker). Fall back
+                            // to the synthetic ticket_id bytes only for local stages.
+                            let ticket_bytes = ticket
+                                .flight_ticket_bytes
+                                .clone()
+                                .unwrap_or_else(|| ticket.ticket_id.as_bytes().to_vec());
                             exchange_runtime
                                 .register_ticket(
                                     &ticket.query_id,
                                     ticket.stage_id,
                                     &ticket.worker_id,
-                                    ticket.ticket_id.as_bytes().to_vec(),
+                                    ticket_bytes,
                                 )
                                 .await;
                             if !stage_workers.contains(&ticket.worker_id) {
@@ -1696,29 +1705,6 @@ pub struct CancellationResult {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Convert Arrow data type to DuckDB SQL type string.
-fn arrow_type_to_duckdb_type(data_type: &DataType) -> &str {
-    match data_type {
-        DataType::Int8 => "TINYINT",
-        DataType::Int16 => "SMALLINT",
-        DataType::Int32 => "INTEGER",
-        DataType::Int64 => "BIGINT",
-        DataType::UInt8 => "UTINYINT",
-        DataType::UInt16 => "USMALLINT",
-        DataType::UInt32 => "UINTEGER",
-        DataType::UInt64 => "UBIGINT",
-        DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
-        DataType::Boolean => "BOOLEAN",
-        DataType::Date32 => "DATE",
-        DataType::Date64 => "TIMESTAMP",
-        DataType::Timestamp(_, _) => "TIMESTAMP",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
-        _ => "VARCHAR", // Fallback for unsupported types
-    }
-}
 
 /// Generate a unique query ID using UUID v4.
 ///
