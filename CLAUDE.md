@@ -384,6 +384,49 @@ The `worker-cp` crate contains minimal control plane communication logic. The `t
 - E2E test status: `docs/E2E_TEST_FINAL_STATUS.md`
 - Control plane repository: git@github.com:pzhenzhou/leibrix.git
 
+## Error Handling
+
+- **Library boundaries** (`worker-storage` public API): Use `thiserror` with typed error enums and struct variants for pattern matching.
+- **Internal implementation**: Use `anyhow` for flexibility. Always add context with `.context()` or `.with_context(|| ...)`.
+- **Structured error variants**: Prefer `QueryTimeout { elapsed: Duration, limit: Duration }` over `QueryTimeout(String)`.
+- **Logging levels**: `error!()` for system failures, `warn!()` for recoverable issues, `info!()` for milestones, `debug!()` for troubleshooting.
+
+## Code Style Conventions
+
+### Import Organization
+
+Four groups, separated by blank lines:
+1. `std` / `core`
+2. External crates (`arrow`, `duckdb`, `tokio`, etc.)
+3. Internal workspace crates (`worker_proto`, `worker_storage`)
+4. Parent/sibling modules (`super::`, `crate::`)
+
+### Logging
+
+Use `tracing` with structured field syntax, not string formatting:
+```rust
+// Good
+tracing::info!(worker_id = %id, stage = %stage_id, "stage completed");
+// Bad
+tracing::info!("stage {} completed on worker {}", stage_id, id);
+```
+
+### Async and Blocking
+
+- Use `tokio::task::spawn_blocking()` for CPU-bound work (DuckDB queries, Substrait serialization).
+- Use `.await` for I/O-bound work (Flight RPCs, network calls).
+- Clone `Arc` (cheap ref count bump), never clone its contents.
+
+## SQL Semantic Parity Invariant
+
+Transformed queries **must produce identical results** to the original. Original predicates are always preserved as a final filter after macro expansion — the macro call is an optimization hint, not the source of truth:
+```sql
+-- Original
+SELECT * FROM sales WHERE dt >= '2025-01-01'
+-- Transformed (predicate kept)
+SELECT * FROM scan_sales('2025-01-01', '2025-02-01') WHERE dt >= '2025-01-01'
+```
+
 ## Design Principles
 
 All code changes in this repository follow principles from **Effective Rust** and **A Philosophy of Software Design**. These are not aspirational — they are enforced during review.
