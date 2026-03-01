@@ -385,10 +385,15 @@ mod tests {
             _ => panic!("Expected Range partitioning for low cardinality data"),
         }
 
-        // Test with high skew
-        let mut high_skew_stats = DataDistributionStats::new();
-        high_skew_stats.skew_factor = 5.0; // Above threshold
-        high_skew_stats.top_values = vec![("popular".to_string(), 100)];
+        // Test with high skew (distinct_values must be >= distinct_threshold to reach skew check)
+        let high_skew_stats = DataDistributionStats {
+            distinct_values: 5000,
+            total_rows: 10000,
+            distinct_ratio: 0.5,
+            skew_factor: 5.0, // Above threshold
+            value_histogram: vec![],
+            top_values: vec![("popular".to_string(), 100)],
+        };
 
         let strategy = partitioner.determine_partition_strategy(&high_skew_stats, 16);
         match strategy {
