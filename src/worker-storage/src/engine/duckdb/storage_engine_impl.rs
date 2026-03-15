@@ -232,6 +232,76 @@ impl crate::engine::storage_engine::StorageEngine for MemoryDuckDBEngine {
         }
     }
 
+    fn update_dataset_macro(
+        &self,
+        dataset_id: String,
+        date_column: String,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        let tx = self.com_tx.clone();
+        let shared_db = self.shared_db.clone();
+
+        async move {
+            // First, list all epochs for this dataset
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(EngineCom::ListEpoch {
+                dataset_id: dataset_id.clone(),
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Engine channel closed"))?;
+
+            let epochs = resp_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("Response channel closed"))??;
+
+            // Collect epoch table names
+            let epoch_tables: Vec<String> = epochs.iter().map(|e| e.table_name.clone()).collect();
+
+            // If there are no epoch tables, get the stored schema for creating an empty macro
+            // with the correct column types
+            let dataset_schema = if epoch_tables.is_empty() {
+                let (schema_tx, schema_rx) = oneshot::channel();
+                tx.send(EngineCom::GetDatasetSchema {
+                    dataset_id: dataset_id.clone(),
+                    resp: schema_tx,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Engine channel closed"))?;
+
+                schema_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Response channel closed"))?
+            } else {
+                None
+            };
+
+            // Create/update the macro using a pooled connection
+            // This needs to run in spawn_blocking since DuckDB connection is !Send
+            let date_column_clone = date_column.clone();
+            let dataset_id_clone = dataset_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = shared_db.get()?;
+                super::helper::create_or_update_dataset_macro(
+                    &conn,
+                    &dataset_id_clone,
+                    &date_column_clone,
+                    &epoch_tables,
+                    dataset_schema,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))??;
+
+            info!(
+                dataset_id = %dataset_id,
+                date_column = %date_column,
+                "Updated dataset scan macro"
+            );
+
+            Ok(())
+        }
+    }
+
     async fn shutdown(self) -> anyhow::Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.com_tx

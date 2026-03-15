@@ -16,7 +16,7 @@ memory, delivering predictable millisecond-level query latency with strict multi
 
 ## Role & Responsibilities
 
-- **Data Loading**: Pulls immutable data epochs from source systems (Iceberg, StarRocks, JDBC) via Arrow Flight
+- **Data Loading**: Pulls immutable data epochs from source systems (StarRocks, JDBC; Iceberg planned) via Arrow Flight
 - **Memory Management**: Maintains in-memory datasets within strict per-tenant memory quotas
 - **Query Execution**: Executes bounded SQL queries using embedded DuckDB with vectorized processing
 - **Resource Enforcement**: Enforces per-query CPU, memory, and row scan limits for predictability

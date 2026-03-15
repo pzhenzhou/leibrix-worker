@@ -33,6 +33,10 @@ struct EngineState {
     conn: PooledConnection<DuckdbConnectionManager>,
     config: DuckDBConfig,
     committed: HashMap<String, (EpochView, TableMetadata)>,
+    /// Stores the schema for each dataset. This is used when all epochs
+    /// of a dataset are evicted, so we can still create an empty macro
+    /// with the correct schema instead of a dummy schema.
+    dataset_schemas: HashMap<String, Arc<Schema>>,
     in_progress: HashMap<String, EpochInProgress>,
     metrics: EngineMetrics,
     shutdown: bool,
@@ -60,6 +64,10 @@ pub enum EngineCom {
     ListEpoch {
         dataset_id: String,
         resp: oneshot::Sender<anyhow::Result<Vec<EpochView>>>,
+    },
+    GetDatasetSchema {
+        dataset_id: String,
+        resp: oneshot::Sender<Option<Arc<Schema>>>,
     },
     MemoryStats {
         resp: oneshot::Sender<anyhow::Result<crate::engine::storage_engine::MemoryStats>>,
@@ -105,6 +113,7 @@ pub fn engine_main(
         conn: db_conn,
         config,
         committed: HashMap::new(),
+        dataset_schemas: HashMap::new(),
         in_progress: HashMap::new(),
         metrics: EngineMetrics {
             total_batches_written: 0,
@@ -158,6 +167,10 @@ pub fn engine_main(
             Some(EngineCom::ListEpoch { dataset_id, resp }) => {
                 let rs = on_list_epochs(&mut state, dataset_id);
                 let _ = resp.send(rs);
+            }
+            Some(EngineCom::GetDatasetSchema { dataset_id, resp }) => {
+                let schema = state.dataset_schemas.get(&dataset_id).cloned();
+                let _ = resp.send(schema);
             }
             Some(EngineCom::MemoryStats { resp }) => {
                 let state = on_memory_stats(&mut state);
@@ -220,6 +233,9 @@ fn on_start_epoch(
         let _ = done.send(Err(e));
         return;
     }
+
+    // Store the schema for this dataset so we can use it for empty macros later
+    state.dataset_schemas.insert(dataset_id.clone(), schema);
 
     state.in_progress.insert(
         epoch_key,

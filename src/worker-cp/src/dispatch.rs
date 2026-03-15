@@ -25,7 +25,7 @@
 //! rather than `Arc<dyn TaskDispatcher>`, so the trait is deliberately
 //! not object-safe.
 
-use crate::types::ControlCommand;
+use crate::types::{ControlCommand, EpochKey};
 use std::future::Future;
 
 /// Single-method dispatcher consumed by the Receive Task.
@@ -52,4 +52,11 @@ pub trait TaskDispatcher: Send + Sync {
     /// **MUST return promptly** for every variant — spawn background tasks
     /// for anything that involves I/O or long computation.
     fn handle_command(&self, command: ControlCommand) -> impl Future<Output = ()> + Send;
+
+    /// Returns a list of all epochs currently loaded and queryable.
+    ///
+    /// Used for reconnect reconciliation: after re-establishing a session with
+    /// the control plane, the worker reports all loaded epochs so the CP can
+    /// update its state to match reality.
+    fn list_loaded_epochs(&self) -> Vec<EpochKey>;
 }

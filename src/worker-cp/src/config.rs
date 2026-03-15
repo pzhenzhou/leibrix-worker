@@ -31,6 +31,12 @@ pub struct ControlPlaneConfig {
     /// Tenant this worker is dedicated to.
     pub tenant_id: String,
 
+    /// The worker's own advertised address (e.g., the Arrow Flight listen
+    /// address).  This is what the CP and gateways will use to reach the
+    /// worker for queries.  When `None`, falls back to `master_addr` (which
+    /// is almost certainly wrong for production).
+    pub worker_addr: Option<String>,
+
     // -------------------------------------------------------------------
     // Session behaviour
     // -------------------------------------------------------------------
@@ -131,6 +137,7 @@ impl Default for ControlPlaneConfig {
             master_addr: String::new(),
             worker_id: String::new(),
             tenant_id: String::new(),
+            worker_addr: None,
             heartbeat_interval: Duration::from_secs(10),
             registration_timeout: Duration::from_secs(10),
             outgoing_channel_capacity: 64,

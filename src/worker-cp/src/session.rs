@@ -127,10 +127,22 @@ impl ControlPlaneSession {
         // ── 3. Registration handshake ───────────────────────────────────────
         let _ = status_tx.send(SessionStatus::Registering);
 
+        // Determine the worker address to advertise.
+        // Priority: worker_addr (explicit advertise) > fallback to master_addr (almost certainly wrong).
+        let advertised_addr = config.worker_addr.as_deref().unwrap_or_else(|| {
+            tracing::warn!(
+                "No worker_addr configured; falling back to master_addr '{}' for registration. \
+                 This is almost certainly wrong — queries will route to the master instead of this worker. \
+                 Set --advertise-addr or --query-listen-addr with a routable address.",
+                config.master_addr
+            );
+            &config.master_addr
+        });
+
         let register_msg = proto_convert::register_event(
             &config.worker_id,
             &config.tenant_id,
-            &config.master_addr,
+            advertised_addr,
         );
         grpc_out_tx
             .send(register_msg)
@@ -169,6 +181,34 @@ impl ControlPlaneSession {
                 warn!(?unexpected, event_id = %first_msg.event_id,
                       "unexpected first message from CP; treating as registration ack");
             }
+        }
+
+        // ── 4. Reconnect reconciliation ─────────────────────────────────────
+        // Report any already-loaded epochs to the CP so it can update its state.
+        // This handles the case where a previous session died after a successful
+        // load but before the status report was sent.
+        let loaded_epochs = dispatcher.list_loaded_epochs();
+        if !loaded_epochs.is_empty() {
+            info!(count = loaded_epochs.len(), "reconciling loaded epochs with CP");
+            for epoch in loaded_epochs {
+                let msg = proto_convert::status_update_event(
+                    &config.worker_id,
+                    &config.tenant_id,
+                    &epoch.dataset_id,
+                    &epoch.epoch_id,
+                    crate::types::LoadStatus::Completed,
+                    None,
+                );
+                if let Err(e) = grpc_out_tx.send(msg).await {
+                    warn!(
+                        dataset_id = %epoch.dataset_id,
+                        epoch_id = %epoch.epoch_id,
+                        error = %e,
+                        "failed to send reconciliation status for epoch"
+                    );
+                }
+            }
+            debug!("reconciliation status updates sent");
         }
 
         let channel_capacity = config.outgoing_channel_capacity;

@@ -34,12 +34,15 @@ use arrow::ipc::reader::StreamReader;
 use dashmap::DashMap;
 use std::future::Future;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 use worker_storage::engine::storage_engine::{EpochView, StorageEngine};
 use worker_storage::loader::types::{Catalog, ConnectionPoolOptions, DataSource, LoadRequest};
 use worker_storage::loader::DataLoader;
+use worker_storage::sql::RegisteredDataset;
+use worker_storage::sql::SqlTransformer;
 
 /// How many times to retry `try_send` before dropping a status update.
 const STATUS_RETRY_COUNT: usize = 3;
@@ -56,7 +59,7 @@ const STATUS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 ///     data_loader,
 ///     storage_engine,
 ///     /* max_concurrent_loads = */ 4,
-///     session.outgoing_sender(),
+///     sql_transformer,
 /// );
 /// ```
 pub struct WorkerRuntimeDispatcher<E: StorageEngine> {
@@ -70,6 +73,10 @@ pub struct WorkerRuntimeDispatcher<E: StorageEngine> {
     /// if an eviction arrives while a load is in-flight, the phase is set to
     /// `Evicting` and the load task itself drops the table when it finishes.
     epoch_phases: Arc<DashMap<EpochKey, EpochPhase>>,
+    /// SQL transformer for dataset registration after successful epoch loads.
+    /// When a new dataset is loaded for the first time, the dispatcher
+    /// registers it with the transformer so queries can reference it.
+    sql_transformer: Arc<RwLock<SqlTransformer>>,
     /// Channel back to the Send Task for status updates.
     ///
     /// Initialised via [`Self::init_sender`] after the session is started.  The
@@ -84,6 +91,10 @@ pub struct WorkerRuntimeDispatcher<E: StorageEngine> {
     /// could yield `None` for assignments that arrive immediately after
     /// registration.
     outgoing_tx: Arc<OnceLock<mpsc::Sender<OutgoingPayload>>>,
+    /// When true, new assignments are rejected (drain mode is active).
+    draining: Arc<AtomicBool>,
+    /// Notified each time a load task completes (used by `wait_for_drain`).
+    drain_notify: Arc<Notify>,
 }
 
 impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
@@ -99,13 +110,17 @@ impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
         data_loader: Arc<DataLoader<E>>,
         storage_engine: Arc<E>,
         max_concurrent_loads: usize,
+        sql_transformer: Arc<RwLock<SqlTransformer>>,
     ) -> Self {
         Self {
             data_loader,
             storage_engine,
             semaphore: Arc::new(Semaphore::new(max_concurrent_loads)),
             epoch_phases: Arc::new(DashMap::new()),
+            sql_transformer,
             outgoing_tx: Arc::new(OnceLock::new()),
+            draining: Arc::new(AtomicBool::new(false)),
+            drain_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -114,6 +129,19 @@ impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
     /// Useful for tests and diagnostics.
     pub fn epoch_phases(&self) -> &DashMap<EpochKey, EpochPhase> {
         &self.epoch_phases
+    }
+
+    /// Returns a list of all epochs currently in the Active phase.
+    ///
+    /// Used for reconnect reconciliation: after re-establishing a session with
+    /// the control plane, the worker reports all loaded epochs so the CP can
+    /// update its state to match reality.
+    pub fn list_loaded_epochs(&self) -> Vec<EpochKey> {
+        self.epoch_phases
+            .iter()
+            .filter(|entry| *entry.value() == EpochPhase::Active)
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Wire up the outgoing status channel after the session has started.
@@ -125,6 +153,33 @@ impl<E: StorageEngine + 'static> WorkerRuntimeDispatcher<E> {
             .set(sender)
             .expect("init_sender called more than once");
     }
+
+    /// Returns `true` if drain mode is active (new assignments are rejected).
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Wait for all in-flight loads to complete.
+    ///
+    /// Returns immediately if no loads are in progress.  The caller should
+    /// call this after the Drain command is handled to ensure a graceful
+    /// shutdown before terminating the worker.
+    pub async fn wait_for_drain(&self) {
+        loop {
+            // Count epochs currently in Loading phase
+            let loading_count = self
+                .epoch_phases
+                .iter()
+                .filter(|entry| *entry.value() == EpochPhase::Loading)
+                .count();
+            if loading_count == 0 {
+                info!("drain complete: no in-flight loads");
+                return;
+            }
+            info!(loading_count, "drain waiting for in-flight loads to complete");
+            self.drain_notify.notified().await;
+        }
+    }
 }
 
 impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
@@ -134,6 +189,9 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
         let storage_engine = Arc::clone(&self.storage_engine);
         let semaphore = Arc::clone(&self.semaphore);
         let epoch_phases = Arc::clone(&self.epoch_phases);
+        let sql_transformer = Arc::clone(&self.sql_transformer);
+        let draining = Arc::clone(&self.draining);
+        let drain_notify = Arc::clone(&self.drain_notify);
         // Capture the Arc — *not* `.get().cloned()` — so every use-site
         // resolves the sender lazily.  This eliminates the race where a
         // command arrives before `init_sender` is called (possible because
@@ -146,8 +204,29 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
             match command {
                 // ── Assignment: semaphore-gated background load ────────────
                 ControlCommand::Assignment(assignment) => {
+                    // Reject new assignments if draining
+                    if draining.load(Ordering::Acquire) {
+                        warn!(
+                            dataset_id = %assignment.dataset_id,
+                            epoch_id = %assignment.epoch_id,
+                            "rejecting assignment: drain mode active"
+                        );
+                        if let Some(tx) = outgoing_tx.get() {
+                            report_status(
+                                tx,
+                                assignment.dataset_id.clone(),
+                                assignment.epoch_id.clone(),
+                                LoadStatus::Failed,
+                                Some("worker is draining".to_string()),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+
                     let dataset_id = assignment.dataset_id.clone();
                     let epoch_id = assignment.epoch_id.clone();
+                    let time_column_name = assignment.time_column_name.clone();
                     let key = EpochKey::new(&dataset_id, &epoch_id);
 
                     // Mark the epoch as Loading (or skip if already Evicting)
@@ -226,21 +305,97 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                                     {
                                         error!(%dataset_id, %epoch_id, error = %e,
                                                "deferred drop_epoch_table failed");
+                                    } else {
+                                        // Update the scan macro to remove the dropped epoch table.
+                                        // The time_column_name is available from the original assignment.
+                                        if !time_column_name.is_empty() {
+                                            if let Err(e) = storage_engine
+                                                .update_dataset_macro(
+                                                    dataset_id.clone(),
+                                                    time_column_name.clone(),
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    %dataset_id,
+                                                    error = %e,
+                                                    "failed to update dataset scan macro after deferred eviction"
+                                                );
+                                            }
+                                        }
                                     }
                                     epoch_phases.remove(&key);
                                 } else {
-                                    epoch_phases.insert(key, EpochPhase::Active);
-                                }
+                                    // Register the dataset with the SQL transformer so
+                                    // queries can reference it by logical name.
+                                    if !time_column_name.is_empty() {
+                                        let dataset = RegisteredDataset::new(
+                                            dataset_id.clone(),
+                                            time_column_name.clone(),
+                                        );
+                                        sql_transformer.write().await.register_dataset(dataset);
+                                        info!(%dataset_id, "dataset registered with SQL transformer");
 
-                                if let Some(tx) = outgoing_tx.get() {
-                                    report_status(
-                                        tx,
-                                        dataset_id,
-                                        epoch_id,
-                                        LoadStatus::Completed,
-                                        None,
-                                    )
-                                    .await;
+                                        // Update the DuckDB scan macro to include all epoch tables
+                                        // for this dataset. This enables the SQL transformer's
+                                        // rewritten queries (e.g., scan_orders(...)) to work.
+                                        match storage_engine
+                                            .update_dataset_macro(
+                                                dataset_id.clone(),
+                                                time_column_name.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                epoch_phases.insert(key, EpochPhase::Active);
+                                                if let Some(tx) = outgoing_tx.get() {
+                                                    report_status(
+                                                        tx,
+                                                        dataset_id,
+                                                        epoch_id,
+                                                        LoadStatus::Completed,
+                                                        None,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Macro update failed - data is not queryable.
+                                                // Report FAILED to CP to avoid state divergence.
+                                                error!(
+                                                    %dataset_id,
+                                                    %epoch_id,
+                                                    error = %e,
+                                                    "failed to update dataset scan macro; reporting load as failed"
+                                                );
+                                                epoch_phases.remove(&key);
+                                                if let Some(tx) = outgoing_tx.get() {
+                                                    report_status(
+                                                        tx,
+                                                        dataset_id,
+                                                        epoch_id,
+                                                        LoadStatus::Failed,
+                                                        Some(format!("macro update failed: {}", e)),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // No time column - dataset not registered but still queryable
+                                        // via raw table name.
+                                        epoch_phases.insert(key, EpochPhase::Active);
+                                        if let Some(tx) = outgoing_tx.get() {
+                                            report_status(
+                                                tx,
+                                                dataset_id,
+                                                epoch_id,
+                                                LoadStatus::Completed,
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -258,6 +413,8 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                                 }
                             }
                         }
+                        // Notify drain waiter that a load task completed
+                        drain_notify.notify_one();
                     });
                 }
 
@@ -290,6 +447,27 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                             {
                                 error!(%dataset_id, %epoch_id, error = %e,
                                        "drop_epoch_table failed");
+                            } else {
+                                // Update the scan macro to remove the dropped epoch table.
+                                // Get the time column from the registered dataset.
+                                let time_column = sql_transformer
+                                    .read()
+                                    .await
+                                    .get_dataset(&dataset_id)
+                                    .map(|d| d.time_column_name.clone());
+
+                                if let Some(time_col) = time_column {
+                                    if let Err(e) = storage_engine
+                                        .update_dataset_macro(dataset_id.clone(), time_col)
+                                        .await
+                                    {
+                                        warn!(
+                                            %dataset_id,
+                                            error = %e,
+                                            "failed to update dataset scan macro after eviction"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -297,7 +475,19 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
 
                 // ── Drain ─────────────────────────────────────────────────
                 ControlCommand::Drain => {
-                    info!("received Drain command; graceful drain not yet implemented");
+                    // Set drain flag to reject new assignments.
+                    // The caller should call `wait_for_drain()` to wait for
+                    // in-flight loads to complete before shutting down.
+                    let was_draining = draining.swap(true, Ordering::AcqRel);
+                    if was_draining {
+                        info!("received Drain command; already draining");
+                    } else {
+                        let loading_count = epoch_phases
+                            .iter()
+                            .filter(|e| *e.value() == EpochPhase::Loading)
+                            .count();
+                        info!(loading_count, "received Drain command; drain mode activated");
+                    }
                 }
 
                 // ── Unknown ───────────────────────────────────────────────
@@ -306,6 +496,14 @@ impl<E: StorageEngine + 'static> TaskDispatcher for WorkerRuntimeDispatcher<E> {
                 }
             }
         }
+    }
+
+    fn list_loaded_epochs(&self) -> Vec<EpochKey> {
+        self.epoch_phases
+            .iter()
+            .filter(|entry| *entry.value() == EpochPhase::Active)
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 }
 

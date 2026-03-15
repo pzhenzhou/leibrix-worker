@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         data_loader,
         Arc::clone(&engine),
         cfg.cp_max_concurrent_loads,
+        Arc::clone(&sql_transformer),
     ));
 
     let cp_cfg = cfg
@@ -61,10 +62,13 @@ async fn main() -> anyhow::Result<()> {
     // Start the Arrow Flight server if a listen address was configured.
     let mut flight_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
     let flight_task = if let Some(addr) = cfg.query_listen_addr {
+        let flight_tls = cfg
+            .flight_server_tls_config()
+            .context("failed to load Flight server TLS config")?;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let flight_config = FlightServerConfig {
             bind_addr: addr,
-            tls_config: None, // TLS wired via a follow-up task
+            tls_config: flight_tls,
             max_message_size: 16 * 1024 * 1024,
             concurrency_limit: 1000,
         };
@@ -75,7 +79,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.tenant_id.clone(),
             Arc::clone(&shared_db),
         );
-        info!(%addr, "Arrow Flight server starting");
+        let tls_enabled = cfg.flight_server_tls.cert_path.is_some();
+        info!(%addr, tls_enabled, "Arrow Flight server starting");
         let handle = tokio::spawn(async move {
             builder
                 .run_with_shutdown(async move {

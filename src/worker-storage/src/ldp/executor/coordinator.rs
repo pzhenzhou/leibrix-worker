@@ -2,7 +2,7 @@
 //!
 //! The coordinator is responsible for the complete query lifecycle:
 //! 1. SQL parsing and admission control
-//! 2. LDP planning (SQL → Substrait → LDP)
+//! 2. LDP planning (transformed SQL → logical plan → LDP)
 //! 3. Stage scheduling to workers
 //! 4. Exchange execution between stages
 //! 5. Result streaming back to client
@@ -30,7 +30,7 @@
 //! │                    ▼                         │
 //! │  ┌─────────────────────────────────────────┐ │
 //! │  │ 3. LDP Planning                         │ │
-//! │  │    - SQL → Substrait (DuckDB)           │ │
+//! │  │    - Parse transformed SQL              │ │
 //! │  │    - Annotate distributions             │ │
 //! │  │    - Cut into stages                    │ │
 //! │  └─────────────────────────────────────────┘ │
@@ -335,8 +335,8 @@ impl<M: Metadata + Send + Sync + 'static> LdpCoordinator<M> {
     /// Register a dataset schema for planning (creates planning macro in coordinator's DuckDB).
     ///
     /// This method creates a dummy table macro on the coordinator's DuckDB instance
-    /// that provides schema information for Substrait generation. The macro returns
-    /// no rows (WHERE FALSE) since the coordinator doesn't hold actual data.
+    /// so transformed queries can resolve dataset schemas during planning. The macro
+    /// returns no rows (`WHERE FALSE`) because the coordinator does not hold data.
     ///
     /// In production, Gateway would call this method to provide schema metadata
     /// from the Control Plane before executing a query.

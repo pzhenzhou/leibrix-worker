@@ -1,3 +1,4 @@
+use super::arrow_utils::arrow_type_to_duckdb;
 use anyhow::Context;
 use arrow::datatypes::{DataType, Schema};
 use duckdb::{params, Connection};
@@ -186,5 +187,121 @@ fn duckdb_type_str_to_arrow_type(type_str: &str) -> anyhow::Result<DataType> {
             DataType::Utf8
         }
     })
+}
+
+/// Creates or updates a DuckDB table macro for epoch-partitioned datasets.
+///
+/// This function creates a macro `scan_{dataset_id}(start_date, end_date)` that:
+/// 1. Unions all epoch tables for the dataset
+/// 2. Applies time-based filtering based on the date column
+///
+/// The macro uses `CREATE OR REPLACE`, so calling this function multiple times
+/// (e.g., after loading additional epochs) is safe and will update the macro
+/// to include all current epoch tables.
+///
+/// # Arguments
+/// * `conn` - DuckDB connection to create the macro on
+/// * `dataset_id` - The dataset identifier (used in macro name: `scan_{dataset_id}`)
+/// * `date_column` - Name of the date/time column for filtering
+/// * `epoch_tables` - List of physical epoch table names to include in the union
+/// * `dataset_schema` - Optional Arrow schema for the dataset. Used when epoch_tables is empty
+///   to create an empty macro that returns the correct column types instead of a dummy schema.
+///
+/// # Example
+/// ```sql
+/// -- After calling with dataset_id="orders", date_column="order_date",
+/// -- epoch_tables=["orders__epoch1", "orders__epoch2"]:
+/// -- Creates macro scan_orders(start_date, end_date)
+/// -- Usage: SELECT * FROM scan_orders('2024-01-01', '2024-02-01')
+/// ```
+pub fn create_or_update_dataset_macro(
+    conn: &Connection,
+    dataset_id: &str,
+    date_column: &str,
+    epoch_tables: &[String],
+    dataset_schema: Option<std::sync::Arc<arrow::datatypes::Schema>>,
+) -> anyhow::Result<()> {
+    let macro_name = format!("scan_{}", dataset_id);
+
+    if epoch_tables.is_empty() {
+        // Create an empty macro that returns no rows.
+        // If we have the schema, use it to generate correct column types.
+        // Otherwise, fall back to a dummy schema.
+        let macro_sql = if let Some(schema) = dataset_schema {
+            // Generate column definitions from schema: CAST(NULL AS TYPE) AS name
+            let columns: Vec<String> = schema
+                .fields()
+                .iter()
+                .filter_map(|field| {
+                    let col_name = field.name();
+                    let col_type = arrow_type_to_duckdb(field.data_type()).ok()?;
+                    Some(format!("CAST(NULL AS {}) AS {}", col_type, escape_ident(col_name)))
+                })
+                .collect();
+
+            if columns.is_empty() {
+                // Schema had no convertible columns, fall back to dummy
+                format!(
+                    r#"CREATE OR REPLACE MACRO {}(start_date, end_date) AS TABLE (
+                        SELECT * FROM (SELECT 0 AS _empty) WHERE 1=0
+                    )"#,
+                    macro_name
+                )
+            } else {
+                let columns_sql = columns.join(", ");
+                format!(
+                    r#"CREATE OR REPLACE MACRO {}(start_date, end_date) AS TABLE (
+                        SELECT {} WHERE FALSE
+                    )"#,
+                    macro_name, columns_sql
+                )
+            }
+        } else {
+            // No schema available, use dummy
+            format!(
+                r#"CREATE OR REPLACE MACRO {}(start_date, end_date) AS TABLE (
+                    SELECT * FROM (SELECT 0 AS _empty) WHERE 1=0
+                )"#,
+                macro_name
+            )
+        };
+
+        conn.execute_batch(&macro_sql)
+            .with_context(|| format!("Failed to create empty macro {}", macro_name))?;
+        info!(macro_name = %macro_name, "Created empty dataset macro (no epoch tables)");
+        return Ok(());
+    }
+
+    // Create UNION ALL clauses for each epoch table
+    let union_clauses: Vec<String> = epoch_tables
+        .iter()
+        .map(|table| format!("SELECT * FROM {}", escape_ident(table)))
+        .collect();
+
+    let union_sql = union_clauses.join(" UNION ALL ");
+
+    // Build the macro with time-based filtering
+    let macro_sql = format!(
+        r#"CREATE OR REPLACE MACRO {}(start_date, end_date) AS TABLE (
+            SELECT * FROM (
+                {}
+            ) WHERE CAST({} AS DATE) >= CAST(start_date AS DATE) 
+                  AND CAST({} AS DATE) < CAST(end_date AS DATE)
+        )"#,
+        macro_name,
+        union_sql,
+        escape_ident(date_column),
+        escape_ident(date_column)
+    );
+
+    conn.execute_batch(&macro_sql)
+        .with_context(|| format!("Failed to create macro {} with {} tables", macro_name, epoch_tables.len()))?;
+
+    info!(
+        macro_name = %macro_name,
+        epoch_tables = ?epoch_tables,
+        "Created/updated dataset macro"
+    );
+    Ok(())
 }
 

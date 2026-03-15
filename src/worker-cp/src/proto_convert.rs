@@ -164,6 +164,31 @@ pub(crate) fn register_event(worker_id: &str, tenant_id: &str, addr: &str) -> Ev
     }
 }
 
+/// Build a status update `EventStreamMessage` for a single epoch.
+///
+/// Used for both normal load completion reports and reconnect reconciliation.
+pub(crate) fn status_update_event(
+    worker_id: &str,
+    tenant_id: &str,
+    dataset_id: &str,
+    epoch_id: &str,
+    status: LoadStatus,
+    error: Option<String>,
+) -> EventStreamMessage {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    EventStreamMessage {
+        event_id,
+        tenant_id: tenant_id.to_string(),
+        worker_id: worker_id.to_string(),
+        payload: Some(Payload::DataPullStatusUpdate(DataPullStatusUpdateEvent {
+            dataset_id: dataset_id.to_string(),
+            epoch_id: epoch_id.to_string(),
+            status: load_status_to_proto(status) as i32,
+            error_message: error.unwrap_or_default(),
+        })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
