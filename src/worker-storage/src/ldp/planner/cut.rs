@@ -166,6 +166,24 @@ fn get_output_column_name(item: &SelectItem) -> Option<String> {
     }
 }
 
+/// Check if a SelectItem matches a column expression (for deduplication).
+/// This compares the output column name (either alias or dequalified identifier)
+/// with the column string representation.
+fn item_matches_column(item: &SelectItem, col_str: &str) -> bool {
+    // Check if the output name matches the column
+    if let Some(name) = get_output_column_name(item) {
+        // Compare the dequalified column name (last component)
+        let col_dequalified = col_str.rsplit('.').next().unwrap_or(col_str);
+        if name.eq_ignore_ascii_case(col_dequalified) {
+            return true;
+        }
+    }
+    // Note: We intentionally do NOT check contains() on the full string representation,
+    // because that would match "o_orderdate" inside "ORDER BY o_orderdate" in window functions,
+    // even though o_orderdate is not an actual output column.
+    false
+}
+
 /// Add ORDER BY columns to a LogicalPlan by wrapping it in a Project if needed.
 /// This ensures that when the plan is executed and sent through an exchange,
 /// the ORDER BY columns are available in the output.
@@ -246,8 +264,29 @@ fn add_columns_to_plan(mut plan: LogicalPlan, columns: Vec<Expr>) -> LogicalPlan
             *input = Box::new(add_columns_to_plan(*input.clone(), columns));
             plan
         }
-        LogicalPlan::Window { input, .. } => {
-            // For Window, add columns to its input
+        LogicalPlan::Window {
+            ref mut input,
+            ref mut window_exprs,
+            ..
+        } => {
+            // For Window, add columns to both window_exprs (output) and input.
+            // The window_exprs is the SELECT list that becomes the stage output,
+            // so ORDER BY columns must be in window_exprs to be available downstream.
+            for col in &columns {
+                let col_str = format!("{}", col);
+                let already_exists = window_exprs
+                    .iter()
+                    .any(|item| item_matches_column(item, &col_str));
+                if !already_exists {
+                    // Add the column with an alias matching the column name
+                    let alias = get_column_alias(col);
+                    window_exprs.push(SelectItem::ExprWithAlias {
+                        expr: col.clone(),
+                        alias: Ident::new(alias),
+                    });
+                }
+            }
+            // Also add columns to input for window partition/order expressions
             *input = Box::new(add_columns_to_plan(*input.clone(), columns));
             plan
         }
@@ -273,6 +312,7 @@ fn extract_inner_projection_items(plan: &LogicalPlan) -> Option<Vec<SelectItem>>
         LogicalPlan::Project { items, .. } => Some(items.clone()),
         LogicalPlan::Limit { input, .. } => extract_inner_projection_items(input),
         LogicalPlan::Sort { input, .. } => extract_inner_projection_items(input),
+        LogicalPlan::Window { window_exprs, .. } => Some(window_exprs.clone()),
         _ => None,
     }
 }
@@ -290,28 +330,60 @@ fn has_exchange_in_descendants(annotated: &AnnotatedPlan) -> bool {
     false
 }
 
-/// Walk the annotated plan tree and add ORDER BY columns to the `.plan` field
-/// of any child that has `exchange_before` set.  This ensures that when
-/// `extract_stage_plan` later calls `cut_recursive(child)`, the child's plan
-/// (which becomes the upstream stage's SQL) includes the extra columns.
+/// Walk the annotated plan tree and add ORDER BY columns to nodes that determine
+/// the stage output (Project, Aggregate, Window). These nodes filter which columns
+/// flow through to downstream stages via exchanges.
 ///
-/// This function only modifies the plan for nodes that are already Project or
-/// Aggregate (where we can safely add columns without changing structure).
-/// For other node types, we recurse to find Project/Aggregate descendants with exchanges.
+/// The key insight is that exchanges themselves don't limit columns - they carry
+/// whatever the upstream plan outputs. But Window/Project/Aggregate explicitly
+/// enumerate their output columns, so ORDER BY columns must be added there.
 fn add_order_by_columns_to_exchange_children(annotated: &mut AnnotatedPlan, columns: &[Expr]) {
+    // First, try to add columns to THIS node if it's a column-limiting operator
+    let modified = add_columns_to_plan_safe(&annotated.plan, columns.to_vec());
+    if let Some(new_plan) = modified {
+        annotated.plan = new_plan;
+    }
+
+    // Recurse into children
+    // We need to add columns to any child that has exchange_before (it's a stage boundary)
+    // AND recurse into children without exchange_before to find nested exchanges
     for child in &mut annotated.children {
         if child.exchange_before.is_some() {
-            // Only modify if it's safe to do so without changing structure
-            // Project: add to items (safe)
-            // Aggregate: add to aggr_exprs (safe)
-            // Other: could wrap in Project - unsafe, skip
-            let modified_plan = add_columns_to_plan_safe(&child.plan, columns.to_vec());
-            if let Some(new_plan) = modified_plan {
+            // This child has an exchange - it's a stage boundary.
+            // We need to add ORDER BY columns to THIS child so they flow through the exchange.
+            // But we don't recurse further - that's a different stage.
+            let modified_child = add_columns_to_plan_safe(&child.plan, columns.to_vec());
+            if let Some(new_plan) = modified_child {
                 child.plan = new_plan;
+            } else {
+                // Can't modify this child directly, but it's at an exchange boundary
+                // so we need to make sure the columns are in its output.
+                // Recurse into it to find a modifiable node.
+                add_order_by_columns_in_subtree(child, columns);
             }
         } else {
+            // No exchange at this child - recurse to find exchanges deeper in the tree
             add_order_by_columns_to_exchange_children(child, columns);
         }
+    }
+}
+
+/// Helper to add ORDER BY columns to a subtree that's at an exchange boundary.
+/// This finds the topmost modifiable node in the subtree.
+fn add_order_by_columns_in_subtree(annotated: &mut AnnotatedPlan, columns: &[Expr]) {
+    // Try to modify this node first
+    let modified = add_columns_to_plan_safe(&annotated.plan, columns.to_vec());
+    if let Some(new_plan) = modified {
+        annotated.plan = new_plan;
+        return;
+    }
+    
+    // Can't modify this node, try children (but only within this stage)
+    for child in &mut annotated.children {
+        if child.exchange_before.is_none() {
+            add_order_by_columns_in_subtree(child, columns);
+        }
+        // Don't cross exchange boundaries into other stages
     }
 }
 
@@ -322,7 +394,7 @@ fn add_columns_to_plan_safe(plan: &LogicalPlan, columns: Vec<Expr>) -> Option<Lo
         return None;
     }
     match plan {
-        LogicalPlan::Project { .. } | LogicalPlan::Aggregate { .. } => {
+        LogicalPlan::Project { .. } | LogicalPlan::Aggregate { .. } | LogicalPlan::Window { .. } => {
             // Safe: can add columns without changing node type
             Some(add_columns_to_plan(plan.clone(), columns))
         }

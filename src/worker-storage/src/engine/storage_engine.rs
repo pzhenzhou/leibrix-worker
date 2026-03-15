@@ -170,5 +170,29 @@ pub trait StorageEngine: Send + Sync {
         epoch_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<EpochStats>>> + Send;
 
+    /// Updates the DuckDB scan macro for a dataset to include all its current epoch tables.
+    ///
+    /// This method creates or replaces a table macro `scan_{dataset_id}(start_date, end_date)`
+    /// that unions all physical epoch tables for the dataset and applies time-based filtering.
+    ///
+    /// # Arguments
+    /// * `dataset_id` - The logical dataset identifier (used in macro name)
+    /// * `date_column` - The date/time column name for filtering (e.g., "order_date", "dt")
+    ///
+    /// # How it works
+    /// 1. Queries `list_epochs(dataset_id)` to get all epoch tables
+    /// 2. Builds a UNION ALL of all epoch tables with date filtering
+    /// 3. Creates/replaces the macro: `scan_{dataset_id}(start_date, end_date)`
+    ///
+    /// # When to call
+    /// Call this method after successfully loading an epoch via `create_epoch_table`.
+    /// The SQL transformer rewrites queries like `SELECT * FROM orders WHERE dt >= '2024-01-01'`
+    /// to `SELECT * FROM scan_orders('2024-01-01', '2024-02-01') WHERE dt >= '2024-01-01'`.
+    fn update_dataset_macro(
+        &self,
+        dataset_id: String,
+        date_column: String,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
     fn shutdown(self) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

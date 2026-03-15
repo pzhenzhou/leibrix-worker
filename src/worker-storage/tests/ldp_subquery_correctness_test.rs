@@ -188,12 +188,14 @@ async fn setup_test_cluster() -> anyhow::Result<Arc<TestCluster>> {
         .await
         .map_err(|e| anyhow!("{}", e))?;
 
-    // Load customer data on w1
+    // Load customer data to ALL workers (dimension table needs to be replicated)
     let customers = generate_customer_data(50);
-    cluster
-        .load_data_to_worker("w1", "customer", customers)
-        .await
-        .map_err(|e| anyhow!("{}", e))?;
+    for worker_id in ["w1", "w2", "w3"] {
+        cluster
+            .load_data_to_worker(worker_id, "customer", customers.clone())
+            .await
+            .map_err(|e| anyhow!("{}", e))?;
+    }
 
     // Register datasets
     cluster

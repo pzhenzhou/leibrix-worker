@@ -60,6 +60,11 @@ impl SqlTransformer {
         self.registered_datasets.contains_key(dataset_id)
     }
 
+    /// Get a registered dataset by ID.
+    pub fn get_dataset(&self, dataset_id: &str) -> Option<&RegisteredDataset> {
+        self.registered_datasets.get(dataset_id)
+    }
+
     /// Get registered dataset names.
     pub fn registered_dataset_ids(&self) -> HashSet<String> {
         self.registered_datasets.keys().cloned().collect()

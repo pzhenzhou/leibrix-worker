@@ -465,9 +465,9 @@ impl AdmissionController {
                     predicates.push(selection.clone());
                 }
 
-                // Also collect from joins
+                // Collect from joins and derived tables in FROM clause
                 for twj in &select.from {
-                    self.collect_predicates_from_joins(twj, predicates);
+                    self.collect_predicates_from_table_with_joins(twj, predicates);
                 }
             }
             SetExpr::Query(query) => {
@@ -481,12 +481,41 @@ impl AdmissionController {
         }
     }
 
-    /// Collect predicates from join ON clauses.
-    fn collect_predicates_from_joins(&self, twj: &TableWithJoins, predicates: &mut Vec<Expr>) {
+    /// Collect predicates from table with joins (including derived tables and join ON clauses).
+    fn collect_predicates_from_table_with_joins(
+        &self,
+        twj: &TableWithJoins,
+        predicates: &mut Vec<Expr>,
+    ) {
+        // Collect from the main relation
+        self.collect_predicates_from_table_factor(&twj.relation, predicates);
+
+        // Collect from joins
         for join in &twj.joins {
+            // Collect from join relation (may be a derived table)
+            self.collect_predicates_from_table_factor(&join.relation, predicates);
+
+            // Collect from join ON clause
             if let Some(expr) = super::extract_join_on_expr(&join.join_operator) {
                 predicates.push(expr.clone());
             }
+        }
+    }
+
+    /// Collect predicates from a table factor (recurses into derived tables).
+    fn collect_predicates_from_table_factor(&self, factor: &TableFactor, predicates: &mut Vec<Expr>) {
+        match factor {
+            TableFactor::Derived { subquery, .. } => {
+                // Recurse into the subquery to collect its predicates
+                predicates.extend(self.collect_predicates(subquery));
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                self.collect_predicates_from_table_with_joins(table_with_joins, predicates);
+            }
+            // Regular tables don't contain predicates
+            _ => {}
         }
     }
 

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use worker_cp::dispatch::TaskDispatcher;
-use worker_cp::types::ControlCommand;
+use worker_cp::types::{ControlCommand, EpochKey};
 
 /// Records every call to `handle_command` for later assertion.
 pub struct RecordingDispatcher {
@@ -50,5 +50,10 @@ impl TaskDispatcher for RecordingDispatcher {
         async move {
             commands.lock().await.push(command);
         }
+    }
+
+    fn list_loaded_epochs(&self) -> Vec<EpochKey> {
+        // For testing, return empty list (no pre-loaded epochs)
+        Vec::new()
     }
 }

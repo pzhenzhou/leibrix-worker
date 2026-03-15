@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
 use worker_cp::ControlPlaneConfig;
 use worker_storage::engine::duckdb::DuckDBConfig;
@@ -46,7 +46,14 @@ pub struct LeibrixWorkerConfig {
     pub worker_id: String,
     pub master_endpoint: String,
     pub query_listen_addr: Option<SocketAddr>,
+    /// Advertised address for registration. If set, this overrides query_listen_addr
+    /// for the address reported to the control plane. Use this when binding to
+    /// 0.0.0.0 or other non-routable addresses.
+    pub advertise_addr: Option<String>,
+    /// TLS config for CP client (outbound to master).
     pub tls: TlsConfig,
+    /// TLS config for Flight server (inbound queries).
+    pub flight_server_tls: FlightServerTlsConfig,
     pub duckdb: DuckDBConfig,
     /// Capacity of the domain-level outgoing event channel (worker → CP).
     pub cp_outgoing_capacity: usize,
@@ -61,6 +68,15 @@ pub struct TlsConfig {
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub server_name: Option<String>,
+}
+
+/// TLS configuration for the Flight gRPC server.
+#[derive(Debug, Clone, Default)]
+pub struct FlightServerTlsConfig {
+    /// Server certificate path (PEM format).
+    pub cert_path: Option<PathBuf>,
+    /// Server private key path (PEM format).
+    pub key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -213,6 +229,26 @@ pub struct RunArgs {
     )]
     pub tls_server_name: Option<String>,
 
+    /// Flight server TLS certificate path.
+    #[arg(
+        long,
+        env = "LEIBRIX_FLIGHT_TLS_CERT",
+        value_name = "PATH",
+        help = "Flight server TLS certificate path (optional)",
+        long_help = "Flight server TLS certificate path (PEM format).\n\nIf provided, --flight-tls-key must also be set.\n\nCan be provided via $LEIBRIX_FLIGHT_TLS_CERT."
+    )]
+    pub flight_tls_cert: Option<PathBuf>,
+
+    /// Flight server TLS private key path.
+    #[arg(
+        long,
+        env = "LEIBRIX_FLIGHT_TLS_KEY",
+        value_name = "PATH",
+        help = "Flight server TLS private key path (optional)",
+        long_help = "Flight server TLS private key path (PEM format).\n\nIf provided, --flight-tls-cert must also be set.\n\nCan be provided via $LEIBRIX_FLIGHT_TLS_KEY."
+    )]
+    pub flight_tls_key: Option<PathBuf>,
+
     /// Outgoing CP event channel capacity.
     #[arg(
         long,
@@ -232,6 +268,22 @@ pub struct RunArgs {
         help = "Max concurrent DataLoader::load_epoch operations (default: 4)"
     )]
     pub cp_max_concurrent_loads: usize,
+
+    /// Advertised query address for the worker.
+    ///
+    /// This is the routable address that the control plane and gateways will use
+    /// to connect to this worker. Use this when `query_listen_addr` is bound to
+    /// `0.0.0.0` or another non-routable address.
+    ///
+    /// If not provided, `query_listen_addr` is used (which may be non-routable).
+    #[arg(
+        long,
+        env = "LEIBRIX_ADVERTISE_ADDR",
+        value_name = "HOST:PORT",
+        help = "Advertised query address (overrides query-listen-addr for registration)",
+        long_help = "Advertised query address for the worker.\n\nThis is the routable address that the control plane and gateways will use to connect to this worker. Use this when --query-listen-addr is bound to 0.0.0.0 or another non-routable address.\n\nIf not provided, --query-listen-addr is used (which may be non-routable in containerized environments).\n\nCan be provided via $LEIBRIX_ADVERTISE_ADDR."
+    )]
+    pub advertise_addr: Option<String>,
 }
 
 impl LeibrixWorkerConfig {
@@ -252,6 +304,16 @@ impl LeibrixWorkerConfig {
         if tls_any && (args.tls_ca.is_none() || args.tls_cert.is_none() || args.tls_key.is_none()) {
             anyhow::bail!(
                 "TLS is partially configured; provide --tls-ca, --tls-cert, and --tls-key together"
+            );
+        }
+
+        // Flight server TLS: either both (cert/key) are present, or none.
+        let flight_tls_any = args.flight_tls_cert.is_some() || args.flight_tls_key.is_some();
+        if flight_tls_any
+            && (args.flight_tls_cert.is_none() || args.flight_tls_key.is_none())
+        {
+            anyhow::bail!(
+                "Flight server TLS is partially configured; provide --flight-tls-cert and --flight-tls-key together"
             );
         }
 
@@ -278,11 +340,16 @@ impl LeibrixWorkerConfig {
             worker_id: args.worker_id,
             master_endpoint: args.master_endpoint,
             query_listen_addr: args.query_listen_addr,
+            advertise_addr: args.advertise_addr,
             tls: TlsConfig {
                 ca_path: args.tls_ca,
                 cert_path: args.tls_cert,
                 key_path: args.tls_key,
                 server_name: args.tls_server_name,
+            },
+            flight_server_tls: FlightServerTlsConfig {
+                cert_path: args.flight_tls_cert,
+                key_path: args.flight_tls_key,
             },
             duckdb,
             cp_outgoing_capacity: args.cp_outgoing_capacity,
@@ -332,10 +399,44 @@ impl LeibrixWorkerConfig {
             master_addr: self.master_endpoint.clone(),
             worker_id: self.worker_id.clone(),
             tenant_id: self.tenant_id.clone(),
+            // Prefer advertise_addr > query_listen_addr for the address reported to CP.
+            // advertise_addr should be set when query_listen_addr is non-routable (e.g., 0.0.0.0).
+            worker_addr: self
+                .advertise_addr
+                .clone()
+                .or_else(|| self.query_listen_addr.map(|a| a.to_string())),
             outgoing_channel_capacity: self.cp_outgoing_capacity,
             tls,
             ..ControlPlaneConfig::default()
         })
+    }
+
+    /// Build a [`ServerTlsConfig`] for the Flight server, if TLS material was provided.
+    ///
+    /// Returns `Ok(None)` if no Flight server TLS is configured.
+    /// Returns an error if certificate/key files are specified but cannot be read.
+    pub fn flight_server_tls_config(&self) -> anyhow::Result<Option<ServerTlsConfig>> {
+        let Some(cert_path) = &self.flight_server_tls.cert_path else {
+            return Ok(None);
+        };
+        let key_path = self.flight_server_tls.key_path.as_ref().unwrap(); // validated at parse time
+
+        let cert_pem = std::fs::read(cert_path).with_context(|| {
+            format!(
+                "failed to read Flight server TLS certificate: {}",
+                cert_path.display()
+            )
+        })?;
+        let key_pem = std::fs::read(key_path).with_context(|| {
+            format!(
+                "failed to read Flight server TLS key: {}",
+                key_path.display()
+            )
+        })?;
+
+        let tls_config = ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem));
+
+        Ok(Some(tls_config))
     }
 }
 

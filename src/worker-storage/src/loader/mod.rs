@@ -3,6 +3,7 @@ mod starrocks;
 pub mod types;
 
 use self::adapter::SourceAdapter;
+use self::starrocks::backend::StarRocksBackend;
 use self::types::{Catalog, LoadRequest};
 use crate::engine::storage_engine::{StorageEngine, TableMetadata};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ impl<E: StorageEngine> DataLoader<E> {
 
     pub async fn load_epoch(&self, request: LoadRequest) -> anyhow::Result<TableMetadata> {
         // 1. Select appropriate adapter based on request.source.catalog
-        let adapter = self.get_adapter(&request.source.catalog)?;
+        let adapter = self.get_adapter(&request.source.catalog).await?;
 
         let data_source = Arc::new(request.source.clone());
         // 2. Fetch data stream
@@ -32,16 +33,19 @@ impl<E: StorageEngine> DataLoader<E> {
             .await
     }
 
-    fn get_adapter(&self, catalog: &Catalog) -> anyhow::Result<Box<dyn SourceAdapter>> {
+    async fn get_adapter(&self, catalog: &Catalog) -> anyhow::Result<Box<dyn SourceAdapter>> {
         match catalog {
-            Catalog::Iceberg { .. } => {
-                todo!("StarRocks adapter not implemented yet")
+            Catalog::Iceberg { uri } => {
+                // Iceberg support is planned but not yet implemented.
+                // Requires integration with iceberg-rust crate.
+                Err(anyhow::anyhow!(
+                    "Iceberg catalog '{}' is not yet supported; planned for a future release",
+                    uri
+                ))
             }
-            Catalog::StarRocks { .. } => {
-                todo!("StarRocks adapter not implemented yet")
-            }
-            Catalog::Jdbc { .. } => {
-                todo!("StarRocks adapter not implemented yet")
+            Catalog::StarRocks { .. } | Catalog::Jdbc { .. } => {
+                let backend = StarRocksBackend::from_catalog(catalog.clone()).await?;
+                Ok(Box::new(backend))
             }
         }
     }
